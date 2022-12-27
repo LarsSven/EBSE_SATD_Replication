@@ -1,0 +1,2042 @@
+diff --git a/.github/PULL_REQUEST_TEMPLATE.md b/.github/PULL_REQUEST_TEMPLATE.md
+index 6227dc256a1d8..6297bcbcd0b14 100644
+--- a/.github/PULL_REQUEST_TEMPLATE.md
++++ b/.github/PULL_REQUEST_TEMPLATE.md
+@@ -12,7 +12,7 @@
+ 
+   - Fill out the template below to describe the changes contributed by the pull request. That will give reviewers the context they need to do the review.
+   
+-  - Make sure that the change passes the automated tests, i.e., `mvn clean verify` passes. You can set up Travis CI to do that following [this guide](https://flink.apache.org/contributing/contribute-code.html#open-a-pull-request).
++  - Make sure that the change passes the automated tests, i.e., `mvn clean verify` passes. You can set up Azure Pipelines CI to do that following [this guide](https://cwiki.apache.org/confluence/display/FLINK/Azure+Pipelines#AzurePipelines-Tutorial:SettingupAzurePipelinesforaforkoftheFlinkrepository).
+ 
+   - Each pull request should address only one issue, not mix up code from multiple issues.
+   
+diff --git a/azure-pipelines.yml b/azure-pipelines.yml
+index 82c0831a32720..fba75edd6deda 100644
+--- a/azure-pipelines.yml
++++ b/azure-pipelines.yml
+@@ -48,10 +48,11 @@ resources:
+ #   to understand why the secrets are handled like this
+ variables:
+   MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
++  E2E_CACHE_FOLDER: $(Pipeline.Workspace)/e2e_cache
+   MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+   CACHE_KEY: maven | $(Agent.OS) | **/pom.xml, !**/target/**
+   CACHE_FALLBACK_KEY: maven | $(Agent.OS)
+-  CACHE_FLINK_DIR: $(Pipeline.Workspace)/flink_cache
++  FLINK_ARTIFACT_DIR: $(Pipeline.Workspace)/flink_artifact
+   SECRET_S3_BUCKET: $[variables.IT_CASE_S3_BUCKET]
+   SECRET_S3_ACCESS_KEY: $[variables.IT_CASE_S3_ACCESS_KEY]
+   SECRET_S3_SECRET_KEY: $[variables.IT_CASE_S3_SECRET_KEY]
+diff --git a/flink-end-to-end-tests/run-nightly-tests.sh b/flink-end-to-end-tests/run-nightly-tests.sh
+index 3a3471c13ccfd..3f3e2a2cdcbfd 100755
+--- a/flink-end-to-end-tests/run-nightly-tests.sh
++++ b/flink-end-to-end-tests/run-nightly-tests.sh
+@@ -45,7 +45,7 @@ if [ ! -z "$TF_BUILD" ] ; then
+ 		echo "COMPRESSING build artifacts."
+ 		COMPRESSED_ARCHIVE=${BUILD_BUILDNUMBER}.tgz
+ 		mkdir compressed-archive-dir
+-		tar -zcvf compressed-archive-dir/${COMPRESSED_ARCHIVE} $ARTIFACTS_DIR
++		tar -zcvf compressed-archive-dir/${COMPRESSED_ARCHIVE} -C $ARTIFACTS_DIR .
+ 		echo "##vso[task.setvariable variable=ARTIFACT_DIR]$(pwd)/compressed-archive-dir"
+ 	}
+ 	on_exit compress_logs
+@@ -235,7 +235,7 @@ printf "Running Java end-to-end tests\n"
+ printf "==============================================================================\n"
+ 
+ 
+-LOG4J_PROPERTIES=${END_TO_END_DIR}/../tools/log4j-travis.properties
++LOG4J_PROPERTIES=${END_TO_END_DIR}/../tools/ci/log4j-ci.properties
+ 
+ MVN_LOGGING_OPTIONS="-Dlog.dir=${ARTIFACTS_DIR} -DlogBackupDir=${ARTIFACTS_DIR} -Dlog4j.configurationFile=file://$LOG4J_PROPERTIES"
+ MVN_COMMON_OPTIONS="-Dflink.forkCount=2 -Dflink.forkCountTestPackage=2 -Dfast -Pskip-webui-build"
+@@ -243,7 +243,7 @@ e2e_modules=$(find flink-end-to-end-tests -mindepth 2 -maxdepth 5 -name 'pom.xml
+ e2e_modules="${e2e_modules},$(find flink-walkthroughs -mindepth 2 -maxdepth 2 -name 'pom.xml' -printf '%h\n' | sort -u | tr '\n' ',')"
+ 
+ PROFILE="$PROFILE -Pe2e-travis1 -Pe2e-travis2 -Pe2e-travis3 -Pe2e-travis4 -Pe2e-travis5 -Pe2e-travis6"
+-run_mvn ${MVN_COMMON_OPTIONS} ${MVN_LOGGING_OPTIONS} ${PROFILE} verify -pl ${e2e_modules} -DdistDir=$(readlink -e build-target)
++run_mvn ${MVN_COMMON_OPTIONS} ${MVN_LOGGING_OPTIONS} ${PROFILE} verify -pl ${e2e_modules} -DdistDir=$(readlink -e build-target) -Dcache-dir=$E2E_CACHE_FOLDER -Dcache-ttl=P1M
+ 
+ EXIT_CODE=$?
+ 
+diff --git a/flink-end-to-end-tests/run-pre-commit-tests.sh b/flink-end-to-end-tests/run-pre-commit-tests.sh
+deleted file mode 100755
+index 94c9b9ef1ea3d..0000000000000
+--- a/flink-end-to-end-tests/run-pre-commit-tests.sh
++++ /dev/null
+@@ -1,64 +0,0 @@
+-#!/usr/bin/env bash
+-################################################################################
+-#  Licensed to the Apache Software Foundation (ASF) under one
+-#  or more contributor license agreements.  See the NOTICE file
+-#  distributed with this work for additional information
+-#  regarding copyright ownership.  The ASF licenses this file
+-#  to you under the Apache License, Version 2.0 (the
+-#  "License"); you may not use this file except in compliance
+-#  with the License.  You may obtain a copy of the License at
+-#
+-#      http://www.apache.org/licenses/LICENSE-2.0
+-#
+-#  Unless required by applicable law or agreed to in writing, software
+-#  distributed under the License is distributed on an "AS IS" BASIS,
+-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-#  See the License for the specific language governing permissions and
+-# limitations under the License.
+-################################################################################
+-
+-END_TO_END_DIR="`dirname \"$0\"`" # relative
+-END_TO_END_DIR="`( cd \"$END_TO_END_DIR\" && pwd -P )`" # absolutized and normalized
+-if [ -z "$END_TO_END_DIR" ] ; then
+-    # error; for some reason, the path is not accessible
+-    # to the script (e.g. permissions re-evaled after suid)
+-    exit 1  # fail
+-fi
+-
+-export END_TO_END_DIR
+-
+-if [ -z "$FLINK_DIR" ] ; then
+-    echo "You have to export the Flink distribution directory as FLINK_DIR"
+-    exit 1
+-fi
+-
+-source ${END_TO_END_DIR}/test-scripts/test-runner-common.sh
+-
+-FLINK_DIR="`( cd \"$FLINK_DIR\" && pwd -P)`" # absolutized and normalized
+-
+-echo "flink-end-to-end-test directory: $END_TO_END_DIR"
+-echo "Flink distribution directory: $FLINK_DIR"
+-
+-# Template for adding a test:
+-# run_test "<description>" "$END_TO_END_DIR/test-scripts/<script_name>" ["skip_check_exceptions"]
+-
+-# IMPORTANT:
+-# With the "skip_check_exceptions" flag one can disable default exceptions and errors checking in log files. This should be done
+-# carefully though. A valid reasons for doing so could be e.g killing TMs randomly as we cannot predict what exception could be thrown. Whenever
+-# those checks are disabled, one should take care that a proper checks are performed in the tests itself that ensure that the test finished
+-# in an expected state.
+-
+-run_test "State Migration end-to-end test from 1.6" "$END_TO_END_DIR/test-scripts/test_state_migration.sh"
+-run_test "State Evolution end-to-end test" "$END_TO_END_DIR/test-scripts/test_state_evolution.sh"
+-run_test "Wordcount end-to-end test" "$END_TO_END_DIR/test-scripts/test_batch_wordcount.sh file"
+-run_test "Shaded Hadoop S3A end-to-end test" "$END_TO_END_DIR/test-scripts/test_batch_wordcount.sh hadoop"
+-run_test "Shaded Hadoop S3A end-to-end test (minio)" "$END_TO_END_DIR/test-scripts/test_batch_wordcount.sh hadoop_minio"
+-run_test "Shaded Presto S3 end-to-end test" "$END_TO_END_DIR/test-scripts/test_batch_wordcount.sh presto"
+-run_test "Shaded Presto S3 end-to-end test (minio)" "$END_TO_END_DIR/test-scripts/test_batch_wordcount.sh presto_minio"
+-run_test "Custom FS plugin end-to-end test" "$END_TO_END_DIR/test-scripts/test_batch_wordcount.sh dummy-fs"
+-
+-run_test "Kinesis end-to-end test" "$END_TO_END_DIR/test-scripts/test_streaming_kinesis.sh"
+-run_test "class loading end-to-end test" "$END_TO_END_DIR/test-scripts/test_streaming_classloader.sh"
+-run_test "Distributed cache end-to-end test" "$END_TO_END_DIR/test-scripts/test_streaming_distributed_cache_via_blob.sh"
+-printf "\n[PASS] All tests passed\n"
+-exit 0
+diff --git a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java
+index 031e139d26592..fca47e0fd8102 100644
+--- a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java
++++ b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java
+@@ -449,7 +449,7 @@ public boolean accept(File dir, String name) {
+ 							}
+ 
+ 							if (!whitelistedFound) {
+-								// logging in FATAL to see the actual message in TRAVIS tests.
++								// logging in FATAL to see the actual message in CI tests.
+ 								Marker fatal = MarkerFactory.getMarker("FATAL");
+ 								LOG.error(fatal, "Prohibited String '{}' in '{}:{}'", aProhibited, f.getAbsolutePath(), lineFromFile);
+ 
+@@ -1048,11 +1048,10 @@ public static void teardown() throws Exception {
+ 			hdfsSiteXML.delete();
+ 		}
+ 
+-		// When we are on travis, we copy the temp files of JUnit (containing the MiniYARNCluster log files)
++		// When we are on CI, we copy the temp files of JUnit (containing the MiniYARNCluster log files)
+ 		// to <flinkRoot>/target/flink-yarn-tests-*.
+-		// The files from there are picked up by the ./tools/travis_watchdog.sh script
+-		// to upload them to Amazon S3.
+-		if (isOnTravis()) {
++		// The files from there are picked up by the tools/ci/* scripts to upload them.
++		if (isOnCI()) {
+ 			File target = new File("../target" + YARN_CONFIGURATION.get(TEST_CLUSTER_NAME_KEY));
+ 			if (!target.mkdirs()) {
+ 				LOG.warn("Error creating dirs to {}", target);
+@@ -1068,8 +1067,8 @@ public static void teardown() throws Exception {
+ 
+ 	}
+ 
+-	public static boolean isOnTravis() {
+-		return System.getenv("TRAVIS") != null && System.getenv("TRAVIS").equals("true");
++	public static boolean isOnCI() {
++		return System.getenv("IS_CI") != null && System.getenv("IS_CI").equals("true");
+ 	}
+ 
+ 	protected void waitApplicationFinishedElseKillIt(
+diff --git a/tools/azure-pipelines/build-apache-repo.yml b/tools/azure-pipelines/build-apache-repo.yml
+index dab6d956f84f4..fc0f80d296111 100644
+--- a/tools/azure-pipelines/build-apache-repo.yml
++++ b/tools/azure-pipelines/build-apache-repo.yml
+@@ -42,10 +42,11 @@ resources:
+ 
+ variables:
+   MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
++  E2E_CACHE_FOLDER: $(Pipeline.Workspace)/e2e_cache
+   MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+   CACHE_KEY: maven | $(Agent.OS) | **/pom.xml, !**/target/**
+   CACHE_FALLBACK_KEY: maven | $(Agent.OS)
+-  CACHE_FLINK_DIR: $(Pipeline.Workspace)/flink_cache
++  FLINK_ARTIFACT_DIR: $(Pipeline.Workspace)/flink_artifact
+   SECRET_S3_BUCKET: $[variables.IT_CASE_S3_BUCKET]
+   SECRET_S3_ACCESS_KEY: $[variables.IT_CASE_S3_ACCESS_KEY]
+   SECRET_S3_SECRET_KEY: $[variables.IT_CASE_S3_SECRET_KEY]
+diff --git a/tools/azure-pipelines/build-python-wheels.yml b/tools/azure-pipelines/build-python-wheels.yml
+index a7dd375c4c580..8716cdcacbe37 100644
+--- a/tools/azure-pipelines/build-python-wheels.yml
++++ b/tools/azure-pipelines/build-python-wheels.yml
+@@ -22,8 +22,9 @@ jobs:
+       clean: all
+     steps:
+       # Compile
+-      - script: STAGE=compile ${{parameters.environment}} ./tools/azure_controller.sh compile
+-        displayName: Build
++      - script: |
++          ${{parameters.environment}} ./tools/ci/compile.sh
++        displayName: Compile
+ 
+       - script: |
+           VERSION=$(mvn --file pom.xml org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout)
+@@ -31,15 +32,14 @@ jobs:
+         name: set_version
+ 
+       - script: |
+-          cd $(Pipeline.Workspace)
+-          tar czf $(Pipeline.Workspace)/flink.tar.gz flink_cache/flink-dist/target/flink-$(set_version.VERSION)-bin/flink-$(set_version.VERSION)
++          tar czf $(Pipeline.Workspace)/flink.tar.gz flink-dist/target/flink-$(set_version.VERSION)-bin/flink-$(set_version.VERSION)
+         displayName: Compress in tgz
+ 
+       # upload artifacts for building wheels
+       - task: PublishPipelineArtifact@1
+         inputs:
+           targetPath: $(Pipeline.Workspace)/flink.tar.gz
+-          artifactName: FlinkCompileCacheDir-${{parameters.stage_name}}
++          artifact: FlinkCompileArtifact-${{parameters.stage_name}}
+ 
+   - job: build_wheels
+     dependsOn: compile_${{parameters.stage_name}}
+@@ -58,11 +58,11 @@ jobs:
+       - task: DownloadPipelineArtifact@2
+         inputs:
+           path: $(Pipeline.Workspace)
+-          artifact: FlinkCompileCacheDir-${{parameters.stage_name}}
++          artifact: FlinkCompileArtifact-${{parameters.stage_name}}
+       - script: |
+           tar zxf $(Pipeline.Workspace)/flink.tar.gz -C $(Pipeline.Workspace)
+           mkdir -p flink-dist/target/flink-$(VERSION)-bin
+-          ln -snf $(CACHE_FLINK_DIR)/flink-dist/target/flink-$(VERSION)-bin/flink-$(VERSION) `pwd`/flink-dist/target/flink-$(VERSION)-bin/flink-$(VERSION)
++          ln -snf $(Pipeline.Workspace)/flink-dist/target/flink-$(VERSION)-bin/flink-$(VERSION) `pwd`/flink-dist/target/flink-$(VERSION)-bin/flink-$(VERSION)
+         displayName: Recreate 'flink-dist/target' symlink
+       - script: |
+           cd flink-python
+diff --git a/tools/test_deploy_to_maven.sh b/tools/azure-pipelines/create_build_artifact.sh
+similarity index 59%
+rename from tools/test_deploy_to_maven.sh
+rename to tools/azure-pipelines/create_build_artifact.sh
+index 6aa1b3c97595e..6de32e9a553fa 100755
+--- a/tools/test_deploy_to_maven.sh
++++ b/tools/azure-pipelines/create_build_artifact.sh
+@@ -17,11 +17,24 @@
+ # limitations under the License.
+ ################################################################################
+ 
+-echo "Call this in the tools/ directory!"
+-sleep 2
+-export TRAVIS_JOB_NUMBER="75.6"
+-export TRAVIS_PULL_REQUEST="false"
++echo "Creating build artifact dir $FLINK_ARTIFACT_DIR"
+ 
+-cd ..
++cp -r . "$FLINK_ARTIFACT_DIR"
++
++echo "Minimizing artifact files"
++
++# reduces the size of the artifact directory to speed up
++# the packing&upload / download&unpacking process
++# by removing files not required for subsequent stages
++
++# jars are re-built in subsequent stages, so no need to cache them (cannot be avoided)
++find "$FLINK_ARTIFACT_DIR" -maxdepth 8 -type f -name '*.jar' | xargs rm -rf
++
++# .git directory
++# not deleting this can cause build stability issues
++# merging the cached version sometimes fails
++rm -rf "$FLINK_ARTIFACT_DIR/.git"
++
++# AZ Pipelines has a problem with links.
++rm "$FLINK_ARTIFACT_DIR/build-target"
+ 
+-./tools/deploy_to_maven.sh
+diff --git a/tools/azure-pipelines/debug_files_utils.sh b/tools/azure-pipelines/debug_files_utils.sh
+new file mode 100755
+index 0000000000000..27a42b2fdb5d1
+--- /dev/null
++++ b/tools/azure-pipelines/debug_files_utils.sh
+@@ -0,0 +1,35 @@
++#!/usr/bin/env bash
++################################################################################
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++# limitations under the License.
++################################################################################
++
++function debug_files_prepare {
++	MODULE=$1
++	export DEBUG_FILES_OUTPUT_DIR="$AGENT_TEMPDIRECTORY/debug_files"
++	export DEBUG_FILES_NAME="$(echo $MODULE | tr -dc '[:alnum:]\n\r')-$(date +%s)"
++	echo "##vso[task.setvariable variable=DEBUG_FILES_OUTPUT_DIR]$DEBUG_FILES_OUTPUT_DIR"
++	echo "##vso[task.setvariable variable=DEBUG_FILES_NAME]$DEBUG_FILES_NAME"
++	mkdir -p $DEBUG_FILES_OUTPUT_DIR || { echo "FAILURE: cannot create log directory '${DEBUG_FILES_OUTPUT_DIR}'." ; exit 1; }
++}
++
++function debug_files_compress {
++	echo "Compressing debug files"
++	tar -zcvf /tmp/$DEBUG_FILES_NAME.tgz -C $DEBUG_FILES_OUTPUT_DIR .
++	# clean directory
++	find $DEBUG_FILES_OUTPUT_DIR -delete
++	mv /tmp/$DEBUG_FILES_NAME.tgz $DEBUG_FILES_OUTPUT_DIR
++}
+diff --git a/tools/azure-pipelines/jobs-template.yml b/tools/azure-pipelines/jobs-template.yml
+index 0efb1a24bc499..cf8fc85afbff0 100644
+--- a/tools/azure-pipelines/jobs-template.yml
++++ b/tools/azure-pipelines/jobs-template.yml
+@@ -24,7 +24,8 @@ parameters:
+ 
+ jobs:
+ - job: compile_${{parameters.stage_name}}
+-  condition: not(eq(variables['MODE'], 'e2e'))
++  # succeeded() is needed to allow job cancellation
++  condition: and(succeeded(), not(eq(variables['MODE'], 'e2e')))
+   pool: ${{parameters.test_pool_definition}}
+   container: ${{parameters.container}}
+   timeoutInMinutes: 240
+@@ -64,14 +65,16 @@ jobs:
+     displayName: "Set to jdk11"
+     condition: eq('${{parameters.jdk}}', 'jdk11')
+   # Compile
+-  - script: STAGE=compile ${{parameters.environment}} ./tools/azure_controller.sh compile
+-    displayName: Build
++  - script: |
++      ${{parameters.environment}} ./tools/ci/compile.sh || exit $?
++      ./tools/azure-pipelines/create_build_artifact.sh
++    displayName: Compile
+ 
+   # upload artifacts for next stage
+   - task: PublishPipelineArtifact@1
+     inputs:
+-      path: $(CACHE_FLINK_DIR)
+-      artifact: FlinkCompileCacheDir-${{parameters.stage_name}}
++      targetPath: $(FLINK_ARTIFACT_DIR)
++      artifact: FlinkCompileArtifact-${{parameters.stage_name}}
+ 
+ - job: test_${{parameters.stage_name}}
+   dependsOn: compile_${{parameters.stage_name}}
+@@ -107,11 +110,14 @@ jobs:
+     condition: not(eq('${{parameters.test_pool_definition.name}}', 'Default'))
+     displayName: Free up disk space
+ 
+-  # download artifacts
++  # download artifact from compile stage
+   - task: DownloadPipelineArtifact@2
+     inputs:
+-      path: $(CACHE_FLINK_DIR)
+-      artifact: FlinkCompileCacheDir-${{parameters.stage_name}}
++      path: $(FLINK_ARTIFACT_DIR)
++      artifact: FlinkCompileArtifact-${{parameters.stage_name}}
++
++  - script: ./tools/azure-pipelines/unpack_build_artifact.sh
++    displayName: "Unpack Build artifact"
+ 
+   - task: Cache@2
+     inputs:
+@@ -121,15 +127,25 @@ jobs:
+     continueOnError: true # continue the build even if the cache fails.
+     condition: not(eq('${{parameters.test_pool_definition.name}}', 'Default'))
+     displayName: Cache Maven local repo
++
+   - script: |
+       echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_HOME_11_X64"
+       echo "##vso[task.setvariable variable=PATH]$JAVA_HOME_11_X64/bin:$PATH"
+     displayName: "Set to jdk11"
+     condition: eq('${{parameters.jdk}}', 'jdk11')  
++
+   - script: sudo sysctl -w kernel.core_pattern=core.%p
+     displayName: Set coredump pattern
++
+   # Test
+-  - script: STAGE=test ${{parameters.environment}} ./tools/azure_controller.sh $(module)
++  - script: |
++      source ./tools/azure-pipelines/debug_files_utils.sh
++      debug_files_prepare $(module)
++      
++      ${{parameters.environment}} ./tools/ci/test_controller.sh $(module) ; TEST_EXIT_CODE=$?
++    
++      debug_files_compress
++      exit $TEST_EXIT_CODE
+     displayName: Test - $(module)
+     env:
+       IT_CASE_S3_BUCKET: $(SECRET_S3_BUCKET)
+@@ -137,15 +153,17 @@ jobs:
+       IT_CASE_S3_SECRET_KEY: $(SECRET_S3_SECRET_KEY)
+ 
+   - task: PublishTestResults@2
++    condition: succeededOrFailed()
+     inputs:
+       testResultsFormat: 'JUnit'
++
+   # upload debug artifacts
+   - task: PublishPipelineArtifact@1
+-    condition: and(succeededOrFailed(), not(eq('$(ARTIFACT_DIR)', '')))
++    condition: and(succeededOrFailed(), not(eq('$(DEBUG_FILES_OUTPUT_DIR)', '')))
+     displayName: Upload Logs
+     inputs:
+-      path: $(ARTIFACT_DIR)
+-      artifact: logs-${{parameters.stage_name}}-$(ARTIFACT_NAME)
++      targetPath: $(DEBUG_FILES_OUTPUT_DIR)
++      artifact: logs-${{parameters.stage_name}}-$(DEBUG_FILES_NAME)
+ 
+ - job: e2e_${{parameters.stage_name}}
+   # uncomment below condition to run the e2e tests only on request.
+@@ -164,6 +182,12 @@ jobs:
+         path: $(MAVEN_CACHE_FOLDER)
+       displayName: Cache Maven local repo
+       continueOnError: true
++    - task: Cache@2
++      inputs:
++        key: e2e-cache | flink-end-to-end-tests/**/*.java, !**/avro/**
++        path: $(E2E_CACHE_FOLDER)
++      displayName: Cache E2E files
++      continueOnError: true
+     - script: |
+         echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_HOME_11_X64"
+         echo "##vso[task.setvariable variable=PATH]$JAVA_HOME_11_X64/bin:$PATH"
+@@ -178,11 +202,8 @@ jobs:
+     - script: ./tools/azure-pipelines/free_disk_space.sh
+       displayName: Free up disk space
+     - script: sudo apt-get install -y bc
+-    - script: ${{parameters.environment}} STAGE=compile ./tools/azure_controller.sh compile
++    - script: ${{parameters.environment}} ./tools/ci/compile.sh
+       displayName: Build Flink
+-    # TODO remove pre-commit tests script by adding the tests to the nightly script
+-#    - script: FLINK_DIR=build-target ./flink-end-to-end-tests/run-pre-commit-tests.sh
+-#      displayName: Test - precommit 
+     - script: ${{parameters.environment}} FLINK_DIR=`pwd`/build-target flink-end-to-end-tests/run-nightly-tests.sh
+       displayName: Run e2e tests
+       env:
+@@ -194,7 +215,7 @@ jobs:
+       condition: and(succeededOrFailed(), not(eq(variables['ARTIFACT_DIR'], '')))
+       displayName: Upload Logs
+       inputs:
+-        path: $(ARTIFACT_DIR)
++        targetPath: $(ARTIFACT_DIR)
+         artifact: logs-${{parameters.stage_name}}-e2e
+         
+ 
+diff --git a/tools/azure-pipelines/prepare_precommit.sh b/tools/azure-pipelines/unpack_build_artifact.sh
+similarity index 68%
+rename from tools/azure-pipelines/prepare_precommit.sh
+rename to tools/azure-pipelines/unpack_build_artifact.sh
+index cac545bde4984..1f2b7f096e242 100755
+--- a/tools/azure-pipelines/prepare_precommit.sh
++++ b/tools/azure-pipelines/unpack_build_artifact.sh
+@@ -15,10 +15,17 @@
+ #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ #  See the License for the specific language governing permissions and
+ # limitations under the License.
++################################################################################
++
+ 
++if ! [ -e $FLINK_ARTIFACT_DIR ]; then
++    echo "Cached flink dir $FLINK_ARTIFACT_DIR does not exist. Exiting build."
++    exit 1
++fi
+ 
+ echo "Merging cache"
+-cp -RT "$CACHE_FLINK_DIR" "."
++cp -RT "$FLINK_ARTIFACT_DIR" "."
++
+ echo "Adjusting timestamps"
+ # adjust timestamps to prevent recompilation
+ find . -type f -name '*.java' | xargs touch
+@@ -28,20 +35,3 @@ sleep 5
+ find . -type f -name '*.class' | xargs touch
+ find . -type f -name '*.timestamp' | xargs touch
+ 
+-
+-export M2_HOME=/home/vsts/maven_cache/apache-maven-3.2.5/ 
+-export PATH=/home/vsts/maven_cache/apache-maven-3.2.5/bin:$PATH
+-run_mvn -version
+-MVN_CALL="run_mvn install -DskipTests -Drat.skip"
+-$MVN_CALL
+-EXIT_CODE=$?
+-
+-if [ $EXIT_CODE != 0 ]; then
+-	echo "=============================================================================="
+-	echo "Build error. Exit code: $EXIT_CODE. Failing build"
+-	echo "=============================================================================="
+-	exit $EXIT_CODE
+-fi
+-
+-chmod -R +x build-target
+-chmod -R +x flink-end-to-end-tests
+diff --git a/tools/azure_controller.sh b/tools/azure_controller.sh
+deleted file mode 100755
+index 6c0a74c737155..0000000000000
+--- a/tools/azure_controller.sh
++++ /dev/null
+@@ -1,198 +0,0 @@
+-#!/usr/bin/env bash
+-################################################################################
+-#  Licensed to the Apache Software Foundation (ASF) under one
+-#  or more contributor license agreements.  See the NOTICE file
+-#  distributed with this work for additional information
+-#  regarding copyright ownership.  The ASF licenses this file
+-#  to you under the Apache License, Version 2.0 (the
+-#  "License"); you may not use this file except in compliance
+-#  with the License.  You may obtain a copy of the License at
+-#
+-#      http://www.apache.org/licenses/LICENSE-2.0
+-#
+-#  Unless required by applicable law or agreed to in writing, software
+-#  distributed under the License is distributed on an "AS IS" BASIS,
+-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-#  See the License for the specific language governing permissions and
+-# limitations under the License.
+-################################################################################
+-
+-HERE="`dirname \"$0\"`"             # relative
+-HERE="`( cd \"$HERE\" && pwd )`"    # absolutized and normalized
+-if [ -z "$HERE" ] ; then
+-    # error; for some reason, the path is not accessible
+-    # to the script (e.g. permissions re-evaled after suid)
+-    exit 1  # fail
+-fi
+-
+-source "${HERE}/ci/stage.sh"
+-source "${HERE}/ci/shade.sh"
+-source "${HERE}/ci/maven-utils.sh"
+-
+-echo $M2_HOME
+-echo $PATH
+-echo $MAVEN_OPTS
+-
+-run_mvn -version
+-echo "Commit: $(git rev-parse HEAD)"
+-
+-print_system_info() {
+-    echo "CPU information"
+-    lscpu
+-
+-    echo "Memory information"
+-    cat /proc/meminfo
+-
+-    echo "Disk information"
+-    df -hH
+-
+-    echo "Running build as"
+-    whoami
+-}
+-
+-print_system_info
+-
+-
+-STAGE=$1
+-echo "Current stage: \"$STAGE\""
+-
+-EXIT_CODE=0
+-
+-# Set up a custom Maven settings file, configuring an Google-hosted maven central
+-# mirror. We use a different mirror because the official maven central mirrors
+-# often lead to connection timeouts (probably due to rate-limiting)
+-
+-MVN="run_mvn clean install $MAVEN_OPTS -Dflink.convergence.phase=install -Pcheck-convergence -Dflink.forkCount=2 -Dflink.forkCountTestPackage=2 -Dmaven.javadoc.skip=true -U -DskipTests"
+-
+-# Run actual compile&test steps
+-if [ $STAGE == "$STAGE_COMPILE" ]; then
+-    # run mvn clean install:
+-    $MVN
+-    EXIT_CODE=$?
+-
+-    if [ $EXIT_CODE == 0 ]; then
+-        echo "\n\n==============================================================================\n"
+-        echo "Checking scala suffixes\n"
+-        echo "==============================================================================\n"
+-
+-        ./tools/verify_scala_suffixes.sh "${PROFILE}"
+-        EXIT_CODE=$?
+-    else
+-        echo "\n==============================================================================\n"
+-        echo "Previous build failure detected, skipping scala-suffixes check.\n"
+-        echo "==============================================================================\n"
+-    fi
+-    
+-    if [ $EXIT_CODE == 0 ]; then
+-        check_shaded_artifacts
+-        EXIT_CODE=$(($EXIT_CODE+$?))
+-        check_shaded_artifacts_s3_fs hadoop
+-        EXIT_CODE=$(($EXIT_CODE+$?))
+-        check_shaded_artifacts_s3_fs presto
+-        EXIT_CODE=$(($EXIT_CODE+$?))
+-        check_shaded_artifacts_connector_elasticsearch 2
+-        EXIT_CODE=$(($EXIT_CODE+$?))
+-        check_shaded_artifacts_connector_elasticsearch 5
+-        EXIT_CODE=$(($EXIT_CODE+$?))
+-        check_shaded_artifacts_connector_elasticsearch 6
+-        EXIT_CODE=$(($EXIT_CODE+$?))
+-    else
+-        echo "=============================================================================="
+-        echo "Previous build failure detected, skipping shaded dependency check."
+-        echo "=============================================================================="
+-    fi
+-
+-    if [ $EXIT_CODE == 0 ]; then
+-        echo "Creating cache build directory $CACHE_FLINK_DIR"
+-    
+-        cp -r . "$CACHE_FLINK_DIR"
+-
+-        function minimizeCachedFiles() {
+-            # reduces the size of the cached directory to speed up
+-            # the packing&upload / download&unpacking process
+-            # by removing files not required for subsequent stages
+-    
+-            # jars are re-built in subsequent stages, so no need to cache them (cannot be avoided)
+-            find "$CACHE_FLINK_DIR" -maxdepth 8 -type f -name '*.jar' \
+-            ! -path "$CACHE_FLINK_DIR/flink-formats/flink-csv/target/flink-csv*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-formats/flink-json/target/flink-json*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-formats/flink-avro/target/flink-avro*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-runtime/target/flink-runtime*tests.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-streaming-java/target/flink-streaming-java*tests.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-dist/target/flink-*-bin/flink-*/lib/flink-dist*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-dist/target/flink-*-bin/flink-*/lib/flink-table_*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-dist/target/flink-*-bin/flink-*/lib/flink-table-blink*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-dist/target/flink-*-bin/flink-*/opt/flink-python*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-dist/target/flink-*-bin/flink-*/opt/flink-sql-client_*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-connectors/flink-connector-elasticsearch-base/target/flink-*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-connectors/flink-connector-kafka-base/target/flink-*.jar" \
+-            ! -path "$CACHE_FLINK_DIR/flink-table/flink-table-planner/target/flink-table-planner*tests.jar" | xargs rm -rf
+-    
+-            # .git directory
+-            # not deleting this can cause build stability issues
+-            # merging the cached version sometimes fails
+-            rm -rf "$CACHE_FLINK_DIR/.git"
+-
+-            # AZ Pipelines has a problem with links.
+-            rm "$CACHE_FLINK_DIR/build-target"
+-        }
+-    
+-        echo "Minimizing cache"
+-        minimizeCachedFiles
+-    else
+-        echo "=============================================================================="
+-        echo "Previous build failure detected, skipping cache setup."
+-        echo "=============================================================================="
+-    fi
+-elif [ $STAGE != "$STAGE_CLEANUP" ]; then
+-    if ! [ -e $CACHE_FLINK_DIR ]; then
+-        echo "Cached flink dir $CACHE_FLINK_DIR does not exist. Exiting build."
+-        exit 1
+-    fi
+-    # merged compiled flink into local clone
+-    # this prevents the cache from being re-uploaded
+-    echo "Merging cache"
+-    cp -RT "$CACHE_FLINK_DIR" "."
+-
+-    echo "Adjusting timestamps"
+-    # adjust timestamps to prevent recompilation
+-    find . -type f -name '*.java' | xargs touch
+-    find . -type f -name '*.scala' | xargs touch
+-    # wait a bit for better odds of different timestamps
+-    sleep 5
+-    find . -type f -name '*.class' | xargs touch
+-    find . -type f -name '*.timestamp' | xargs touch
+-
+-    if [ $STAGE == $STAGE_PYTHON ]; then
+-        echo "=============================================================================="
+-        echo "Python stage found. Re-compiling (this is required on Azure for the python tests to pass)"
+-        echo "=============================================================================="
+-        # run mvn install (w/o "clean"):
+-        PY_MVN="${MVN// clean/}"
+-        PY_MVN="$PY_MVN -Drat.skip=true"
+-        ${PY_MVN}
+-        EXIT_CODE=$?
+-
+-        if [ $EXIT_CODE != 0 ]; then
+-            echo "=============================================================================="
+-            echo "Compile error for python stage preparation. Exit code: $EXIT_CODE. Failing build"
+-            echo "=============================================================================="
+-            exit $EXIT_CODE
+-        fi
+-        
+-        echo "Done compiling ... "
+-    fi
+-
+-
+-    TEST="$STAGE" "./tools/travis_watchdog.sh" 900
+-    EXIT_CODE=$?
+-elif [ $STAGE == "$STAGE_CLEANUP" ]; then
+-    echo "Cleaning up $CACHE_BUILD_DIR"
+-    rm -rf "$CACHE_BUILD_DIR"
+-else
+-    echo "Invalid Stage specified: $STAGE"
+-    exit 1
+-fi
+-
+-# Exit code for Azure build success/failure
+-exit $EXIT_CODE
+diff --git a/tools/ci/compile.sh b/tools/ci/compile.sh
+new file mode 100755
+index 0000000000000..b0b4803f2a985
+--- /dev/null
++++ b/tools/ci/compile.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++################################################################################
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++# limitations under the License.
++################################################################################
++
++#
++# This file contains tooling for compiling Flink
++#
++
++HERE="`dirname \"$0\"`"             # relative
++HERE="`( cd \"$HERE\" && pwd )`"    # absolutized and normalized
++if [ -z "$HERE" ] ; then
++    exit 1  # fail
++fi
++CI_DIR="$HERE/../ci"
++
++# source required ci scripts
++source "${CI_DIR}/stage.sh"
++source "${CI_DIR}/shade.sh"
++source "${CI_DIR}/maven-utils.sh"
++
++echo "Maven version:"
++run_mvn -version
++
++echo "=============================================================================="
++echo "Compiling Flink"
++echo "=============================================================================="
++
++EXIT_CODE=0
++
++run_mvn clean install $MAVEN_OPTS -Dflink.convergence.phase=install -Pcheck-convergence -Dflink.forkCount=2 \
++    -Dflink.forkCountTestPackage=2 -Dmaven.javadoc.skip=true -U -DskipTests
++
++EXIT_CODE=$?
++
++if [ $EXIT_CODE == 0 ]; then
++    echo "=============================================================================="
++    echo "Checking scala suffixes"
++    echo "=============================================================================="
++
++    ${CI_DIR}/verify_scala_suffixes.sh "${PROFILE}"
++    EXIT_CODE=$?
++else
++    echo "=============================================================================="
++    echo "Previous build failure detected, skipping scala-suffixes check."
++    echo "=============================================================================="
++fi
++
++if [ $EXIT_CODE == 0 ]; then
++    check_shaded_artifacts
++    EXIT_CODE=$(($EXIT_CODE+$?))
++    check_shaded_artifacts_s3_fs hadoop
++    EXIT_CODE=$(($EXIT_CODE+$?))
++    check_shaded_artifacts_s3_fs presto
++    EXIT_CODE=$(($EXIT_CODE+$?))
++    check_shaded_artifacts_connector_elasticsearch 5
++    EXIT_CODE=$(($EXIT_CODE+$?))
++    check_shaded_artifacts_connector_elasticsearch 6
++    EXIT_CODE=$(($EXIT_CODE+$?))
++else
++    echo "=============================================================================="
++    echo "Previous build failure detected, skipping shaded dependency check."
++    echo "=============================================================================="
++fi
++
++exit $EXIT_CODE
++
+diff --git a/tools/ci/controller_utils.sh b/tools/ci/controller_utils.sh
+new file mode 100644
+index 0000000000000..e209a40285fa8
+--- /dev/null
++++ b/tools/ci/controller_utils.sh
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++################################################################################
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++# limitations under the License.
++################################################################################
++
++print_system_info() {
++    echo "CPU information"
++    lscpu
++
++    echo "Memory information"
++    cat /proc/meminfo
++
++    echo "Disk information"
++    df -hH
++
++    echo "Running build as"
++    whoami
++}
++
++# locate YARN logs and put them into artifacts directory
++put_yarn_logs_to_artifacts() {
++	for file in `find ./flink-yarn-tests/target -type f -name '*.log'`; do
++		TARGET_FILE=`echo "$file" | grep -Eo "container_[0-9_]+/(.*).log"`
++		TARGET_DIR=`dirname	 "$TARGET_FILE"`
++		mkdir -p "$DEBUG_FILES_OUTPUT_DIR/yarn-tests/$TARGET_DIR"
++		cp $file "$DEBUG_FILES_OUTPUT_DIR/yarn-tests/$TARGET_FILE"
++	done
++}
++
++print_stacktraces () {
++	echo "=============================================================================="
++	echo "The following Java processes are running (JPS)"
++	echo "=============================================================================="
++
++	jps
++
++	local pids=( $(jps | awk '{print $1}') )
++
++	for pid in "${pids[@]}"; do
++		echo "=============================================================================="
++		echo "Printing stack trace of Java process ${pid}"
++		echo "=============================================================================="
++
++		jstack $pid
++	done
++}
+diff --git a/tools/log4j-travis.properties b/tools/ci/log4j-ci.properties
+similarity index 100%
+rename from tools/log4j-travis.properties
+rename to tools/ci/log4j-ci.properties
+diff --git a/tools/ci/maven-utils.sh b/tools/ci/maven-utils.sh
+index c85057211756d..f3be22a53b9e6 100755
+--- a/tools/ci/maven-utils.sh
++++ b/tools/ci/maven-utils.sh
+@@ -73,7 +73,7 @@ function collect_coredumps {
+ 	echo "Searching for .dump, .dumpstream and related files in '$SEARCHDIR'"
+ 	for file in `find $SEARCHDIR -type f -regextype posix-extended -iregex '.*\.hprof|.*\.dump|.*\.dumpstream|.*hs.*\.log|.*/core(.[0-9]+)?$'`; do
+ 		echo "Moving '$file' to target directory ('$TARGET_DIR')"
+-		mv $file $TARGET_DIR/
++		mv $file $TARGET_DIR/$(echo $file | tr "/" "-")
+ 	done
+ }
+ 
+diff --git a/tools/ci/shade.sh b/tools/ci/shade.sh
+old mode 100644
+new mode 100755
+diff --git a/tools/ci/stage.sh b/tools/ci/stage.sh
+old mode 100644
+new mode 100755
+index e431ebe1c7d7b..c8536f6323f3f
+--- a/tools/ci/stage.sh
++++ b/tools/ci/stage.sh
+@@ -158,6 +158,10 @@ function get_compile_modules_for_stage() {
+             # the negation takes precedence, thus not all required modules would be built
+             echo ""
+         ;;
++        (${STAGE_PYTHON})
++            # compile everything. The Python tests expect a full Flink distribution.
++            echo ""
++        ;;
+     esac
+ }
+ 
+diff --git a/tools/ci/test_controller.sh b/tools/ci/test_controller.sh
+new file mode 100755
+index 0000000000000..9432059b506db
+--- /dev/null
++++ b/tools/ci/test_controller.sh
+@@ -0,0 +1,124 @@
++#!/usr/bin/env bash
++################################################################################
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++# limitations under the License.
++################################################################################
++
++#
++# This file contains generic control over the test execution.
++#
++
++HERE="`dirname \"$0\"`"             # relative
++HERE="`( cd \"$HERE\" && pwd )`"    # absolutized and normalized
++if [ -z "$HERE" ] ; then
++	exit 1
++fi
++
++source "${HERE}/stage.sh"
++source "${HERE}/maven-utils.sh"
++source "${HERE}/controller_utils.sh"
++source "${HERE}/watchdog.sh"
++STAGE=$1
++
++# =============================================================================
++# Step 0: Check & print environment information & configure env
++# =============================================================================
++
++# check preconditions
++if [ -z "$DEBUG_FILES_OUTPUT_DIR" ] ; then
++	echo "ERROR: Environment variable 'DEBUG_FILES_OUTPUT_DIR' is not set but expected by test_controller.sh. Tests may use this location to store debugging files."
++	exit 1
++fi
++
++if [ ! -d "$DEBUG_FILES_OUTPUT_DIR" ] ; then
++	echo "ERROR: Environment variable DEBUG_FILES_OUTPUT_DIR=$DEBUG_FILES_OUTPUT_DIR points to a directory that does not exist"
++	exit 1
++fi
++
++if [ -z "$STAGE" ] ; then
++	echo "ERROR: Environment variable 'STAGE' is not set but expected by test_controller.sh. THe variable refers to the stage being executed."
++	exit 1
++fi
++
++echo "Printing environment information"
++
++echo "PATH=$PATH"
++run_mvn -version
++echo "Commit: $(git rev-parse HEAD)"
++print_system_info
++
++# enable coredumps for this process
++ulimit -c unlimited
++
++# configure JVMs to produce heap dumps
++export JAVA_TOOL_OPTIONS="-XX:+HeapDumpOnOutOfMemoryError"
++
++# some tests provide additional logs if they find this variable
++export IS_CI=true
++
++# =============================================================================
++# Step 1: Rebuild jars and install Flink to local maven repository
++# =============================================================================
++
++LOG4J_PROPERTIES=${HERE}/log4j-ci.properties
++MVN_LOGGING_OPTIONS="-Dlog.dir=${DEBUG_FILES_OUTPUT_DIR} -Dlog4j.configurationFile=file://$LOG4J_PROPERTIES"
++
++MVN_COMMON_OPTIONS="-Dflink.forkCount=2 -Dflink.forkCountTestPackage=2 -Dfast -Pskip-webui-build $MVN_LOGGING_OPTIONS"
++MVN_COMPILE_OPTIONS="-DskipTests"
++MVN_COMPILE_MODULES=$(get_compile_modules_for_stage ${STAGE})
++
++CALLBACK_ON_TIMEOUT="print_stacktraces | tee ${DEBUG_FILES_OUTPUT_DIR}/jps-traces.out"
++run_with_watchdog "run_mvn $MVN_COMMON_OPTIONS $MVN_COMPILE_OPTIONS $PROFILE $MVN_COMPILE_MODULES install" $CALLBACK_ON_TIMEOUT
++EXIT_CODE=$?
++
++if [ $EXIT_CODE != 0 ]; then
++	echo "=============================================================================="
++	echo "Compilation failure detected, skipping test execution."
++	echo "=============================================================================="
++	exit $EXIT_CODE
++fi
++
++
++# =============================================================================
++# Step 2: Run tests
++# =============================================================================
++
++if [ $STAGE == $STAGE_PYTHON ]; then
++	run_with_watchdog "./flink-python/dev/lint-python.sh" $CALLBACK_ON_TIMEOUT
++	EXIT_CODE=$?
++else
++	MVN_TEST_OPTIONS="-Dflink.tests.with-openssl"
++	MVN_TEST_MODULES=$(get_test_modules_for_stage ${STAGE})
++
++	run_with_watchdog "run_mvn $MVN_COMMON_OPTIONS $MVN_TEST_OPTIONS $PROFILE $MVN_TEST_MODULES verify" $CALLBACK_ON_TIMEOUT
++	EXIT_CODE=$?
++fi
++
++# =============================================================================
++# Step 3: Put extra logs into $DEBUG_FILES_OUTPUT_DIR
++# =============================================================================
++
++# only misc builds flink-yarn-tests
++case $STAGE in
++	(misc)
++		put_yarn_logs_to_artifacts
++	;;
++esac
++
++collect_coredumps $(pwd) $DEBUG_FILES_OUTPUT_DIR
++
++# Exit code for CI build success/failure
++exit $EXIT_CODE
+diff --git a/tools/verify_scala_suffixes.sh b/tools/ci/verify_scala_suffixes.sh
+similarity index 100%
+rename from tools/verify_scala_suffixes.sh
+rename to tools/ci/verify_scala_suffixes.sh
+diff --git a/tools/ci/watchdog.sh b/tools/ci/watchdog.sh
+new file mode 100755
+index 0000000000000..1e03430f84e56
+--- /dev/null
++++ b/tools/ci/watchdog.sh
+@@ -0,0 +1,111 @@
++#!/usr/bin/env bash
++################################################################################
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++# limitations under the License.
++################################################################################
++
++#
++# This file contains a watchdog tool to monitor a task and potentially kill it after
++# not producing any output for $MAX_NO_OUTPUT seconds.
++#
++
++# Number of seconds w/o output before printing a stack trace and killing the watched process
++MAX_NO_OUTPUT=${MAX_NO_OUTPUT:-900}
++
++# Number of seconds to sleep before checking the output again
++SLEEP_TIME=${SLEEP_TIME:-20}
++
++# Internal fields
++CMD_OUT="/tmp/watchdog.out"
++CMD_PID="/tmp/watchdog.pid"
++CMD_EXIT="/tmp/watchdog.exit"
++
++
++# =============================================
++# Utility functions
++# ============================================= 
++
++mod_time () {
++	echo `stat -c "%Y" $CMD_OUT`
++}
++
++the_time() {
++	echo `date +%s`
++}
++
++# watchdog process
++
++watchdog () {
++	touch $CMD_OUT
++
++	while true; do
++		sleep $SLEEP_TIME
++
++		time_diff=$((`the_time` - `mod_time`))
++
++		if [ $time_diff -ge $MAX_NO_OUTPUT ]; then
++			echo "=============================================================================="
++			echo "Process produced no output for ${MAX_NO_OUTPUT} seconds."
++			echo "=============================================================================="
++
++			# run timeout callback
++			$CALLBACK_ON_TIMEOUT
++
++			echo "Killing process with pid=$(<$CMD_PID) and all descendants"
++			pkill -P $(<$CMD_PID) # kill descendants
++			kill $(<$CMD_PID) # kill process itself
++
++			exit 1
++		fi
++	done
++}
++
++
++# =============================================
++# main function
++# =============================================
++
++# entrypoint
++function run_with_watchdog() {
++	local cmd="$1"
++	local CALLBACK_ON_TIMEOUT="$2"
++
++	watchdog &
++	WD_PID=$!
++	echo "STARTED watchdog (${WD_PID})."
++
++	echo "RUNNING '${cmd}'."
++
++	# Run $CMD and pipe output to $CMD_OUT for the watchdog. The PID is written to $CMD_PID to
++	# allow the watchdog to kill $CMD if it is not producing any output anymore. $CMD_EXIT contains
++	# the exit code. This is important for CI build life-cycle (success/failure).
++	( $cmd & PID=$! ; echo $PID >&3 ; wait $PID ; echo $? >&4 ) 3>$CMD_PID 4>$CMD_EXIT | tee $CMD_OUT
++
++	EXIT_CODE=$(<$CMD_EXIT)
++
++	echo "Process exited with EXIT CODE: ${EXIT_CODE}."
++
++	# Make sure to kill the watchdog in any case after $CMD has completed
++	echo "Trying to KILL watchdog (${WD_PID})."
++	( kill $WD_PID 2>&1 ) > /dev/null
++
++	rm $CMD_PID
++	rm $CMD_EXIT
++
++	return $EXIT_CODE
++}
++
++
+diff --git a/tools/merge_flink_pr.py b/tools/merge_flink_pr.py
+deleted file mode 100755
+index 4a6f41675bf76..0000000000000
+--- a/tools/merge_flink_pr.py
++++ /dev/null
+@@ -1,336 +0,0 @@
+-#!/usr/bin/env python
+-
+-#
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#    http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-
+-# Utility for creating well-formed pull request merges and pushing them to Apache.
+-#   usage: ./merge_flink_pr.sh    (see config env vars below)
+-#
+-# This utility assumes you already have local a Flink git folder and that you
+-# have added remotes corresponding to both (i) the github apache FLINK
+-# mirror and (ii) the apache git repo.
+-
+-#
+-# Note by Robert Metzger:
+-# This script has been written by the Apache Spark team.
+-# I found the source here: https://github.com/apache/spark/blob/master/dev/merge_spark_pr.py
+-#
+-
+-import json
+-import os
+-import re
+-import subprocess
+-import sys
+-import tempfile
+-import urllib2
+-
+-try:
+-    import jira.client
+-    JIRA_IMPORTED = True
+-except ImportError:
+-    JIRA_IMPORTED = False
+-
+-# Location of your FLINK git development area
+-FLINK_HOME = os.environ.get("FLINK_HOME", "/home/patrick/Documents/spark")
+-# Remote name which points to the Github site
+-PR_REMOTE_NAME = os.environ.get("PR_REMOTE_NAME", "apache-github")
+-# Remote name which points to Apache git
+-PUSH_REMOTE_NAME = os.environ.get("PUSH_REMOTE_NAME", "apache")
+-# ASF JIRA username
+-JIRA_USERNAME = os.environ.get("JIRA_USERNAME", "pwendell")
+-# ASF JIRA password
+-JIRA_PASSWORD = os.environ.get("JIRA_PASSWORD", "1234")
+-
+-GITHUB_BASE = "https://github.com/apache/flink/pull"
+-GITHUB_API_BASE = "https://api.github.com/repos/apache/flink"
+-JIRA_BASE = "https://issues.apache.org/jira/browse"
+-JIRA_API_BASE = "https://issues.apache.org/jira"
+-# Prefix added to temporary branches
+-BRANCH_PREFIX = "PR_TOOL"
+-
+-os.chdir(FLINK_HOME)
+-
+-
+-def get_json(url):
+-    try:
+-        return json.load(urllib2.urlopen(url))
+-    except urllib2.HTTPError as e:
+-        print "Unable to fetch URL, exiting: %s" % url
+-        sys.exit(-1)
+-
+-
+-def fail(msg):
+-    print msg
+-    clean_up()
+-    sys.exit(-1)
+-
+-
+-def run_cmd(cmd):
+-    if isinstance(cmd, list):
+-        return subprocess.check_output(cmd)
+-    else:
+-        return subprocess.check_output(cmd.split(" "))
+-
+-
+-def continue_maybe(prompt):
+-    result = raw_input("\n%s (y/n): " % prompt)
+-    if result.lower() != "y":
+-        fail("Okay, exiting")
+-
+-
+-original_head = run_cmd("git rev-parse --abbrev-ref HEAD").rstrip("/\n")
+-
+-
+-def clean_up():
+-    print "Restoring head pointer to %s" % original_head
+-    run_cmd("git checkout %s" % original_head)
+-
+-    branches = run_cmd("git branch").replace(" ", "").split("\n")
+-
+-    for branch in filter(lambda x: x.startswith(BRANCH_PREFIX), branches):
+-        print "Deleting local branch %s" % branch
+-        run_cmd("git branch -D %s" % branch)
+-
+-
+-# merge the requested PR and return the merge hash
+-def merge_pr(pr_num, target_ref):
+-    pr_branch_name = "%s_MERGE_PR_%s" % (BRANCH_PREFIX, pr_num)
+-    target_branch_name = "%s_MERGE_PR_%s_%s" % (BRANCH_PREFIX, pr_num, target_ref.upper())
+-    run_cmd("git fetch %s pull/%s/head:%s" % (PR_REMOTE_NAME, pr_num, pr_branch_name))
+-    run_cmd("git fetch %s %s:%s" % (PUSH_REMOTE_NAME, target_ref, target_branch_name))
+-    run_cmd("git checkout %s" % target_branch_name)
+-
+-    had_conflicts = False
+-    try:
+-        run_cmd(['git', 'merge', pr_branch_name, '--squash'])
+-    except Exception as e:
+-        msg = "Error merging: %s\nWould you like to manually fix-up this merge?" % e
+-        continue_maybe(msg)
+-        msg = "Okay, please fix any conflicts and 'git add' conflicting files... Finished?"
+-        continue_maybe(msg)
+-        had_conflicts = True
+-
+-    commit_authors = run_cmd(['git', 'log', 'HEAD..%s' % pr_branch_name,
+-                             '--pretty=format:%an <%ae>']).split("\n")
+-    distinct_authors = sorted(set(commit_authors),
+-                              key=lambda x: commit_authors.count(x), reverse=True)
+-    primary_author = distinct_authors[0]
+-    commits = run_cmd(['git', 'log', 'HEAD..%s' % pr_branch_name,
+-                      '--pretty=format:%h [%an] %s']).split("\n\n")
+-
+-    merge_message_flags = []
+-
+-    merge_message_flags += ["-m", title]
+-    if body != None:
+-        merge_message_flags += ["-m", body]
+-
+-    authors = "\n".join(["Author: %s" % a for a in distinct_authors])
+-
+-    merge_message_flags += ["-m", authors]
+-
+-    if had_conflicts:
+-        committer_name = run_cmd("git config --get user.name").strip()
+-        committer_email = run_cmd("git config --get user.email").strip()
+-        message = "This patch had conflicts when merged, resolved by\nCommitter: %s <%s>" % (
+-            committer_name, committer_email)
+-        merge_message_flags += ["-m", message]
+-
+-    # The string "Closes #%s" string is required for GitHub to correctly close the PR
+-    merge_message_flags += [
+-        "-m",
+-        "Closes #%s from %s and squashes the following commits:" % (pr_num, pr_repo_desc)]
+-    for c in commits:
+-        merge_message_flags += ["-m", c]
+-
+-    run_cmd(['git', 'commit', '--author="%s"' % primary_author] + merge_message_flags)
+-
+-    continue_maybe("Merge complete (local ref %s). Push to %s?" % (
+-        target_branch_name, PUSH_REMOTE_NAME))
+-
+-    try:
+-        run_cmd('git push %s %s:%s' % (PUSH_REMOTE_NAME, target_branch_name, target_ref))
+-    except Exception as e:
+-        clean_up()
+-        fail("Exception while pushing: %s" % e)
+-
+-    merge_hash = run_cmd("git rev-parse %s" % target_branch_name)[:8]
+-    clean_up()
+-    print("Pull request #%s merged!" % pr_num)
+-    print("Merge hash: %s" % merge_hash)
+-    return merge_hash
+-
+-
+-def cherry_pick(pr_num, merge_hash, default_branch):
+-    pick_ref = raw_input("Enter a branch name [%s]: " % default_branch)
+-    if pick_ref == "":
+-        pick_ref = default_branch
+-
+-    pick_branch_name = "%s_PICK_PR_%s_%s" % (BRANCH_PREFIX, pr_num, pick_ref.upper())
+-
+-    run_cmd("git fetch %s %s:%s" % (PUSH_REMOTE_NAME, pick_ref, pick_branch_name))
+-    run_cmd("git checkout %s" % pick_branch_name)
+-    run_cmd("git cherry-pick -sx %s" % merge_hash)
+-
+-    continue_maybe("Pick complete (local ref %s). Push to %s?" % (
+-        pick_branch_name, PUSH_REMOTE_NAME))
+-
+-    try:
+-        run_cmd('git push %s %s:%s' % (PUSH_REMOTE_NAME, pick_branch_name, pick_ref))
+-    except Exception as e:
+-        clean_up()
+-        fail("Exception while pushing: %s" % e)
+-
+-    pick_hash = run_cmd("git rev-parse %s" % pick_branch_name)[:8]
+-    clean_up()
+-
+-    print("Pull request #%s picked into %s!" % (pr_num, pick_ref))
+-    print("Pick hash: %s" % pick_hash)
+-    return pick_ref
+-
+-
+-def fix_version_from_branch(branch, versions):
+-    # Note: Assumes this is a sorted (newest->oldest) list of un-released versions
+-    if branch == "master":
+-        return versions[0]
+-    else:
+-        branch_ver = branch.replace("branch-", "")
+-        return filter(lambda x: x.name.startswith(branch_ver), versions)[-1]
+-
+-
+-def resolve_jira(title, merge_branches, comment):
+-    asf_jira = jira.client.JIRA({'server': JIRA_API_BASE},
+-                                basic_auth=(JIRA_USERNAME, JIRA_PASSWORD))
+-
+-    default_jira_id = ""
+-    search = re.findall("FLINK-[0-9]{4,5}", title)
+-    if len(search) > 0:
+-        default_jira_id = search[0]
+-
+-    jira_id = raw_input("Enter a JIRA id [%s]: " % default_jira_id)
+-    if jira_id == "":
+-        jira_id = default_jira_id
+-
+-    try:
+-        issue = asf_jira.issue(jira_id)
+-    except Exception as e:
+-        fail("ASF JIRA could not find %s\n%s" % (jira_id, e))
+-
+-    cur_status = issue.fields.status.name
+-    cur_summary = issue.fields.summary
+-    cur_assignee = issue.fields.assignee
+-    if cur_assignee is None:
+-        cur_assignee = "NOT ASSIGNED!!!"
+-    else:
+-        cur_assignee = cur_assignee.displayName
+-
+-    if cur_status == "Resolved" or cur_status == "Closed":
+-        fail("JIRA issue %s already has status '%s'" % (jira_id, cur_status))
+-    print ("=== JIRA %s ===" % jira_id)
+-    print ("summary\t\t%s\nassignee\t%s\nstatus\t\t%s\nurl\t\t%s/%s\n" % (
+-        cur_summary, cur_assignee, cur_status, JIRA_BASE, jira_id))
+-
+-    versions = asf_jira.project_versions("FLINK")
+-    versions = sorted(versions, key=lambda x: x.name, reverse=True)
+-    versions = filter(lambda x: x.raw['released'] is False, versions)
+-
+-    default_fix_versions = map(lambda x: fix_version_from_branch(x, versions).name, merge_branches)
+-    for v in default_fix_versions:
+-        # Handles the case where we have forked a release branch but not yet made the release.
+-        # In this case, if the PR is committed to the master branch and the release branch, we
+-        # only consider the release branch to be the fix version. E.g. it is not valid to have
+-        # both 1.1.0 and 1.0.0 as fix versions.
+-        (major, minor, patch) = v.split(".")
+-        if patch == "0":
+-            previous = "%s.%s.%s" % (major, int(minor) - 1, 0)
+-            if previous in default_fix_versions:
+-                default_fix_versions = filter(lambda x: x != v, default_fix_versions)
+-    default_fix_versions = ",".join(default_fix_versions)
+-
+-    fix_versions = raw_input("Enter comma-separated fix version(s) [%s]: " % default_fix_versions)
+-    if fix_versions == "":
+-        fix_versions = default_fix_versions
+-    fix_versions = fix_versions.replace(" ", "").split(",")
+-
+-    def get_version_json(version_str):
+-        return filter(lambda v: v.name == version_str, versions)[0].raw
+-
+-    jira_fix_versions = map(lambda v: get_version_json(v), fix_versions)
+-
+-    resolve = filter(lambda a: a['name'] == "Resolve Issue", asf_jira.transitions(jira_id))[0]
+-    asf_jira.transition_issue(
+-        jira_id, resolve["id"], fixVersions=jira_fix_versions, comment=comment)
+-
+-    print "Successfully resolved %s with fixVersions=%s!" % (jira_id, fix_versions)
+-
+-
+-#branches = get_json("%s/branches" % GITHUB_API_BASE)
+-#print "branches %s " % (branches)
+-#branch_names = filter(lambda x: x.startswith("release-"), [x['name'] for x in branches])
+-# Assumes branch names can be sorted lexicographically
+-latest_branch = "master" #sorted(branch_names, reverse=True)[0]
+-
+-pr_num = raw_input("Which pull request would you like to merge? (e.g. 34): ")
+-pr = get_json("%s/pulls/%s" % (GITHUB_API_BASE, pr_num))
+-
+-url = pr["url"]
+-title = pr["title"]
+-body = pr["body"]
+-target_ref = pr["base"]["ref"]
+-user_login = pr["user"]["login"]
+-base_ref = pr["head"]["ref"]
+-pr_repo_desc = "%s/%s" % (user_login, base_ref)
+-
+-if pr["merged"] is True:
+-    print "Pull request %s has already been merged, assuming you want to backport" % pr_num
+-    merge_commit_desc = run_cmd([
+-        'git', 'log', '--merges', '--first-parent',
+-        '--grep=pull request #%s' % pr_num, '--oneline']).split("\n")[0]
+-    if merge_commit_desc == "":
+-        fail("Couldn't find any merge commit for #%s, you may need to update HEAD." % pr_num)
+-
+-    merge_hash = merge_commit_desc[:7]
+-    message = merge_commit_desc[8:]
+-
+-    print "Found: %s" % message
+-    maybe_cherry_pick(pr_num, merge_hash, latest_branch)
+-    sys.exit(0)
+-
+-if not bool(pr["mergeable"]):
+-    msg = "Pull request %s is not mergeable in its current form.\n" % pr_num + \
+-        "Continue? (experts only!)"
+-    continue_maybe(msg)
+-
+-print ("\n=== Pull Request #%s ===" % pr_num)
+-print ("title\t%s\nsource\t%s\ntarget\t%s\nurl\t%s" % (
+-    title, pr_repo_desc, target_ref, url))
+-continue_maybe("Proceed with merging pull request #%s?" % pr_num)
+-
+-merged_refs = [target_ref]
+-
+-merge_hash = merge_pr(pr_num, target_ref)
+-
+-pick_prompt = "Would you like to pick %s into another branch?" % merge_hash
+-while raw_input("\n%s (y/n): " % pick_prompt).lower() == "y":
+-    merged_refs = merged_refs + [cherry_pick(pr_num, merge_hash, latest_branch)]
+-
+-if JIRA_IMPORTED:
+-    continue_maybe("Would you like to update an associated JIRA?")
+-    jira_comment = "Issue resolved by pull request %s\n[%s/%s]" % (pr_num, GITHUB_BASE, pr_num)
+-    resolve_jira(title, merged_refs, jira_comment)
+-else:
+-    print "Could not find jira-python library. Run 'sudo pip install jira-python' to install."
+-    print "Exiting without trying to close the associated JIRA."
+diff --git a/tools/merge_pull_request.sh.template b/tools/merge_pull_request.sh.template
+deleted file mode 100755
+index 41915ddaa9919..0000000000000
+--- a/tools/merge_pull_request.sh.template
++++ /dev/null
+@@ -1,32 +0,0 @@
+-#!/bin/sh
+-
+-#
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#    http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-
+-# the directory where you have your flink code
+-export FLINK_HOME="/home/robert/projects/flink"
+-# Remote name which points to the Gihub site
+-export PR_REMOTE_NAME="github_flink"
+-# Remote name which points to Apache git
+-export PUSH_REMOTE_NAME="asf_flink"
+-# ASF JIRA username
+-export JIRA_USERNAME"rmetzger"
+-# ASF JIRA password
+-export JIRA_PASSWORD="Ideally, don't push your password to git."
+-
+-# Arch Linux users have to call "python2.7" here.
+-python merge_flink_pr.py
+diff --git a/tools/qa-check.sh b/tools/qa-check.sh
+deleted file mode 100755
+index cf3c96398e262..0000000000000
+--- a/tools/qa-check.sh
++++ /dev/null
+@@ -1,181 +0,0 @@
+-#!/usr/bin/env bash
+-
+-#
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#    http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-
+-
+-#
+-# QA check your changes.
+-# Possible options:
+-# BRANCH set a another branch as the "check" reference
+-#
+-#
+-# Use the tool like this "BRANCH=release-0.8 ./tools/qa-check.sh"
+-#
+-
+-
+-BRANCH=${BRANCH:-origin/master}
+-
+-
+-
+-here="`dirname \"$0\"`"				# relative
+-here="`( cd \"$here\" && pwd )`" 	# absolutized and normalized
+-if [ -z "$here" ] ; then
+-	# error; for some reason, the path is not accessible
+-	# to the script (e.g. permissions re-evaled after suid)
+-	exit 1  # fail
+-fi
+-flink_home="`dirname \"$here\"`"
+-
+-cd $here
+-
+-if [ ! -d  "_qa_workdir" ] ; then
+-	echo "_qa_workdir doesnt exist. Creating it"
+-	mkdir _qa_workdir
+-fi
+-
+-cd _qa_workdir
+-
+-if [ ! -d  "flink" ] ; then
+-	echo "There is no flink copy in the workdir. Cloning flink"
+-	git clone https://git-wip-us.apache.org/repos/asf/flink.git flink
+-fi
+-
+-cd flink
+-# fetch and checkout quietly
+-git fetch -q origin
+-git checkout -q $BRANCH
+-cd $here
+-# go to refrence flink directory
+-
+-cd _qa_workdir
+-VAR_DIR=`pwd`
+-cd flink
+-
+-# Initialize variables
+-export TESTS_PASSED=true
+-# Store output of results in a file in the qa dir
+-QA_OUTPUT="$VAR_DIR/qa_results.txt"
+-rm -f "$QA_OUTPUT"
+-
+-append_output() {
+-	echo "$1"
+-	echo "$1" >> "$QA_OUTPUT"
+-}
+-
+-goToTestDirectory() {
+-	cd $flink_home
+-}
+-
+-############################ Methods ############################
+-
+-############ Javadocs ############
+-JAVADOC_MVN_COMMAND="mvn javadoc:aggregate -Pdocs-and-source -Dmaven.javadoc.failOnError=false -Dquiet=false | grep  \"WARNING\|warning\|error\" | wc -l"
+-
+-referenceJavadocsErrors() {
+-	eval $JAVADOC_MVN_COMMAND > "$VAR_DIR/_JAVADOCS_NUM_WARNINGS"
+-}
+-
+-
+-checkJavadocsErrors() {
+-	OLD_JAVADOC_ERR_CNT=`cat $VAR_DIR/_JAVADOCS_NUM_WARNINGS` 
+-	NEW_JAVADOC_ERR_CNT=`eval $JAVADOC_MVN_COMMAND`
+-	if [ "$NEW_JAVADOC_ERR_CNT" -gt "$OLD_JAVADOC_ERR_CNT" ]; then
+-		append_output ":-1: The change increases the number of javadoc errors from $OLD_JAVADOC_ERR_CNT to $NEW_JAVADOC_ERR_CNT"
+-		TESTS_PASSED=false
+-	else
+-		append_output ":+1: The number of javadoc errors was $OLD_JAVADOC_ERR_CNT and is now $NEW_JAVADOC_ERR_CNT"
+-	fi
+-}
+-
+-
+-############ Compiler warnings ############
+-COMPILER_WARN_MVN_COMMAND="mvn clean compile -Dmaven.compiler.showWarning=true -Dmaven.compiler.showDeprecation=true | grep \"WARNING\""
+-referenceCompilerWarnings() {
+-	eval "$COMPILER_WARN_MVN_COMMAND | tee $VAR_DIR/_COMPILER_REFERENCE_WARNINGS | wc -l" > "$VAR_DIR/_COMPILER_NUM_WARNINGS"
+-}
+-
+-checkCompilerWarnings() {
+-	OLD_COMPILER_ERR_CNT=`cat $VAR_DIR/_COMPILER_NUM_WARNINGS` 
+-	NEW_COMPILER_ERR_CNT=`eval $COMPILER_WARN_MVN_COMMAND | tee $VAR_DIR/_COMPILER_NEW_WARNINGS | wc -l`
+-	if [ "$NEW_COMPILER_ERR_CNT" -gt "$OLD_COMPILER_ERR_CNT" ]; then
+-		append_output ":-1: The change increases the number of compiler warnings from $OLD_COMPILER_ERR_CNT to $NEW_COMPILER_ERR_CNT"
+-		append_output '```diff'
+-		append_output "First 100 warnings:"
+-		append_output "`diff $VAR_DIR/_COMPILER_REFERENCE_WARNINGS $VAR_DIR/_COMPILER_NEW_WARNINGS | head -n 100`"
+-		append_output '```'
+-		TESTS_PASSED=false
+-	else
+-		append_output ":+1: The number of compiler warnings was $OLD_COMPILER_ERR_CNT and is now $NEW_COMPILER_ERR_CNT"
+-	fi
+-}
+-
+-############ Files in lib ############
+-BUILD_MVN_COMMAND="mvn clean package -DskipTests -Dmaven.javadoc.skip=true"
+-COUNT_LIB_FILES="find . | grep \"\/lib\/\" | grep -v \"_qa_workdir\" | wc -l"
+-referenceLibFiles() {
+-	eval $BUILD_MVN_COMMAND > /dev/null
+-	eval $COUNT_LIB_FILES > "$VAR_DIR/_NUM_LIB_FILES"
+-}
+-
+-checkLibFiles() {
+-	OLD_LIB_FILES_CNT=`cat $VAR_DIR/_NUM_LIB_FILES` 
+-	eval $BUILD_MVN_COMMAND > /dev/null
+-	NEW_LIB_FILES_CNT=`eval $COUNT_LIB_FILES`
+-	if [ "$NEW_LIB_FILES_CNT" -gt "$OLD_LIB_FILES_CNT" ]; then
+-		append_output ":-1: The change increases the number of dependencies in the lib/ folder from $OLD_LIB_FILES_CNT to $NEW_LIB_FILES_CNT"
+-		TESTS_PASSED=false
+-	else
+-		append_output ":+1: The number of files in the lib/ folder was $OLD_LIB_FILES_CNT before the change and is now $NEW_LIB_FILES_CNT"
+-	fi
+-}
+-
+-############ @author tag ############
+-
+-checkAuthorTag() {
+-	# we are grep-ing for "java" but we've messed up the string a bit so that it doesn't find exactly this line.
+-	if [ `grep -r "@author" . | grep "ja""va" | wc -l` -gt "0" ]; then
+-		append_output ":-1: The change contains @author tags"
+-		TESTS_PASSED=false
+-	fi
+-}
+-
+-
+-################################### QA checks ###################################
+-
+-append_output "Computing Flink QA-Check results (please be patient)."
+-
+-##### Methods to be executed on the current 'master'
+-referenceJavadocsErrors
+-referenceCompilerWarnings
+-referenceLibFiles
+-
+-
+-goToTestDirectory
+-## Methods to be executed on the changes (flink root dir)
+-checkJavadocsErrors
+-checkCompilerWarnings
+-checkLibFiles
+-checkAuthorTag
+-
+-
+-append_output "QA-Check finished."
+-if [ "$TESTS_PASSED" == "true" ]; then
+-	append_output "Overall result: :+1:. All tests passed"
+-else 
+-	append_output "Overall result: :-1:. Some tests failed. Please check messages above"
+-fi
+diff --git a/tools/travis_watchdog.sh b/tools/travis_watchdog.sh
+deleted file mode 100755
+index 6a47db86380f1..0000000000000
+--- a/tools/travis_watchdog.sh
++++ /dev/null
+@@ -1,327 +0,0 @@
+-#!/usr/bin/env bash
+-################################################################################
+-#  Licensed to the Apache Software Foundation (ASF) under one
+-#  or more contributor license agreements.  See the NOTICE file
+-#  distributed with this work for additional information
+-#  regarding copyright ownership.  The ASF licenses this file
+-#  to you under the Apache License, Version 2.0 (the
+-#  "License"); you may not use this file except in compliance
+-#  with the License.  You may obtain a copy of the License at
+-#
+-#      http://www.apache.org/licenses/LICENSE-2.0
+-#
+-#  Unless required by applicable law or agreed to in writing, software
+-#  distributed under the License is distributed on an "AS IS" BASIS,
+-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-#  See the License for the specific language governing permissions and
+-# limitations under the License.
+-################################################################################
+-
+-HERE="`dirname \"$0\"`"				# relative
+-HERE="`( cd \"$HERE\" && pwd )`" 	# absolutized and normalized
+-if [ -z "$HERE" ] ; then
+-	# error; for some reason, the path is not accessible
+-	# to the script (e.g. permissions re-evaled after suid)
+-	exit 1  # fail
+-fi
+-
+-source "${HERE}/ci/stage.sh"
+-source "${HERE}/ci/maven-utils.sh"
+-
+-ARTIFACTS_DIR="${HERE}/artifacts"
+-
+-mkdir -p $ARTIFACTS_DIR || { echo "FAILURE: cannot create log directory '${ARTIFACTS_DIR}'." ; exit 1; }
+-
+-echo "Build for commit ${TRAVIS_COMMIT} of ${TRAVIS_REPO_SLUG} [build ID: ${TRAVIS_BUILD_ID}, job number: $TRAVIS_JOB_NUMBER]." | tee "${ARTIFACTS_DIR}/build_info"
+-
+-# =============================================================================
+-# CONFIG
+-# =============================================================================
+-
+-# Number of seconds w/o output before printing a stack trace and killing $MVN
+-MAX_NO_OUTPUT=${1:-900}
+-
+-# Number of seconds to sleep before checking the output again
+-SLEEP_TIME=20
+-
+-# Maximum times to retry uploading artifacts file to transfer.sh
+-TRANSFER_UPLOAD_MAX_RETRIES=2
+-
+-# The delay between two retries to upload artifacts file to transfer.sh. The default exponential
+-# backoff algorithm should be too long for the last several retries.
+-TRANSFER_UPLOAD_RETRY_DELAY=5
+-
+-LOG4J_PROPERTIES=${HERE}/log4j-travis.properties
+-
+-PYTHON_TEST="./flink-python/dev/lint-python.sh"
+-PYTHON_PID="${ARTIFACTS_DIR}/watchdog.python.pid"
+-PYTHON_EXIT="${ARTIFACTS_DIR}/watchdog.python.exit"
+-PYTHON_OUT="${ARTIFACTS_DIR}/python.out"
+-
+-MVN_COMPILE_MODULES=$(get_compile_modules_for_stage ${TEST})
+-MVN_TEST_MODULES=$(get_test_modules_for_stage ${TEST})
+-
+-# Maven command to run. We set the forkCount manually, because otherwise Maven sees too many cores
+-# on the Travis VMs. Set forkCountTestPackage to 1 for container-based environment (4 GiB memory)
+-# and 2 for sudo-enabled environment (7.5 GiB memory).
+-MVN_LOGGING_OPTIONS="-Dlog.dir=${ARTIFACTS_DIR} -Dlog4j.configurationFile=file://$LOG4J_PROPERTIES"
+-MVN_COMMON_OPTIONS="-Dflink.forkCount=2 -Dflink.forkCountTestPackage=2 -Dfast -Pskip-webui-build $MVN_LOGGING_OPTIONS"
+-MVN_COMPILE_OPTIONS="-DskipTests"
+-MVN_TEST_OPTIONS="-Dflink.tests.with-openssl"
+-
+-e2e_modules=$(find flink-end-to-end-tests -mindepth 2 -maxdepth 5 -name 'pom.xml' -printf '%h\n' | sort -u | tr '\n' ',')
+-
+-MVN_COMPILE="run_mvn $MVN_COMMON_OPTIONS $MVN_COMPILE_OPTIONS $PROFILE $MVN_COMPILE_MODULES install"
+-MVN_TEST="run_mvn $MVN_COMMON_OPTIONS $MVN_TEST_OPTIONS $PROFILE $MVN_TEST_MODULES verify"
+-# don't move the e2e-pre-commit profile activation into the misc entry in .travis.yml, since it breaks caching
+-MVN_E2E="run_mvn $MVN_COMMON_OPTIONS $MVN_TEST_OPTIONS -Pe2e-pre-commit -pl ${e2e_modules},flink-dist verify"
+-
+-MVN_PID="${ARTIFACTS_DIR}/watchdog.mvn.pid"
+-MVN_EXIT="${ARTIFACTS_DIR}/watchdog.mvn.exit"
+-MVN_OUT="${ARTIFACTS_DIR}/mvn.out"
+-
+-TRACE_OUT="${ARTIFACTS_DIR}/jps-traces.out"
+-
+-# E.g. travis-artifacts/apache/flink/1595/1595.1
+-UPLOAD_TARGET_PATH="travis-artifacts/${TRAVIS_REPO_SLUG}/${TRAVIS_BUILD_NUMBER}/"
+-# These variables are stored as secure variables in '.travis.yml', which are generated per repo via
+-# the travis command line tool.
+-UPLOAD_BUCKET=$ARTIFACTS_AWS_BUCKET
+-UPLOAD_ACCESS_KEY=$ARTIFACTS_AWS_ACCESS_KEY
+-UPLOAD_SECRET_KEY=$ARTIFACTS_AWS_SECRET_KEY
+-
+-ARTIFACTS_FILE=${TRAVIS_JOB_NUMBER}.tar.gz
+-
+-if [ ! -z "$TF_BUILD" ] ; then
+-	# set proper artifacts file name on Azure Pipelines
+-	ARTIFACTS_FILE=${BUILD_BUILDNUMBER}.tar.gz
+-fi
+-
+-# enable coredumps
+-ulimit -c unlimited
+-export JAVA_TOOL_OPTIONS="-XX:+HeapDumpOnOutOfMemoryError"
+-
+-if [ $TEST == $STAGE_PYTHON ]; then
+-	CMD=$PYTHON_TEST
+-	CMD_PID=$PYTHON_PID
+-	CMD_OUT=$PYTHON_OUT
+-	CMD_EXIT=$PYTHON_EXIT
+-	CMD_TYPE="PYTHON"
+-else
+-	CMD=$MVN_COMPILE
+-	CMD_PID=$MVN_PID
+-	CMD_OUT=$MVN_OUT
+-	CMD_EXIT=$MVN_EXIT
+-	CMD_TYPE="MVN"
+-fi
+-
+-# =============================================================================
+-# FUNCTIONS
+-# =============================================================================
+-
+-upload_artifacts_s3() {
+-	echo "PRODUCED build artifacts."
+-
+-	ls $ARTIFACTS_DIR
+-
+-	echo "COMPRESSING build artifacts."
+-
+-	cd $ARTIFACTS_DIR
+-	dmesg > container.log
+-	tar -zcvf $ARTIFACTS_FILE *
+-
+-	# Upload to secured S3
+-	if [ -n "$UPLOAD_BUCKET" ] && [ -n "$UPLOAD_ACCESS_KEY" ] && [ -n "$UPLOAD_SECRET_KEY" ]; then
+-
+-		# Install artifacts tool
+-		curl -sL https://raw.githubusercontent.com/travis-ci/artifacts/master/install | bash
+-
+-		PATH=$HOME/bin/artifacts:$HOME/bin:$PATH
+-
+-		echo "UPLOADING build artifacts."
+-
+-		# Upload everything in $ARTIFACTS_DIR. Use relative path, otherwise the upload tool
+-		# re-creates the whole directory structure from root.
+-		artifacts upload --bucket $UPLOAD_BUCKET --key $UPLOAD_ACCESS_KEY --secret $UPLOAD_SECRET_KEY --target-paths $UPLOAD_TARGET_PATH $ARTIFACTS_FILE
+-	fi
+-
+-	# On Azure, publish ARTIFACTS_FILE as a build artifact
+-	if [ ! -z "$TF_BUILD" ] ; then
+-		TIMESTAMP=`date +%s` # append timestamp to name to allow multiple uploads for the same module
+-		ARTIFACT_DIR="$(pwd)/artifact-dir"
+-		mkdir $ARTIFACT_DIR
+-		cp $ARTIFACTS_FILE $ARTIFACT_DIR/
+-		
+-		echo "##vso[task.setvariable variable=ARTIFACT_DIR]$ARTIFACT_DIR"
+-		echo "##vso[task.setvariable variable=ARTIFACT_NAME]$(echo $MODULE | tr -dc '[:alnum:]\n\r')-$TIMESTAMP"
+-	fi
+-
+-	# upload to https://transfer.sh
+-	echo "Uploading to transfer.sh"
+-	curl --retry ${TRANSFER_UPLOAD_MAX_RETRIES} --retry-delay ${TRANSFER_UPLOAD_RETRY_DELAY} --upload-file $ARTIFACTS_FILE --max-time 60 https://transfer.sh
+-}
+-
+-print_stacktraces () {
+-	echo "=============================================================================="
+-	echo "The following Java processes are running (JPS)"
+-	echo "=============================================================================="
+-
+-	jps
+-
+-	local pids=( $(jps | awk '{print $1}') )
+-
+-	for pid in "${pids[@]}"; do
+-		echo "=============================================================================="
+-		echo "Printing stack trace of Java process ${pid}"
+-		echo "=============================================================================="
+-
+-		jstack $pid
+-	done
+-}
+-
+-# locate YARN logs and put them into artifacts directory
+-put_yarn_logs_to_artifacts() {
+-	# Make sure to be in project root
+-	cd $HERE/../
+-	for file in `find ./flink-yarn-tests/target -type f -name '*.log'`; do
+-		TARGET_FILE=`echo "$file" | grep -Eo "container_[0-9_]+/(.*).log"`
+-		TARGET_DIR=`dirname	 "$TARGET_FILE"`
+-		mkdir -p "$ARTIFACTS_DIR/yarn-tests/$TARGET_DIR"
+-		cp $file "$ARTIFACTS_DIR/yarn-tests/$TARGET_FILE"
+-	done
+-}
+-
+-mod_time () {
+-	if [[ `uname` == 'Darwin' ]]; then
+-		eval $(stat -s $CMD_OUT)
+-		echo $st_mtime
+-	else
+-		echo `stat -c "%Y" $CMD_OUT`
+-	fi
+-}
+-
+-the_time() {
+-	echo `date +%s`
+-}
+-
+-# =============================================================================
+-# WATCHDOG
+-# =============================================================================
+-
+-watchdog () {
+-	touch $CMD_OUT
+-
+-	while true; do
+-		sleep $SLEEP_TIME
+-
+-		time_diff=$((`the_time` - `mod_time`))
+-
+-		if [ $time_diff -ge $MAX_NO_OUTPUT ]; then
+-			echo "=============================================================================="
+-			echo "Maven produced no output for ${MAX_NO_OUTPUT} seconds."
+-			echo "=============================================================================="
+-
+-			print_stacktraces | tee $TRACE_OUT
+-
+-			# Kill $CMD and all descendants
+-			pkill -P $(<$CMD_PID)
+-
+-			exit 1
+-		fi
+-	done
+-}
+-
+-run_with_watchdog() {
+-	local cmd="$1"
+-
+-	watchdog &
+-	WD_PID=$!
+-	echo "STARTED watchdog (${WD_PID})."
+-
+-	# Make sure to be in project root
+-	cd "$HERE/../"
+-
+-	echo "RUNNING '${cmd}'."
+-
+-	# Run $CMD and pipe output to $CMD_OUT for the watchdog. The PID is written to $CMD_PID to
+-	# allow the watchdog to kill $CMD if it is not producing any output anymore. $CMD_EXIT contains
+-	# the exit code. This is important for Travis' build life-cycle (success/failure).
+-	( $cmd & PID=$! ; echo $PID >&3 ; wait $PID ; echo $? >&4 ) 3>$CMD_PID 4>$CMD_EXIT | tee $CMD_OUT
+-
+-	EXIT_CODE=$(<$CMD_EXIT)
+-
+-	echo "${CMD_TYPE} exited with EXIT CODE: ${EXIT_CODE}."
+-
+-	# Make sure to kill the watchdog in any case after $CMD has completed
+-	echo "Trying to KILL watchdog (${WD_PID})."
+-	( kill $WD_PID 2>&1 ) > /dev/null
+-
+-	rm $CMD_PID
+-	rm $CMD_EXIT
+-}
+-
+-run_with_watchdog "$CMD"
+-
+-# Run tests if compilation was successful
+-if [ $CMD_TYPE == "MVN" ]; then
+-	if [ $EXIT_CODE == 0 ]; then
+-		run_with_watchdog "$MVN_TEST"
+-	else
+-		echo "=============================================================================="
+-		echo "Compilation failure detected, skipping test execution."
+-		echo "=============================================================================="
+-	fi
+-fi
+-
+-# Post
+-
+-# only misc builds flink-dist and flink-yarn-tests
+-case $TEST in
+-	(misc)
+-		put_yarn_logs_to_artifacts
+-	;;
+-esac
+-
+-collect_coredumps `pwd` $ARTIFACTS_DIR
+-
+-upload_artifacts_s3
+-
+-# since we are in flink/tools/artifacts
+-# we are going back to
+-cd ../../
+-
+-# only run end-to-end tests in misc because we only have flink-dist here
+-case $TEST in
+-    (misc)
+-        # If we are not on Azure (we are on Travis) run precommit tests in misc stage.
+-        # On Azure, we run them in a separate job
+-        if [ -z "$TF_BUILD" ] ; then
+-            if [ $EXIT_CODE == 0 ]; then
+-                echo "\n\n==============================================================================\n"
+-                echo "Running bash end-to-end tests\n"
+-                echo "==============================================================================\n"
+-
+-                FLINK_DIR=build-target flink-end-to-end-tests/run-pre-commit-tests.sh
+-
+-                EXIT_CODE=$?
+-            else
+-                echo "\n==============================================================================\n"
+-                echo "Previous build failure detected, skipping bash end-to-end tests.\n"
+-                echo "==============================================================================\n"
+-            fi
+-	        if [ $EXIT_CODE == 0 ]; then
+-	            echo "\n\n==============================================================================\n"
+-	            echo "Running java end-to-end tests\n"
+-	            echo "==============================================================================\n"
+-
+-	            run_with_watchdog "$MVN_E2E -DdistDir=$(readlink -e build-target)"
+-	        else
+-	            echo "\n==============================================================================\n"
+-	            echo "Previous build failure detected, skipping java end-to-end tests.\n"
+-	        fi
+-	    fi
+-    ;;
+-esac
+-
+-# Exit code for Travis build success/failure
+-exit $EXIT_CODE

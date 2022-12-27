@@ -1,0 +1,140 @@
+diff --git a/plugins/hypervisors/kvm/src/com/cloud/hypervisor/kvm/resource/LibvirtVMDef.java b/plugins/hypervisors/kvm/src/com/cloud/hypervisor/kvm/resource/LibvirtVMDef.java
+index ec5d6a7a8fc4..6930945b7b7a 100644
+--- a/plugins/hypervisors/kvm/src/com/cloud/hypervisor/kvm/resource/LibvirtVMDef.java
++++ b/plugins/hypervisors/kvm/src/com/cloud/hypervisor/kvm/resource/LibvirtVMDef.java
+@@ -584,18 +584,36 @@ public void defFileBasedDisk(String filePath, String diskLabel, DiskBus bus, Dis
+ 
+         /* skip iso label */
+         private String getDevLabel(int devId, DiskBus bus) {
++            if (devId < 0) {
++                return "";
++            }
++
+             if (devId == 2) {
+                 devId++;
+             }
+ 
+-            char suffix = (char)('a' + devId);
+             if (bus == DiskBus.SCSI) {
+-                return "sd" + suffix;
++                return "sd" + getDevLabelSuffix(devId);
+             } else if (bus == DiskBus.VIRTIO) {
+-                return "vd" + suffix;
++                return "vd" + getDevLabelSuffix(devId);
++            }
++            return "hd" + getDevLabelSuffix(devId);
++        }
++
++        private String getDevLabelSuffix(int deviceIndex) {
++            if (deviceIndex < 0) {
++                return "";
+             }
+-            return "hd" + suffix;
+ 
++            int base = 'z' - 'a' + 1;
++            String labelSuffix = "";
++            do {
++                char suffix = (char)('a' + (deviceIndex % base));
++                labelSuffix = suffix + labelSuffix;
++                deviceIndex = (deviceIndex / base) - 1;
++            } while (deviceIndex >= 0);
++
++            return labelSuffix;
+         }
+ 
+         public void defFileBasedDisk(String filePath, int devId, DiskBus bus, DiskFmtType diskFmtType) {
+@@ -716,11 +734,6 @@ public DiskFmtType getDiskFormatType() {
+             return _diskFmtType;
+         }
+ 
+-        public int getDiskSeq() {
+-            char suffix = _diskLabel.charAt(_diskLabel.length() - 1);
+-            return suffix - 'a';
+-        }
+-
+         public void setBytesReadRate(Long bytesReadRate) {
+             _bytesReadRate = bytesReadRate;
+         }
+diff --git a/server/src/com/cloud/storage/VolumeApiServiceImpl.java b/server/src/com/cloud/storage/VolumeApiServiceImpl.java
+index a5bd85ed59a2..c073d5fd75a5 100644
+--- a/server/src/com/cloud/storage/VolumeApiServiceImpl.java
++++ b/server/src/com/cloud/storage/VolumeApiServiceImpl.java
+@@ -1433,9 +1433,9 @@ public Volume attachVolumeToVM(Long vmId, Long volumeId, Long deviceId) {
+         // that supported by hypervisor
+         if (deviceId == null || deviceId.longValue() != 0) {
+             List<VolumeVO> existingDataVolumes = _volsDao.findByInstanceAndType(vmId, Volume.Type.DATADISK);
+-            int maxDataVolumesSupported = getMaxDataVolumesSupported(vm);
+-            if (existingDataVolumes.size() >= maxDataVolumesSupported) {
+-                throw new InvalidParameterValueException("The specified VM already has the maximum number of data disks (" + maxDataVolumesSupported + "). Please specify another VM.");
++            int maxAttachableDataVolumesSupported = getMaxDataVolumesSupported(vm) - 2; //IDs: 0 (ROOT) and 3 (CD-ROM) are reserved
++            if (existingDataVolumes.size() >= maxAttachableDataVolumesSupported) {
++                throw new InvalidParameterValueException("The specified VM already has the maximum number of data disks (" + maxAttachableDataVolumesSupported + ") attached. Please specify another VM.");
+             }
+         }
+ 
+@@ -2527,7 +2527,7 @@ private VolumeVO sendAttachVolumeCommand(UserVmVO vm, VolumeVO volumeToAttach, L
+ 
+             DataTO volTO = volFactory.getVolume(volumeToAttach.getId()).getTO();
+ 
+-            deviceId = getDeviceId(vm.getId(), deviceId);
++            deviceId = getDeviceId(vm, deviceId);
+ 
+             DiskTO disk = storageMgr.getDiskWithThrottling(volTO, volumeToAttach.getVolumeType(), deviceId, volumeToAttach.getPath(),
+                     vm.getServiceOfferingId(), volumeToAttach.getDiskOfferingId());
+@@ -2585,7 +2585,7 @@ private VolumeVO sendAttachVolumeCommand(UserVmVO vm, VolumeVO volumeToAttach, L
+                     _volsDao.update(volumeToAttach.getId(), volumeToAttach);
+                 }
+             } else {
+-                deviceId = getDeviceId(vm.getId(), deviceId);
++                deviceId = getDeviceId(vm, deviceId);
+ 
+                 _volsDao.attachVolume(volumeToAttach.getId(), vm.getId(), deviceId);
+             }
+@@ -2623,7 +2623,7 @@ private int getMaxDataVolumesSupported(UserVmVO vm) {
+             _hostDao.loadDetails(host);
+             maxDataVolumesSupported = _hypervisorCapabilitiesDao.getMaxDataVolumesLimit(host.getHypervisorType(), host.getDetail("product_version"));
+         }
+-        if (maxDataVolumesSupported == null) {
++        if (maxDataVolumesSupported == null || maxDataVolumesSupported.intValue() <= 0) {
+             maxDataVolumesSupported = 6; // 6 data disks by default if nothing
+             // is specified in
+             // 'hypervisor_capabilities' table
+@@ -2632,28 +2632,32 @@ private int getMaxDataVolumesSupported(UserVmVO vm) {
+         return maxDataVolumesSupported.intValue();
+     }
+ 
+-    private Long getDeviceId(long vmId, Long deviceId) {
++    private Long getDeviceId(UserVmVO vm, Long deviceId) {
+         // allocate deviceId
+-        List<VolumeVO> vols = _volsDao.findByInstance(vmId);
++        int maxDeviceId = getMaxDataVolumesSupported(vm) - 1;
++        List<VolumeVO> vols = _volsDao.findByInstance(vm.getId());
+         if (deviceId != null) {
+-            if (deviceId.longValue() > 15 || deviceId.longValue() == 3) {
+-                throw new RuntimeException("deviceId should be 1,2,4-15");
++            if (deviceId.longValue() <= 0 || deviceId.longValue() > maxDeviceId || deviceId.longValue() == 3) {
++                throw new RuntimeException("deviceId should be 1,2,4-" + maxDeviceId);
+             }
+             for (VolumeVO vol : vols) {
+                 if (vol.getDeviceId().equals(deviceId)) {
+-                    throw new RuntimeException("deviceId " + deviceId + " is used by vm" + vmId);
++                    throw new RuntimeException("deviceId " + deviceId + " is used by vm " + vm.getId());
+                 }
+             }
+         } else {
+             // allocate deviceId here
+             List<String> devIds = new ArrayList<String>();
+-            for (int i = 1; i < 15; i++) {
++            for (int i = 1; i <= maxDeviceId; i++) {
+                 devIds.add(String.valueOf(i));
+             }
+             devIds.remove("3");
+             for (VolumeVO vol : vols) {
+                 devIds.remove(vol.getDeviceId().toString().trim());
+             }
++            if (devIds.isEmpty()) {
++                throw new RuntimeException("All device Ids are used by vm " + vm.getId());
++            }
+             deviceId = Long.parseLong(devIds.iterator().next());
+         }
+ 

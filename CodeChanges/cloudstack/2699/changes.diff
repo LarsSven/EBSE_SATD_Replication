@@ -1,0 +1,236 @@
+diff --git a/engine/schema/src/com/cloud/upgrade/dao/Upgrade41100to41110.java b/engine/schema/src/com/cloud/upgrade/dao/Upgrade41100to41110.java
+index 3443e95242a2..90e000168199 100644
+--- a/engine/schema/src/com/cloud/upgrade/dao/Upgrade41100to41110.java
++++ b/engine/schema/src/com/cloud/upgrade/dao/Upgrade41100to41110.java
+@@ -19,6 +19,11 @@
+ 
+ package com.cloud.upgrade.dao;
+ 
++import com.cloud.hypervisor.Hypervisor;
++import com.cloud.utils.crypt.DBEncryptionUtil;
++import com.cloud.utils.exception.CloudRuntimeException;
++import org.apache.log4j.Logger;
++
+ import java.io.InputStream;
+ import java.sql.Connection;
+ import java.sql.PreparedStatement;
+@@ -29,11 +34,6 @@
+ import java.util.Map;
+ import java.util.Set;
+ 
+-import org.apache.log4j.Logger;
+-
+-import com.cloud.hypervisor.Hypervisor;
+-import com.cloud.utils.exception.CloudRuntimeException;
+-
+ public class Upgrade41100to41110 implements DbUpgrade {
+     final static Logger LOG = Logger.getLogger(Upgrade41000to41100.class);
+ 
+@@ -66,6 +66,76 @@ public InputStream[] getPrepareScripts() {
+     @Override
+     public void performDataMigration(Connection conn) {
+         updateSystemVmTemplates(conn);
++        markUnnecessarySecureConfigsAsUnsecure(conn);
++    }
++
++    private void markUnnecessarySecureConfigsAsUnsecure(Connection conn) {
++        /*
++         * the following config items where added as 'Secure' in the past. For some this made sense but for the ones below,
++         * this makes no sense and is a inconvenience at best. The below method will
++         ** retrieve,
++         ** unencrypt,
++         ** mark as 'Advanced' and then
++         ** store the item
++         */
++        String[] unsecureItems = new String[] {
++                "ldap.basedn",
++                "ldap.bind.principal",
++                "ldap.email.attribute",
++                "ldap.firstname.attribute",
++                "ldap.group.object",
++                "ldap.group.user.uniquemember",
++                "ldap.lastname.attribute",
++                "ldap.search.group.principle",
++                "ldap.truststore",
++                "ldap.user.object",
++                "ldap.username.attribute"
++        };
++
++        for (String name : unsecureItems) {
++            uncrypt(conn, name);
++        }
++    }
++
++    /**
++     * if encrypted, decrypt the ldap hostname and port and then update as they are not encrypted now.
++     */
++    private void uncrypt(Connection conn, String name)
++    {
++        String value = null;
++        try (
++                PreparedStatement prepSelStmt = conn.prepareStatement("SELECT conf.category,conf.value FROM `cloud`.`configuration` conf WHERE conf.name= ?");
++        ) {
++            prepSelStmt.setString(1,name);
++            try (
++                    ResultSet resultSet = prepSelStmt.executeQuery();
++            ) {
++                if (LOG.isInfoEnabled()) {
++                    LOG.info("updating setting '" + name + "'");
++                }
++                if (resultSet.next()) {
++                    if ("Secure".equals(resultSet.getString(1))) {
++                        value = DBEncryptionUtil.decrypt(resultSet.getString(2));
++                        try (
++                                PreparedStatement prepUpdStmt= conn.prepareStatement("UPDATE `cloud`.`configuration` SET category = 'Advanced', value = ? WHERE name = ?" );
++                        ) {
++                            prepUpdStmt.setString(1, value);
++                            prepUpdStmt.setString(2, name);
++                            prepUpdStmt.execute();
++                        } catch (SQLException e) {
++                            if (LOG.isInfoEnabled()) {
++                                LOG.info("failed to update configuration item '" + name + "' with value '" + value + "'");
++                                if (LOG.isDebugEnabled()) {
++                                    LOG.debug("no update because ", e);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        } catch (SQLException e) {
++            throw new CloudRuntimeException("failed to update configuration item '" + name + "' with value '" + value + "'", e);
++        }
+     }
+ 
+     @SuppressWarnings("serial")
+diff --git a/engine/schema/src/com/cloud/upgrade/dao/Upgrade421to430.java b/engine/schema/src/com/cloud/upgrade/dao/Upgrade421to430.java
+index cc4dda210ff0..55e7d3bdac22 100644
+--- a/engine/schema/src/com/cloud/upgrade/dao/Upgrade421to430.java
++++ b/engine/schema/src/com/cloud/upgrade/dao/Upgrade421to430.java
+@@ -23,9 +23,7 @@
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+-import java.sql.Types;
+ 
+-import org.apache.commons.lang.StringUtils;
+ import org.apache.log4j.Logger;
+ 
+ import com.cloud.utils.crypt.DBEncryptionUtil;
+@@ -62,7 +60,6 @@ public InputStream[] getPrepareScripts() {
+ 
+     @Override
+     public void performDataMigration(Connection conn) {
+-        encryptLdapConfigParams(conn);
+         encryptImageStoreDetails(conn);
+         upgradeMemoryOfSsvmOffering(conn);
+     }
+@@ -94,77 +91,6 @@ private void upgradeMemoryOfSsvmOffering(Connection conn) {
+         s_logger.debug("Done upgrading RAM for service offering of Secondary Storage VM to " + newRamSize);
+     }
+ 
+-    private void encryptLdapConfigParams(Connection conn) {
+-        String[][] ldapParams = { {"ldap.user.object", "inetOrgPerson", "Sets the object type of users within LDAP"},
+-                {"ldap.username.attribute", "uid", "Sets the username attribute used within LDAP"}, {"ldap.email.attribute", "mail", "Sets the email attribute used within LDAP"},
+-                {"ldap.firstname.attribute", "givenname", "Sets the firstname attribute used within LDAP"},
+-                {"ldap.lastname.attribute", "sn", "Sets the lastname attribute used within LDAP"},
+-                {"ldap.group.object", "groupOfUniqueNames", "Sets the object type of groups within LDAP"},
+-                {"ldap.group.user.uniquemember", "uniquemember", "Sets the attribute for uniquemembers within a group"}};
+-
+-        String insertSql = "INSERT INTO `cloud`.`configuration`(category, instance, component, name, value, description) VALUES ('Secure', 'DEFAULT', 'management-server', ?, ?, "
+-                + "?) ON DUPLICATE KEY UPDATE category='Secure';";
+-
+-        try (PreparedStatement pstmt_insert_ldap_parameters = conn.prepareStatement(insertSql);){
+-            for (String[] ldapParam : ldapParams) {
+-                String name = ldapParam[0];
+-                String value = ldapParam[1];
+-                String desc = ldapParam[2];
+-                String encryptedValue = DBEncryptionUtil.encrypt(value);
+-                pstmt_insert_ldap_parameters.setString(1, name);
+-                pstmt_insert_ldap_parameters.setBytes(2, encryptedValue.getBytes("UTF-8"));
+-                pstmt_insert_ldap_parameters.setString(3, desc);
+-                pstmt_insert_ldap_parameters.executeUpdate();
+-            }
+-
+-            /**
+-             * if encrypted, decrypt the ldap hostname and port and then update as they are not encrypted now.
+-             */
+-            try (
+-                    PreparedStatement pstmt_ldap_hostname = conn.prepareStatement("SELECT conf.value FROM `cloud`.`configuration` conf WHERE conf.name='ldap.hostname'");
+-                    ResultSet resultSet_ldap_hostname = pstmt_ldap_hostname.executeQuery();
+-                ) {
+-                String hostname = null;
+-                String port;
+-                int portNumber = 0;
+-                if (resultSet_ldap_hostname.next()) {
+-                    hostname = DBEncryptionUtil.decrypt(resultSet_ldap_hostname.getString(1));
+-                }
+-
+-                try (
+-                        PreparedStatement pstmt_ldap_port = conn.prepareStatement("SELECT conf.value FROM `cloud`.`configuration` conf WHERE conf.name='ldap.port'");
+-                        ResultSet resultSet_ldap_port = pstmt_ldap_port.executeQuery();
+-                    ) {
+-                    if (resultSet_ldap_port.next()) {
+-                        port = DBEncryptionUtil.decrypt(resultSet_ldap_port.getString(1));
+-                        if (StringUtils.isNotBlank(port)) {
+-                            portNumber = Integer.parseInt(port);
+-                        }
+-                    }
+-
+-                    if (StringUtils.isNotBlank(hostname)) {
+-                        try (PreparedStatement pstmt_insert_ldap_hostname_port = conn.prepareStatement("INSERT INTO `cloud`.`ldap_configuration`(hostname, port) VALUES(?,?)");) {
+-                            pstmt_insert_ldap_hostname_port.setString(1, hostname);
+-                            if (portNumber != 0) {
+-                                pstmt_insert_ldap_hostname_port.setInt(2, portNumber);
+-                            } else {
+-                                pstmt_insert_ldap_hostname_port.setNull(2, Types.INTEGER);
+-                            }
+-                            pstmt_insert_ldap_hostname_port.executeUpdate();
+-                        }
+-                    }
+-                }
+-            }
+-
+-        } catch (SQLException e) {
+-            throw new CloudRuntimeException("Unable to insert ldap configuration values ", e);
+-        } catch (UnsupportedEncodingException e) {
+-            throw new CloudRuntimeException("Unable to insert ldap configuration values ", e);
+-        }
+-        s_logger.debug("Done encrypting ldap Config values");
+-
+-    }
+-
+     private void encryptImageStoreDetails(Connection conn) {
+         s_logger.debug("Encrypting image store details");
+         try (
+diff --git a/plugins/user-authenticators/ldap/src/org/apache/cloudstack/ldap/LdapConfiguration.java b/plugins/user-authenticators/ldap/src/org/apache/cloudstack/ldap/LdapConfiguration.java
+index 22f8abc9aa58..259d613f6d9e 100644
+--- a/plugins/user-authenticators/ldap/src/org/apache/cloudstack/ldap/LdapConfiguration.java
++++ b/plugins/user-authenticators/ldap/src/org/apache/cloudstack/ldap/LdapConfiguration.java
+@@ -88,7 +88,7 @@ public class LdapConfiguration implements Configurable{
+             ConfigKey.Scope.Domain);
+ 
+     private static final ConfigKey<String> ldapBindPassword = new ConfigKey<String>(
+-            "Advanced",
++            "Secure",
+             String.class,
+             "ldap.bind.password",
+             null,
+@@ -96,7 +96,7 @@ public class LdapConfiguration implements Configurable{
+             true,
+             ConfigKey.Scope.Domain);
+     private static final ConfigKey<String> ldapBindPrincipal = new ConfigKey<String>(
+-            "Advanced",
++            "Secure",
+             String.class,
+             "ldap.bind.principal",
+             null,
+@@ -176,7 +176,7 @@ public class LdapConfiguration implements Configurable{
+             true,
+             ConfigKey.Scope.Domain);
+     private static final ConfigKey<String> ldapTrustStorePassword = new ConfigKey<String>(
+-            "Advanced",
++            "Secure",
+             String.class,
+             "ldap.truststore.password",
+             null,

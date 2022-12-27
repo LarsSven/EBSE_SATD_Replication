@@ -1,0 +1,2487 @@
+diff --git a/build.gradle b/build.gradle
+index 6d6ee2dadf9e..d20deeb93851 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -138,7 +138,6 @@ apply from: file('gradle/validation/rat-sources.gradle')
+ apply from: file('gradle/validation/owasp-dependency-check.gradle')
+ apply from: file('gradle/validation/ecj-lint.gradle')
+ apply from: file('gradle/validation/gradlew-scripts-tweaked.gradle')
+-apply from: file('gradle/validation/missing-docs-check.gradle')
+ apply from: file('gradle/validation/validate-log-calls.gradle')
+ apply from: file('gradle/validation/check-broken-links.gradle')
+ 
+diff --git a/dev-tools/missing-doclet/build.gradle b/dev-tools/missing-doclet/build.gradle
+new file mode 100644
+index 000000000000..4e680b6cb0ed
+--- /dev/null
++++ b/dev-tools/missing-doclet/build.gradle
+@@ -0,0 +1,22 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++apply plugin: 'java-library'
++
++version = "1.0.0-SNAPSHOT"
++group = "org.apache.lucene.tools"
++description = 'Doclet-based javadoc validation.'
+diff --git a/dev-tools/missing-doclet/settings.gradle b/dev-tools/missing-doclet/settings.gradle
+new file mode 100644
+index 000000000000..6a9c064171d2
+--- /dev/null
++++ b/dev-tools/missing-doclet/settings.gradle
+@@ -0,0 +1,17 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
+diff --git a/dev-tools/missing-doclet/src/main/java/org/apache/lucene/missingdoclet/MissingDoclet.java b/dev-tools/missing-doclet/src/main/java/org/apache/lucene/missingdoclet/MissingDoclet.java
+new file mode 100644
+index 000000000000..89c205f09732
+--- /dev/null
++++ b/dev-tools/missing-doclet/src/main/java/org/apache/lucene/missingdoclet/MissingDoclet.java
+@@ -0,0 +1,435 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.lucene.missingdoclet;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Optional;
++import java.util.Set;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
++
++import javax.lang.model.element.AnnotationMirror;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.ElementKind;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.ModuleElement;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.TypeKind;
++import javax.lang.model.util.ElementFilter;
++import javax.lang.model.util.Elements;
++import javax.tools.Diagnostic;
++
++import com.sun.source.doctree.DocCommentTree;
++import com.sun.source.doctree.ParamTree;
++import com.sun.source.util.DocTrees;
++
++import jdk.javadoc.doclet.Doclet;
++import jdk.javadoc.doclet.DocletEnvironment;
++import jdk.javadoc.doclet.Reporter;
++import jdk.javadoc.doclet.StandardDoclet;
++
++/**
++ * Checks for missing javadocs, where missing also means "only whitespace" or "license header".
++ * Has option --missing-level (package, class, method, parameter) so that we can improve over time.
++ * Has option --missing-ignore to ignore individual elements (such as split packages). 
++ *   It isn't recursive, just ignores exactly the elements you tell it.
++ *   This should be removed when packaging is fixed to no longer be split across JARs.
++ * Has option --missing-method to apply "method" level to selected packages (fix one at a time).
++ *   Matches package names exactly: so you'll need to list subpackages separately.
++ */
++public class MissingDoclet extends StandardDoclet {
++  // checks that modules and packages have documentation
++  private static final int PACKAGE = 0;
++  // + checks that classes, interfaces, enums, and annotation types have documentation
++  private static final int CLASS = 1;
++  // + checks that methods, constructors, fields, and enumerated constants have documentation
++  private static final int METHOD = 2;
++  // + checks that @param tags are present for any method/constructor parameters
++  private static final int PARAMETER = 3;
++  int level = PARAMETER;
++  Reporter reporter;
++  DocletEnvironment docEnv;
++  DocTrees docTrees;
++  Elements elementUtils;
++  Set<String> ignored = Collections.emptySet();
++  Set<String> methodPackages = Collections.emptySet();
++  
++  @Override
++  public Set<Doclet.Option> getSupportedOptions() {
++    Set<Doclet.Option> options = new HashSet<>();
++    options.addAll(super.getSupportedOptions());
++    options.add(new Doclet.Option() {
++      @Override
++      public int getArgumentCount() {
++        return 1;
++      }
++
++      @Override
++      public String getDescription() {
++        return "level to enforce for missing javadocs: [package, class, method, parameter]";
++      }
++
++      @Override
++      public Kind getKind() {
++        return Option.Kind.STANDARD;
++      }
++
++      @Override
++      public List<String> getNames() {
++        return Collections.singletonList("--missing-level");
++      }
++
++      @Override
++      public String getParameters() {
++        return "level";
++      }
++
++      @Override
++      public boolean process(String option, List<String> arguments) {
++        switch (arguments.get(0)) {
++          case "package":
++            level = PACKAGE;
++            return true;
++          case "class":
++            level = CLASS;
++            return true;
++          case "method":
++            level = METHOD;
++            return true;
++          case "parameter":
++            level = PARAMETER;
++            return true;
++          default:
++            return false;
++        }
++      }
++    });
++    options.add(new Doclet.Option() {
++      @Override
++      public int getArgumentCount() {
++        return 1;
++      }
++
++      @Override
++      public String getDescription() {
++        return "comma separated list of element names to ignore (e.g. as a workaround for split packages)";
++      }
++
++      @Override
++      public Kind getKind() {
++        return Option.Kind.STANDARD;
++      }
++
++      @Override
++      public List<String> getNames() {
++        return Collections.singletonList("--missing-ignore");
++      }
++
++      @Override
++      public String getParameters() {
++        return "ignoredNames";
++      }
++
++      @Override
++      public boolean process(String option, List<String> arguments) {
++        ignored = new HashSet<>(Arrays.asList(arguments.get(0).split(",")));
++        return true;
++      }
++    });
++    options.add(new Doclet.Option() {
++      @Override
++      public int getArgumentCount() {
++        return 1;
++      }
++
++      @Override
++      public String getDescription() {
++        return "comma separated list of packages to check at 'method' level";
++      }
++
++      @Override
++      public Kind getKind() {
++        return Option.Kind.STANDARD;
++      }
++
++      @Override
++      public List<String> getNames() {
++        return Collections.singletonList("--missing-method");
++      }
++
++      @Override
++      public String getParameters() {
++        return "packages";
++      }
++
++      @Override
++      public boolean process(String option, List<String> arguments) {
++        methodPackages = new HashSet<>(Arrays.asList(arguments.get(0).split(",")));
++        return true;
++      }
++    });
++    return options;
++  }
++
++  @Override
++  public void init(Locale locale, Reporter reporter) {
++    this.reporter = reporter;
++    super.init(locale, reporter);
++  }
++
++  @Override
++  public boolean run(DocletEnvironment docEnv) {
++    this.docEnv = docEnv;
++    this.docTrees = docEnv.getDocTrees();
++    this.elementUtils = docEnv.getElementUtils();
++    for (var element : docEnv.getIncludedElements()) {
++      check(element);
++    }
++
++    return super.run(docEnv);
++  }
++  
++  /**
++   * Returns effective check level for this element
++   */
++  private int level(Element element) {
++    String pkg = elementUtils.getPackageOf(element).getQualifiedName().toString();
++    if (methodPackages.contains(pkg)) {
++      return METHOD;
++    } else {
++      return level;
++    }
++  }
++  
++  /** 
++   * Check an individual element.
++   * This checks packages and types from the doctrees.
++   * It will recursively check methods/fields from encountered types when the level is "method"
++   */
++  private void check(Element element) {
++    switch(element.getKind()) {
++      case MODULE:
++        // don't check the unnamed module, it won't have javadocs
++        if (!((ModuleElement)element).isUnnamed()) {
++          checkComment(element);
++        }
++        break;
++      case PACKAGE:
++        checkComment(element);
++        break;
++      // class-like elements, check them, then recursively check their children (fields and methods)
++      case CLASS:
++      case INTERFACE:
++      case ENUM:
++      case ANNOTATION_TYPE:
++        if (level(element) >= CLASS) {
++          checkComment(element);
++          for (var subElement : element.getEnclosedElements()) {
++            // don't recurse into enclosed types, otherwise we'll double-check since they are already in the included docTree
++            if (subElement.getKind() == ElementKind.METHOD || 
++                subElement.getKind() == ElementKind.CONSTRUCTOR || 
++                subElement.getKind() == ElementKind.FIELD || 
++                subElement.getKind() == ElementKind.ENUM_CONSTANT) {
++              check(subElement);
++            }
++          }
++        }
++        break;
++      // method-like elements, check them if we are configured to do so
++      case METHOD:
++      case CONSTRUCTOR:
++      case FIELD:
++      case ENUM_CONSTANT:
++        if (level(element) >= METHOD && !isSyntheticEnumMethod(element)) {
++          checkComment(element);
++        }
++        break;
++      default:
++        error(element, "I don't know how to analyze " + element.getKind() + " yet.");
++    }
++  }
++
++  /**
++   * Return true if the method is synthetic enum method (values/valueOf).
++   * According to the doctree documentation, the "included" set never includes synthetic elements.
++   * UweSays: It should not happen but it happens!
++   */
++  private boolean isSyntheticEnumMethod(Element element) {
++    String simpleName = element.getSimpleName().toString();
++    if (simpleName.equals("values") || simpleName.equals("valueOf")) {
++      if (element.getEnclosingElement().getKind() == ElementKind.ENUM) {
++        return true;
++      }
++    }
++    return false;
++  }
++  
++  /**
++   * Checks that an element doesn't have missing javadocs.
++   * In addition to truly "missing", check that comments aren't solely whitespace (generated by some IDEs),
++   * that they aren't a license header masquerading as a javadoc comment.
++   */
++  private void checkComment(Element element) {
++    // sanity check that the element is really "included", because we do some recursion into types
++    if (!docEnv.isIncluded(element)) {
++      return;
++    }
++    // check that this element isn't on our ignore list. This is only used as a workaround for "split packages".
++    // ignoring a package isn't recursive (on purpose), we still check all the classes, etc. inside it.
++    // we just need to cope with the fact package-info.java isn't there because it is split across multiple jars.
++    if (ignored.contains(element.toString())) {
++      return;
++    }
++    var tree = docTrees.getDocCommentTree(element);
++    if (tree == null || tree.getFirstSentence().isEmpty()) {
++      // Check for methods that override other stuff and perhaps inherit their Javadocs.
++      if (hasInheritedJavadocs(element)) {
++        return;
++      } else {
++        error(element, "javadocs are missing");
++      }
++    } else {
++      var normalized = tree.getFirstSentence().get(0).toString()
++                       .replace('\u00A0', ' ')
++                       .trim()
++                       .toLowerCase(Locale.ROOT);
++      if (normalized.isEmpty()) {
++        error(element, "blank javadoc comment");
++      } else if (normalized.startsWith("licensed to the apache software foundation") ||
++                 normalized.startsWith("copyright 2004 the apache software foundation")) {
++        error(element, "comment is really a license");
++      }
++    }
++    if (level >= PARAMETER) {
++      checkParameters(element, tree);
++    }
++  }
++
++  private boolean hasInheritedJavadocs(Element element) {
++    boolean hasOverrides = element.getAnnotationMirrors().stream()
++        .anyMatch(ann -> ann.getAnnotationType().toString().equals(Override.class.getName()));
++
++    if (hasOverrides) {
++      // If an element has explicit @Overrides annotation, assume it does
++      // have inherited javadocs somewhere.
++      reporter.print(Diagnostic.Kind.NOTE, element, "javadoc empty but @Override declared, skipping.");
++      return true;
++    }
++
++    // Check for methods up the types tree.
++    if (element instanceof ExecutableElement) {
++      ExecutableElement thisMethod = (ExecutableElement) element;
++      Iterable<Element> superTypes =
++          () -> superTypeForInheritDoc(thisMethod.getEnclosingElement()).iterator();
++
++      for (Element sup : superTypes) {
++        for (ExecutableElement supMethod : ElementFilter.methodsIn(sup.getEnclosedElements())) {
++          TypeElement clazz = (TypeElement) thisMethod.getEnclosingElement();
++          if (elementUtils.overrides(thisMethod, supMethod, clazz)) {
++            // We could check supMethod for non-empty javadoc here. Don't know if this makes
++            // sense though as all methods will be verified in the end so it'd fail on the
++            // top of the hierarchy (if empty) anyway.
++            reporter.print(Diagnostic.Kind.NOTE, element, "javadoc empty but method overrides another, skipping.");
++            return true;
++          }
++        }
++      }
++    }
++
++    return false;
++  }
++
++
++  /* Find types from which methods in type may inherit javadoc, in the proper order.*/
++  private Stream<Element> superTypeForInheritDoc(Element type) {
++    TypeElement clazz = (TypeElement) type;
++    List<Element> interfaces = clazz.getInterfaces()
++        .stream()
++        .filter(tm -> tm.getKind() == TypeKind.DECLARED)
++        .map(tm -> ((DeclaredType) tm).asElement())
++        .collect(Collectors.toList());
++
++    Stream<Element> result = interfaces.stream();
++    result = Stream.concat(result, interfaces.stream().flatMap(this::superTypeForInheritDoc));
++
++    if (clazz.getSuperclass().getKind() == TypeKind.DECLARED) {
++      Element superClass = ((DeclaredType) clazz.getSuperclass()).asElement();
++      result = Stream.concat(result, Stream.of(superClass));
++      result = Stream.concat(result, superTypeForInheritDoc(superClass));
++    }
++
++    return result;
++  }
++
++  /** Checks there is a corresponding "param" tag for each method parameter */
++  private void checkParameters(Element element, DocCommentTree tree) {
++    if (element instanceof ExecutableElement) {
++      // record each @param that we see
++      Set<String> seenParameters = new HashSet<>();
++      if (tree != null) {
++        for (var tag : tree.getBlockTags()) {
++          if (tag instanceof ParamTree) {
++            var name = ((ParamTree)tag).getName().getName().toString();
++            seenParameters.add(name);
++          }
++        }
++      }
++      // now compare the method's formal parameter list against it
++      for (var param : ((ExecutableElement)element).getParameters()) {
++        var name = param.getSimpleName().toString();
++        if (!seenParameters.contains(name)) {
++          error(element, "missing javadoc @param for parameter '" + name + "'");
++        }
++      }
++    }
++  }
++  
++  /** logs a new error for the particular element */
++  private void error(Element element, String message) {
++    var fullMessage = new StringBuilder();
++    switch(element.getKind()) {
++      case MODULE:
++      case PACKAGE:
++        // for modules/packages, we don't have filename + line number, fully qualify
++        fullMessage.append(element.toString());
++        break;
++      case METHOD:
++      case CONSTRUCTOR:
++      case FIELD:
++      case ENUM_CONSTANT:
++        // for method-like elements, include the enclosing type to make it easier
++        fullMessage.append(element.getEnclosingElement().getSimpleName());
++        fullMessage.append(".");
++        fullMessage.append(element.getSimpleName());
++        break;
++      default:
++        // for anything else, use a simple name
++        fullMessage.append(element.getSimpleName());
++        break;
++    }
++    fullMessage.append(" (");
++    fullMessage.append(element.getKind().toString().toLowerCase(Locale.ROOT));
++    fullMessage.append("): ");
++    fullMessage.append(message);
++    reporter.print(Diagnostic.Kind.ERROR, element, fullMessage.toString());
++  }
++}
+diff --git a/dev-tools/scripts/checkJavaDocs.py b/dev-tools/scripts/checkJavaDocs.py
+deleted file mode 100644
+index 14ded3d4ec24..000000000000
+--- a/dev-tools/scripts/checkJavaDocs.py
++++ /dev/null
+@@ -1,392 +0,0 @@
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-import sys
+-import os
+-import re
+-
+-reHREF = re.compile('<a.*?>(.*?)</a>', re.IGNORECASE)
+-
+-reMarkup = re.compile('<.*?>')
+-reDivBlock = re.compile('<div class="block">(.*?)</div>', re.IGNORECASE)
+-reCaption = re.compile('<caption><span>(.*?)</span>', re.IGNORECASE)
+-reJ8Caption = re.compile('<h[23]>(.*?) Summary</h[23]>')
+-reTDLastNested = re.compile('^<td class="colLast"><code><strong><a href="[^>]*\.([^>]*?)\.html" title="class in[^>]*">', re.IGNORECASE)
+-reMethod = re.compile('^<th class="colSecond" scope="row"><code><span class="memberNameLink"><a href="[^>]*#([^>]*?)">', re.IGNORECASE)
+-reColOne = re.compile('^<td class="colOne"><code><strong><a href="[^>]*#([^>]*?)">', re.IGNORECASE)
+-reMemberNameLink = re.compile('^<td class="colLast"><code><span class="memberNameLink"><a href="[^>]*#([^>]*?)"', re.IGNORECASE)
+-reNestedClassMemberNameLink = re.compile('^<td class="colLast"><code><span class="memberNameLink"><a href="[^>]*?".*?>(.*?)</a>', re.IGNORECASE)
+-reMemberNameOneLink = re.compile('^<td class="colOne"><code><span class="memberNameLink"><a href="[^>]*#([^>]*?)"', re.IGNORECASE)
+-
+-# the Method detail section at the end
+-reMethodDetail = re.compile('^<h[23]>Method Details?</h[23]>$', re.IGNORECASE)
+-reMethodDetailAnchor = re.compile('^(?:</a>)?<a id="([^>]*?)">$', re.IGNORECASE)
+-reJ13MethodDetailAnchor = re.compile('^(?:<h3>|</a>)<a id="([^>]*?)">[^>]*</a></h3>$', re.IGNORECASE)
+-
+-reTag = re.compile("(?i)<(\/?\w+)((\s+\w+(\s*=\s*(?:\".*?\"|'.*?'|[^'\">\s]+))?)+\s*|\s*)\/?>")
+-
+-def verifyHTML(s):
+-
+-  stack = []
+-  upto = 0
+-  while True:
+-    m = reTag.search(s, upto)
+-    if m is None:
+-      break
+-    tag = m.group(1)
+-    upto = m.end(0)
+-
+-    if tag[:1] == '/':
+-      justTag = tag[1:]
+-    else:
+-      justTag = tag
+-      
+-    if justTag.lower() in ('br', 'li', 'p', 'col'):
+-      continue
+-
+-    if tag[:1] == '/':
+-      if len(stack) == 0:
+-        raise RuntimeError('saw closing "%s" without opening <%s...>' % (m.group(0), tag[1:]))
+-      elif stack[-1][0] != tag[1:].lower():
+-        raise RuntimeError('closing "%s" does not match opening "%s"' % (m.group(0), stack[-1][1]))
+-      stack.pop()
+-    else:
+-      stack.append((tag.lower(), m.group(0)))
+-
+-  if len(stack) != 0:
+-    raise RuntimeError('"%s" was never closed' % stack[-1][1])
+-
+-def cleanHTML(s):
+-  s = reMarkup.sub('', s)
+-  s = s.replace('&nbsp;', ' ')
+-  s = s.replace('&lt;', '<')
+-  s = s.replace('&gt;', '>')
+-  s = s.replace('&amp;', '&')
+-  return s.strip()
+-
+-reH3 = re.compile('^<h3>(.*?)</h3>', re.IGNORECASE | re.MULTILINE)
+-reH4 = re.compile('^<h4>(.*?)</h4>', re.IGNORECASE | re.MULTILINE)
+-reDetailsDiv = re.compile('<div class="details">')
+-reEndOfClassData = re.compile('<!--.*END OF CLASS DATA.*-->')
+-reBlockList = re.compile('<ul class="blockList(?:Last)?">')
+-reCloseUl = re.compile('</ul>')
+-
+-def checkClassDetails(fullPath):
+-  """
+-  Checks for invalid HTML in the full javadocs under each field/method.
+-  """
+-
+-  # TODO: only works with java7 generated javadocs now!
+-  with open(fullPath, encoding='UTF-8') as f:
+-    desc = []
+-    cat = None
+-    item = None
+-    errors = []
+-    inDetailsDiv = False
+-    blockListDepth = 0
+-    for line in f.readlines():
+-      # Skip content up until  <div class="details">
+-      if not inDetailsDiv:
+-        if reDetailsDiv.match(line) is not None:
+-          inDetailsDiv = True
+-        continue
+-
+-      # Stop looking at content at closing details </div>, which is just before <!-- === END OF CLASS DATA === -->
+-      if reEndOfClassData.match(line) is not None:
+-        if len(desc) != 0:
+-          try:
+-            verifyHTML(''.join(desc))
+-          except RuntimeError as re:
+-            #print('    FAILED: %s' % re)
+-            errors.append((cat, item, str(re)))
+-        break
+-
+-      # <ul class="blockList(Last)"> is the boundary between items
+-      if reBlockList.match(line) is not None:
+-        blockListDepth += 1
+-        if len(desc) != 0:
+-          try:
+-            verifyHTML(''.join(desc))
+-          except RuntimeError as re:
+-            #print('    FAILED: %s' % re)
+-            errors.append((cat, item, str(re)))
+-          del desc[:]
+-
+-      if blockListDepth == 3:
+-        desc.append(line)
+-
+-      if reCloseUl.match(line) is not None:
+-        blockListDepth -= 1
+-      else:
+-        m = reH3.search(line)
+-        if m is not None:
+-          cat = m.group(1)
+-        else:
+-          m = reH4.search(line)
+-          if m is not None:
+-            item = m.group(1)
+-
+-  if len(errors) != 0:
+-    print()
+-    print(fullPath)
+-    for cat, item, message in errors:
+-      print('  broken details HTML: %s: %s: %s' % (cat, item, message))
+-    return True
+-  else:
+-    return False
+-
+-def checkClassSummaries(fullPath):
+-  #print("check %s" % fullPath)
+-
+-  # TODO: only works with java7 generated javadocs now!
+-  f = open(fullPath, encoding='UTF-8')
+-
+-  missing = []
+-  broken = []
+-  inThing = False
+-  lastCaption = None
+-  lastItem = None
+-
+-  desc = None
+-
+-  foundMethodDetail = False
+-  lastMethodAnchor = None
+-  lineCount = 0
+-  
+-  for line in f.readlines():
+-    m = reMethodDetail.search(line)
+-    lineCount += 1
+-    if m is not None:
+-      foundMethodDetail = True
+-      #print('  got method detail')
+-      continue
+-
+-    # prune methods that are just @Overrides of other interface/classes,
+-    # they should be specified elsewhere, if they are e.g. jdk or 
+-    # external classes we cannot inherit their docs anyway
+-    if foundMethodDetail:
+-      m = reMethodDetailAnchor.search(line) or reJ13MethodDetailAnchor.search(line)
+-      if m is not None:
+-        lastMethodAnchor = m.group(1)
+-        continue
+-      isOverrides = '>Overrides:<' in line or '>Specified by:<' in line
+-      #print('check for removing @overridden method: %s; %s; %s' % (lastMethodAnchor, isOverrides, missing))
+-      if isOverrides and ('Methods', lastMethodAnchor) in missing:
+-        #print('removing @overridden method: %s' % lastMethodAnchor)
+-        missing.remove(('Methods', lastMethodAnchor))
+-
+-    m = reCaption.search(line)
+-    if m is not None:
+-      lastCaption = m.group(1)
+-      #print('    caption %s' % lastCaption)
+-    else:
+-      m = reJ8Caption.search(line)
+-      if m is not None:
+-        lastCaption = m.group(1)
+-        if not lastCaption.endswith('s'):
+-          lastCaption += 's'
+-        #print('    caption %s' % lastCaption)
+-
+-    # Try to find the item in question (method/member name):
+-    for matcher in (reTDLastNested, # nested classes
+-                    reMethod, # methods etc.
+-                    reColOne, # ctors etc.
+-                    reMemberNameLink, # java 8
+-                    reNestedClassMemberNameLink, # java 8, nested class
+-                    reMemberNameOneLink): # java 8 ctors
+-      m = matcher.search(line)
+-      if m is not None:
+-        lastItem = m.group(1)
+-        #print('  found item %s; inThing=%s' % (lastItem, inThing))
+-        break
+-
+-    lineLower = line.strip().lower()
+-
+-    if lineLower.find('<tr class="') != -1 or lineLower.find('<tr id="') != -1:
+-      inThing = True
+-      hasDesc = False
+-      continue
+-
+-    if inThing:
+-      if lineLower.find('</tr>') != -1:
+-        #print('  end item %s; hasDesc %s' % (lastItem, hasDesc))
+-        if not hasDesc:
+-          if lastItem is None:
+-            raise RuntimeError('failed to locate javadoc item in %s, line %d? last line: %s' % (fullPath, lineCount, line.rstrip()))
+-          missing.append((lastCaption, unEscapeURL(lastItem)))
+-          #print('    add missing; now %d: %s' % (len(missing), str(missing)))
+-        inThing = False
+-        continue
+-      else:
+-        if line.find('<div class="block">') != -1:
+-          desc = []
+-        if desc is not None:
+-          desc.append(line)
+-          if line.find('</div>') != -1:
+-            desc = ''.join(desc)
+-
+-            try:
+-              verifyHTML(desc)
+-            except RuntimeError as e:
+-              broken.append((lastCaption, lastItem, str(e)))
+-              #print('FAIL: %s: %s: %s: %s' % (lastCaption, lastItem, e, desc))
+-                            
+-            desc = desc.replace('<div class="block">', '')
+-            desc = desc.replace('</div>', '')
+-            desc = desc.strip()
+-            hasDesc = len(desc) > 0
+-            #print('   thing %s: %s' % (lastItem, desc))
+-
+-            desc = None
+-  f.close()
+-  if len(missing) > 0 or len(broken) > 0:
+-    print()
+-    print(fullPath)
+-    for (caption, item) in missing:
+-      print('  missing %s: %s' % (caption, item))
+-    for (caption, item, why) in broken:
+-      print('  broken HTML: %s: %s: %s' % (caption, item, why))
+-    return True
+-  else:
+-    return False
+-  
+-def checkSummary(fullPath):
+-  printed = False
+-  f = open(fullPath, encoding='UTF-8')
+-  anyMissing = False
+-  sawPackage = False
+-  desc = []
+-  lastHREF = None
+-  for line in f.readlines():
+-    lineLower = line.strip().lower()
+-    if desc is not None:
+-      # TODO: also detect missing description in overview-summary
+-      if lineLower.startswith('package ') or lineLower.startswith('<h1 title="package" '):
+-        sawPackage = True
+-      elif sawPackage:
+-        if lineLower.startswith('<table ') or lineLower.startswith('<b>see: ') or lineLower.startswith('<p>see:') or lineLower.startswith('</main>'):
+-          desc = ' '.join(desc)
+-          desc = reMarkup.sub(' ', desc)
+-          desc = desc.strip()
+-          if desc == '':
+-            if not printed:
+-              print()
+-              print(fullPath)
+-              printed = True
+-            print('  no package description (missing package.html in src?)')
+-            anyMissing = True
+-          desc = None
+-        else:
+-          desc.append(lineLower)
+-      
+-    if lineLower in ('<td>&nbsp;</td>', '<td></td>', '<td class="collast">&nbsp;</td>'):
+-      if not printed:
+-        print()
+-        print(fullPath)
+-        printed = True
+-      print('  missing description: %s' % unescapeHTML(lastHREF))
+-      anyMissing = True
+-    elif lineLower.find('licensed to the apache software foundation') != -1 or lineLower.find('copyright 2004 the apache software foundation') != -1:
+-      if not printed:
+-        print()
+-        print(fullPath)
+-        printed = True
+-      print('  license-is-javadoc: %s' % unescapeHTML(lastHREF))
+-      anyMissing = True
+-    m = reHREF.search(line)
+-    if m is not None:
+-      lastHREF = m.group(1)
+-  if desc is not None and fullPath.find('/overview-summary.html') == -1:
+-    raise RuntimeError('BUG: failed to locate description in %s' % fullPath)
+-  f.close()
+-  return anyMissing
+-
+-def unEscapeURL(s):
+-  # Not exhaustive!!
+-  s = s.replace('%20', ' ')
+-  s = s.replace('%5B', '[')
+-  s = s.replace('%5D', ']')
+-  return s
+-
+-def unescapeHTML(s):
+-  s = s.replace('&lt;', '<')
+-  s = s.replace('&gt;', '>')
+-  s = s.replace('&amp;', '&')
+-  return s
+-
+-def checkPackageSummaries(root, level='class'):
+-  """
+-  Just checks for blank summary lines in package-summary.html; returns
+-  True if there are problems.
+-  """
+-
+-  if level != 'class' and level != 'package' and level != 'method' and level != 'none':
+-    print('unsupported level: %s, must be "class" or "package" or "method" or "none"' % level)
+-    sys.exit(1)
+-  
+-  #for dirPath, dirNames, fileNames in os.walk('%s/lucene/build/docs/api' % root):
+-
+-  if False:
+-    os.chdir(root)
+-    print()
+-    print('Run "ant javadocs" > javadocs.log...')
+-    if os.system('ant javadocs > javadocs.log 2>&1'):
+-      print('  FAILED')
+-      sys.exit(1)
+-    
+-  anyMissing = False
+-  if not os.path.isdir(root):
+-    checkClassSummaries(root)
+-    checkClassDetails(root)
+-    sys.exit(0)
+-    
+-  for dirPath, dirNames, fileNames in os.walk(root):
+-
+-    if dirPath.find('/all/') != -1:
+-      # These are dups (this is a bit risk, eg, root IS this /all/ directory..)
+-      continue
+-
+-    if 'package-summary.html' in fileNames:
+-      if (level == 'class' or level == 'method') and checkSummary('%s/package-summary.html' % dirPath):
+-        anyMissing = True
+-      for fileName in fileNames:
+-        fullPath = '%s/%s' % (dirPath, fileName)
+-        if not fileName.startswith('package-') and fileName.endswith('.html') and os.path.isfile(fullPath):
+-          if level == 'method':
+-            if checkClassSummaries(fullPath):
+-              anyMissing = True
+-          # always look for broken html, regardless of level supplied
+-          if checkClassDetails(fullPath):
+-            anyMissing = True
+-              
+-    if 'overview-summary.html' in fileNames:        
+-      if level != 'none' and checkSummary('%s/overview-summary.html' % dirPath):
+-        anyMissing = True
+-
+-  return anyMissing
+-
+-if __name__ == '__main__':
+-  if len(sys.argv) < 2 or len(sys.argv) > 3:
+-    print('usage: %s <dir> [none|package|class|method]' % sys.argv[0])
+-    sys.exit(1)
+-  if len(sys.argv) == 2:
+-    level = 'class'
+-  else:
+-    level = sys.argv[2]
+-  if checkPackageSummaries(sys.argv[1], level):
+-    print()
+-    print('Missing javadocs were found!')
+-    sys.exit(1)
+-  sys.exit(0)
+diff --git a/dev-tools/scripts/smokeTestRelease.py b/dev-tools/scripts/smokeTestRelease.py
+index e2d336d52e12..867e4520807f 100755
+--- a/dev-tools/scripts/smokeTestRelease.py
++++ b/dev-tools/scripts/smokeTestRelease.py
+@@ -39,7 +39,6 @@
+ from collections import namedtuple
+ from scriptutil import download
+ 
+-import checkJavaDocs
+ import checkJavadocLinks
+ 
+ # This tool expects to find /lucene and /solr off the base URL.  You
+@@ -667,7 +666,7 @@ def verifyUnpacked(java, project, artifact, unpackPath, gitRevision, version, te
+ 
+       print('    generate javadocs w/ Java 11...')
+       java.run_java11('ant javadocs', '%s/javadocs.log' % unpackPath)
+-      checkJavadocpathFull('%s/build/docs' % unpackPath)
++      checkBrokenLinks('%s/build/docs' % unpackPath)
+ 
+       if java.run_java12:
+         print("    run tests w/ Java 12 and testArgs='%s'..." % testArgs)
+@@ -677,7 +676,7 @@ def verifyUnpacked(java, project, artifact, unpackPath, gitRevision, version, te
+ 
+         #print('    generate javadocs w/ Java 12...')
+         #java.run_java12('ant javadocs', '%s/javadocs.log' % unpackPath)
+-        #checkJavadocpathFull('%s/build/docs' % unpackPath)
++        #checkBrokenLinks('%s/build/docs' % unpackPath)
+ 
+     else:
+       os.chdir('solr')
+@@ -688,7 +687,7 @@ def verifyUnpacked(java, project, artifact, unpackPath, gitRevision, version, te
+       # test javadocs
+       print('    generate javadocs w/ Java 11...')
+       java.run_java11('ant clean javadocs', '%s/javadocs.log' % unpackPath)
+-      checkJavadocpathFull('%s/solr/build/docs' % unpackPath, False)
++      checkBrokenLinks('%s/solr/build/docs')
+ 
+       print('    test solr example w/ Java 11...')
+       java.run_java11('ant clean server', '%s/antexample.log' % unpackPath)
+@@ -700,7 +699,7 @@ def verifyUnpacked(java, project, artifact, unpackPath, gitRevision, version, te
+ 
+         #print('    generate javadocs w/ Java 12...')
+         #java.run_java12('ant clean javadocs', '%s/javadocs.log' % unpackPath)
+-        #checkJavadocpathFull('%s/solr/build/docs' % unpackPath, False)
++        #checkBrokenLinks('%s/solr/build/docs' % unpackPath)
+ 
+         print('    test solr example w/ Java 12...')
+         java.run_java12('ant clean server', '%s/antexample.log' % unpackPath)
+@@ -719,9 +718,6 @@ def verifyUnpacked(java, project, artifact, unpackPath, gitRevision, version, te
+       if java.run_java12:
+         testDemo(java.run_java12, isSrc, version, '12')
+ 
+-      print('    check Lucene\'s javadoc JAR')
+-      checkJavadocpath('%s/docs' % unpackPath)
+-
+     else:
+       print('    copying unpacked distribution for Java 11 ...')
+       java11UnpackPath = '%s-java11' % unpackPath
+@@ -865,26 +861,8 @@ def testSolrExample(unpackPath, javaPath, isSrc):
+   else:
+     os.chdir(unpackPath)
+     
+-# the weaker check: we can use this on java6 for some checks,
+-# but its generated HTML is hopelessly broken so we cannot run
+-# the link checking that checkJavadocpathFull does.
+-def checkJavadocpath(path, failOnMissing=True):
+-  # check for level='package'
+-  # we fail here if its screwed up
+-  if failOnMissing and checkJavaDocs.checkPackageSummaries(path, 'package'):
+-    raise RuntimeError('missing javadocs package summaries!')
+-    
+-  # now check for level='class'
+-  if checkJavaDocs.checkPackageSummaries(path):
+-    # disabled: RM cannot fix all this, see LUCENE-3887
+-    # raise RuntimeError('javadoc problems')
+-    print('\n***WARNING***: javadocs want to fail!\n')
+-
+-# full checks
+-def checkJavadocpathFull(path, failOnMissing=True):
+-  # check for missing, etc
+-  checkJavadocpath(path, failOnMissing)
+-
++# check for broken links
++def checkBrokenLinks(path):
+   # also validate html/check for broken links
+   if checkJavadocLinks.checkAll(path):
+     raise RuntimeError('broken javadocs links found!')
+diff --git a/gradle/documentation/render-javadoc.gradle b/gradle/documentation/render-javadoc.gradle
+index baae06665a5f..a34d8a103ff1 100644
+--- a/gradle/documentation/render-javadoc.gradle
++++ b/gradle/documentation/render-javadoc.gradle
+@@ -24,6 +24,14 @@ def resources = scriptResources(buildscript)
+ 
+ allprojects {
+   plugins.withType(JavaPlugin) {
++    configurations {
++      missingdoclet
++    }
++
++    dependencies {
++      missingdoclet "org.apache.lucene.tools:missing-doclet"
++    }
++
+     ext {
+       relativeDocPath = project.path.replaceFirst(/:\w+:/, "").replace(':', '/')
+     }
+@@ -44,7 +52,7 @@ allprojects {
+       taskResources = resources
+       dependsOn sourceSets.main.compileClasspath
+       classpath = sourceSets.main.compileClasspath
+-      srcDirSet = sourceSets.main.java;
++      srcDirSet = sourceSets.main.java
+ 
+       outputDir = project.javadoc.destinationDir
+     }
+@@ -80,6 +88,233 @@ allprojects {
+         "https://docs.oracle.com/en/java/javase/11/docs/api/": javaJavadocPackages,
+         "https://junit.org/junit4/javadoc/4.12/": junitJavadocPackages
+     ]
++
++    // Set up custom doclet.
++    dependsOn configurations.missingdoclet
++    docletpath = configurations.missingdoclet
++  }
++}
++
++// Configure project-specific tweaks and to-dos.
++
++configure(project(":lucene:analysis:common")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing javadocs
++    javadocMissingLevel = "class"
++    // TODO: clean up split packages
++    javadocMissingIgnore = [ "org.apache.lucene.analysis.standard" ]
++  }
++}
++
++configure([
++    project(":lucene:analysis:kuromoji"),
++    project(":lucene:analysis:nori"),
++    project(":lucene:analysis:opennlp"),
++    project(":lucene:analysis:smartcn"),
++    project(":lucene:benchmark"),
++    project(":lucene:codecs"),
++    project(":lucene:grouping"),
++    project(":lucene:highlighter"),
++    project(":lucene:luke"),
++    project(":lucene:monitor"),
++    project(":lucene:queries"),
++    project(":lucene:queryparser"),
++    project(":lucene:replicator"),
++    project(":lucene:spatial-extras"),
++  ]) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing javadocs
++    javadocMissingLevel = "class"
++  }
++}
++
++configure([
++    project(":lucene:analysis:icu"),
++    project(":lucene:analysis:morfologik"),
++    project(":lucene:analysis:phonetic"),
++    project(":lucene:analysis:stempel"),
++    project(":lucene:classification"),
++    project(":lucene:demo"),
++    project(":lucene:expressions"),
++    project(":lucene:facet"),
++    project(":lucene:join"),
++    project(":lucene:spatial3d"),
++    project(":lucene:suggest"),
++  ]) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing @param tags
++    javadocMissingLevel = "method"
++  }
++}
++
++configure(project(":lucene:analysis:icu")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.lucene.collation",
++        "org.apache.lucene.collation.tokenattributes"
++    ]
++  }
++}
++
++configure(project(":lucene:backward-codecs")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing @param tags
++    javadocMissingLevel = "method"
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.lucene.codecs",
++        "org.apache.lucene.codecs.lucene50",
++        "org.apache.lucene.codecs.lucene60",
++        "org.apache.lucene.codecs.lucene80",
++        "org.apache.lucene.codecs.lucene84",
++        "org.apache.lucene.codecs.lucene86"
++    ]
++  }
++}
++
++configure(project(":lucene:test-framework")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing javadocs
++    javadocMissingLevel = "class"
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.lucene.analysis",
++        "org.apache.lucene.analysis.standard",
++        "org.apache.lucene.codecs",
++        "org.apache.lucene.codecs.blockterms",
++        "org.apache.lucene.codecs.bloom",
++        "org.apache.lucene.codecs.compressing",
++        "org.apache.lucene.codecs.uniformsplit",
++        "org.apache.lucene.codecs.uniformsplit.sharedterms",
++        "org.apache.lucene.geo",
++        "org.apache.lucene.index",
++        "org.apache.lucene.search",
++        "org.apache.lucene.search.similarities",
++        "org.apache.lucene.search.spans",
++        "org.apache.lucene.store",
++        "org.apache.lucene.util",
++        "org.apache.lucene.util.automaton",
++        "org.apache.lucene.util.fst"
++    ]
++  }
++}
++
++configure(project(":lucene:sandbox")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing javadocs
++    javadocMissingLevel = "class"
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.lucene.search",
++        "org.apache.lucene.document"
++    ]
++  }
++}
++
++configure(project(":lucene:misc")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing javadocs
++    javadocMissingLevel = "class"
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.lucene.search",
++        "org.apache.lucene.search.similarity",
++        "org.apache.lucene.util",
++        "org.apache.lucene.util.fst",
++        "org.apache.lucene.store",
++        "org.apache.lucene.document",
++        "org.apache.lucene.index"
++    ]
++  }
++}
++
++configure(project(":lucene:core")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing javadocs
++    javadocMissingLevel = "class"
++    // some packages are fixed already
++    javadocMissingMethod = [
++        "org.apache.lucene.util.automaton",
++        "org.apache.lucene.analysis",
++        "org.apache.lucene.analysis.standard",
++        "org.apache.lucene.analysis.tokenattributes",
++        "org.apache.lucene.document",
++        "org.apache.lucene.search.similarities",
++        "org.apache.lucene.index",
++        "org.apache.lucene.codecs",
++        "org.apache.lucene.codecs.lucene50",
++        "org.apache.lucene.codecs.lucene60",
++        "org.apache.lucene.codecs.lucene80",
++        "org.apache.lucene.codecs.lucene84",
++        "org.apache.lucene.codecs.lucene86",
++        "org.apache.lucene.codecs.lucene87",
++        "org.apache.lucene.codecs.perfield"
++    ]
++  }
++}
++
++configure(project(":solr").allprojects) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: fix missing javadocs
++    javadocMissingLevel = "package"
++  }
++}
++
++configure(project(":solr:contrib:velocity")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: clean up split packages
++    javadocMissingIgnore = [ "org.apache.solr.response" ]
++  }
++}
++
++configure(project(":solr:contrib:analysis-extras")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.solr.schema",
++        "org.apache.solr.update.processor"
++    ]
++  }
++}
++
++configure(project(":solr:contrib:analytics")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.solr.handler",
++        "org.apache.solr.handler.component",
++        "org.apache.solr.response"
++    ]
++  }
++}
++
++configure(project(":solr:contrib:langid")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: clean up split packages
++    javadocMissingIgnore = [ "org.apache.solr.update.processor" ]
++  }
++}
++
++configure(project(":solr:solrj")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: clean up split packages
++    javadocMissingIgnore = [ "org.apache.solr.client.solrj.embedded" ]
++  }
++}
++
++configure(project(":solr:test-framework")) {
++  project.tasks.withType(RenderJavadocTask) {
++    // TODO: clean up split packages
++    javadocMissingIgnore = [
++        "org.apache.solr",
++        "org.apache.solr.analysis",
++        "org.apache.solr.cloud",
++        "org.apache.solr.core",
++        "org.apache.solr.handler.component",
++        "org.apache.solr.update.processor",
++        "org.apache.solr.util"
++    ]
+   }
+ }
+ 
+@@ -140,6 +375,9 @@ class RenderJavadocTask extends DefaultTask {
+   @CompileClasspath
+   FileCollection classpath
+ 
++  @CompileClasspath
++  FileCollection docletpath
++
+   @Input
+   String title
+ 
+@@ -158,6 +396,19 @@ class RenderJavadocTask extends DefaultTask {
+   @Input
+   def solrDocUrl = "${->project.solrDocUrl}"
+ 
++  // default is to require full javadocs
++  @Input
++  String javadocMissingLevel = "parameter"
++
++  // anything in these packages is checked with level=method. This allows iteratively fixing one package at a time.
++  @Input
++  List<String> javadocMissingMethod = []
++
++  // default is not to ignore any elements, should only be used to workaround split packages
++  @Input
++  List<String> javadocMissingIgnore = []
++
++
+   @Nullable
+   @Optional
+   @Input
+@@ -214,6 +465,18 @@ class RenderJavadocTask extends DefaultTask {
+     opts << [ '-tag', 'lucene.internal:a:NOTE: This API is for internal purposes only and might change in incompatible ways in the next release.' ]
+     opts << [ '-tag', "lucene.spi:t:SPI Name (case-insensitive: if the name is 'htmlStrip', 'htmlstrip' can be used when looking up the service)." ]
+ 
++    opts << [ '-doclet', "org.apache.lucene.missingdoclet.MissingDoclet" ]
++    opts << [ '-docletpath', docletpath.asPath ]
++    opts << [ '--missing-level', javadocMissingLevel ]
++    if (javadocMissingIgnore) {
++      opts << [ '--missing-ignore', String.join(',', javadocMissingIgnore) ]
++    }
++    if (javadocMissingMethod) {
++      opts << [ '--missing-method', String.join(',', javadocMissingMethod) ]
++    }
++
++    opts << [ '-quiet' ]
++
+     def allOfflineLinks = [:]
+     allOfflineLinks.putAll(offlineLinks)
+ 
+diff --git a/gradle/validation/missing-docs-check.gradle b/gradle/validation/missing-docs-check.gradle
+deleted file mode 100644
+index c0ee56ed04b7..000000000000
+--- a/gradle/validation/missing-docs-check.gradle
++++ /dev/null
+@@ -1,130 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+- 
+-def javaVersionCheck = {
+-  def maxSupported = JavaVersion.VERSION_14
+-  def runtimeVersion = runtimeJava.javaVersion
+-  if (runtimeVersion > JavaVersion.VERSION_14) {
+-    logger.warn("Skipping task because runtime Java version ${runtimeVersion} is " +
+-        "higher than Java ${maxSupported}.")
+-    return false
+-  } else {
+-    return true
+-  }
+-}
+-
+-allprojects {
+-  plugins.withType(JavaPlugin) {
+-    // Too many classes to fix overall to just enable the above to be level="method" right now,
+-    // but we can prevent the modules that don't have problems from getting any worse.
+-    def methodLevelProjects = [
+-        ':lucene:analysis:icu',
+-        ':lucene:analysis:morfologik',
+-        ':lucene:analysis:phonetic',
+-        ':lucene:analysis:stempel',
+-        ':lucene:classification',
+-        ':lucene:demo',
+-        ':lucene:expressions',
+-        ':lucene:facet',
+-        ':lucene:join',
+-        ':lucene:memory',
+-        ':lucene:suggest',
+-        ':lucene:spatial3d',
+-    ]
+-
+-    task checkMissingDocsDefault(type: CheckMissingDocsTask, dependsOn: 'renderJavadoc') {
+-      dirs += [ project.javadoc.destinationDir ]
+-
+-      onlyIf javaVersionCheck
+-
+-      // TODO: add missing docs for all classes and bump this to level=class
+-      if (project.path.startsWith(":solr")) {
+-        level = 'package'
+-      } else if (project.path in methodLevelProjects) {
+-        level = 'method'
+-      } else {
+-        level = 'class'
+-      }
+-    }
+-
+-    task checkMissingDocs() {
+-      group 'Verification'
+-      description 'Check missing Javadocs'
+-
+-      dependsOn checkMissingDocsDefault
+-    }
+-  }
+-}
+-
+-configure(project(':lucene:core')) {
+-  // Defer until java plugin has been applied, otherwise we can't resolve project.javadoc.
+-  plugins.withType(JavaPlugin) {
+-    task checkMissingDocsMethod(type: CheckMissingDocsTask, dependsOn: 'renderJavadoc') {
+-      onlyIf javaVersionCheck
+-      level = 'method'
+-    }
+-
+-    // Too much to fix core/ for now, but enforce full javadocs for key packages.
+-    checkMissingDocsMethod.dirs = [
+-        "org/apache/lucene/util/automaton",
+-        "org/apache/lucene/analysis",
+-        "org/apache/lucene/document",
+-        "org/apache/lucene/search/similarities",
+-        "org/apache/lucene/index",
+-        "org/apache/lucene/codecs"
+-    ].collect { path -> file("${project.javadoc.destinationDir}/${path}") }
+-    checkMissingDocs {
+-      dependsOn checkMissingDocsMethod
+-    }
+-  }
+-}
+-
+-class CheckMissingDocsTask extends DefaultTask {
+-  @Input
+-  List<File> dirs = []
+-
+-  @Input
+-  String level = "none"
+-
+-  def checkMissingJavadocs(File dir, String level) {
+-    def output = new ByteArrayOutputStream()
+-    def result = project.exec {
+-      executable project.externalTool("python3")
+-      ignoreExitValue = true
+-      standardOutput = output
+-      errorOutput = output
+-      args = [
+-        "-B",
+-        project.rootProject.file("dev-tools/scripts/checkJavaDocs.py").absolutePath,
+-        dir.absolutePath,
+-        level
+-      ]
+-    }
+-
+-    if (result.getExitValue() != 0) {
+-      throw new GradleException("Javadoc verification failed:\n${output}")
+-    }
+-  }
+-
+-  @TaskAction
+-  def lint() {
+-    dirs.findAll { it.exists() }.each { dir ->
+-      project.logger.info("Checking for missing docs... (dir=${dir}, level=${level})")
+-      checkMissingJavadocs(dir, level)
+-    }
+-  }
+-}
+diff --git a/gradle/validation/validate-source-patterns.gradle b/gradle/validation/validate-source-patterns.gradle
+index 827f1d3dc5c4..03ab081eef19 100644
+--- a/gradle/validation/validate-source-patterns.gradle
++++ b/gradle/validation/validate-source-patterns.gradle
+@@ -56,6 +56,7 @@ configure(rootProject) {
+       // excludes:
+       exclude '**/build/**'
+       exclude '**/dist/**'
++      exclude 'dev-tools/missing-doclet/src/**/*.java' // <-- TODO: remove once we allow "var" on master
+       exclude 'lucene/benchmark/work/**'
+       exclude 'lucene/benchmark/temp/**'
+       exclude '**/CheckLoggingConfiguration.java'
+diff --git a/lucene/analysis/common/build.gradle b/lucene/analysis/common/build.gradle
+index ff5857bf1ba4..a44152ccaf97 100644
+--- a/lucene/analysis/common/build.gradle
++++ b/lucene/analysis/common/build.gradle
+@@ -23,4 +23,3 @@ dependencies {
+   api project(':lucene:core')
+   testImplementation project(':lucene:test-framework')
+ }
+-
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/compound/hyphenation/TernaryTree.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/compound/hyphenation/TernaryTree.java
+index a331d2a2b14d..6d1d71a70ec5 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/compound/hyphenation/TernaryTree.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/compound/hyphenation/TernaryTree.java
+@@ -456,6 +456,10 @@ public Enumeration<String> keys() {
+     return new Iterator();
+   }
+ 
++  /**
++   * Enumeration over TST keys
++   * @lucene.internal
++   */
+   public class Iterator implements Enumeration<String> {
+ 
+     /**
+diff --git a/lucene/analysis/nori/build.gradle b/lucene/analysis/nori/build.gradle
+index 60fe3725a399..430673ce5834 100644
+--- a/lucene/analysis/nori/build.gradle
++++ b/lucene/analysis/nori/build.gradle
+@@ -25,3 +25,4 @@ dependencies {
+   
+   testImplementation project(':lucene:test-framework')
+ }
++
+diff --git a/lucene/backward-codecs/src/java/org/apache/lucene/codecs/Placeholder.java b/lucene/backward-codecs/src/java/org/apache/lucene/codecs/Placeholder.java
+index f359369a0c94..d615da3c2ba4 100644
+--- a/lucene/backward-codecs/src/java/org/apache/lucene/codecs/Placeholder.java
++++ b/lucene/backward-codecs/src/java/org/apache/lucene/codecs/Placeholder.java
+@@ -18,5 +18,6 @@
+ 
+ /** Remove this file when adding back compat codecs */
+ public class Placeholder {
+-  
++  // no instance
++  private Placeholder() {}
+ }
+diff --git a/lucene/benchmark/build.gradle b/lucene/benchmark/build.gradle
+index d7c2457b4d92..73f1dd728335 100644
+--- a/lucene/benchmark/build.gradle
++++ b/lucene/benchmark/build.gradle
+@@ -155,4 +155,4 @@ task getReuters(type: Download) {
+     }
+   }
+   outputs.dir finalPath
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/classification/src/java/org/apache/lucene/classification/CachingNaiveBayesClassifier.java b/lucene/classification/src/java/org/apache/lucene/classification/CachingNaiveBayesClassifier.java
+index b069e19a043f..700e5f7e30ba 100644
+--- a/lucene/classification/src/java/org/apache/lucene/classification/CachingNaiveBayesClassifier.java
++++ b/lucene/classification/src/java/org/apache/lucene/classification/CachingNaiveBayesClassifier.java
+@@ -77,6 +77,7 @@ public CachingNaiveBayesClassifier(IndexReader indexReader, Analyzer analyzer, Q
+   }
+ 
+ 
++  /** Transforms values into a range between 0 and 1 */
+   protected List<ClassificationResult<BytesRef>> assignClassNormalizedList(String inputDocument) throws IOException {
+     String[] tokenizedText = tokenize(inputDocument);
+ 
+diff --git a/lucene/codecs/src/java/org/apache/lucene/codecs/uniformsplit/sharedterms/STUniformSplitTermsWriter.java b/lucene/codecs/src/java/org/apache/lucene/codecs/uniformsplit/sharedterms/STUniformSplitTermsWriter.java
+index ca15d6a74da9..428e4f9e0bbd 100755
+--- a/lucene/codecs/src/java/org/apache/lucene/codecs/uniformsplit/sharedterms/STUniformSplitTermsWriter.java
++++ b/lucene/codecs/src/java/org/apache/lucene/codecs/uniformsplit/sharedterms/STUniformSplitTermsWriter.java
+@@ -335,7 +335,7 @@ private interface SharedTermsWriter {
+     Collection<FieldMetadata> writeSharedTerms(STBlockWriter blockWriter, IndexDictionary.Builder dictionaryBuilder) throws IOException;
+   }
+ 
+-  protected class SegmentPostings {
++  final class SegmentPostings {
+ 
+     final int segmentIndex;
+     final BlockTermState termState;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java b/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java
+index 6e73c543c15e..611f5185a805 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java
++++ b/lucene/core/src/java/org/apache/lucene/search/MultiCollectorManager.java
+@@ -58,6 +58,7 @@ public Object[] reduce(Collection<Collectors> reducableCollectors) throws IOExce
+     return results;
+   }
+ 
++  /** Wraps multiple collectors for processing */
+   public class Collectors implements Collector {
+ 
+     private final Collector[] collectors;
+@@ -86,6 +87,10 @@ final public ScoreMode scoreMode() {
+       return scoreMode;
+     }
+ 
++    /**
++     * Wraps multiple leaf collectors and delegates collection across each one
++     * @lucene.internal
++     */
+     public class LeafCollectors implements LeafCollector {
+ 
+       private final LeafCollector[] leafCollectors;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1EXP.java b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1EXP.java
+index ca5c42be630f..1879109a961f 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1EXP.java
++++ b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1EXP.java
+@@ -128,4 +128,4 @@ protected Explanation idfExplain(BasicStats stats, double freq, double docLen){
+         Explanation.match((float) stats.getDocFreq(),
+             "n, number of documents containing term"));
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1LOG.java b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1LOG.java
+index 6ef3587aff6c..5f8559f3e2ec 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1LOG.java
++++ b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1LOG.java
+@@ -119,4 +119,4 @@ protected Explanation idfExplain(BasicStats stats, double freq, double docLen){
+         Explanation.match((float) stats.getDocFreq(),
+             "n, number of documents containing term"));
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2EXP.java b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2EXP.java
+index bd2804818850..444625862f41 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2EXP.java
++++ b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2EXP.java
+@@ -127,4 +127,4 @@ protected Explanation idfExplain(BasicStats stats, double freq, double docLen){
+         Explanation.match((float) stats.getDocFreq(),
+             "n, number of documents containing term"));
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2LOG.java b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2LOG.java
+index 4780d1e14a9b..556873757e10 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2LOG.java
++++ b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2LOG.java
+@@ -118,4 +118,4 @@ protected Explanation idfExplain(BasicStats stats, double freq, double docLen){
+         Explanation.match((float) stats.getDocFreq(),
+             "n, number of documents containing term"));
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3EXP.java b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3EXP.java
+index a54c7549ac7f..b9ed3463fb80 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3EXP.java
++++ b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3EXP.java
+@@ -122,4 +122,4 @@ protected Explanation idfExplain(BasicStats stats, double freq, double docLen){
+         Explanation.match((float) stats.getDocFreq(),
+             "n, number of documents containing term"));
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3LOG.java b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3LOG.java
+index 194b70a5f1cf..ea772e0c7ccf 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3LOG.java
++++ b/lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3LOG.java
+@@ -110,4 +110,4 @@ protected Explanation idfExplain(BasicStats stats, double freq, double docLen){
+         Explanation.match((float) stats.getDocFreq(),
+             "n, number of documents containing term"));
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanContainingQuery.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanContainingQuery.java
+index 63662994bf14..f3909bb428cd 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanContainingQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanContainingQuery.java
+@@ -51,6 +51,10 @@ public SpanWeight createWeight(IndexSearcher searcher, ScoreMode scoreMode, floa
+                                       bigWeight, littleWeight, boost);
+   }
+ 
++  /**
++   * Creates SpanContainingQuery scorer instances
++   * @lucene.internal
++   */
+   public class SpanContainingWeight extends SpanContainWeight {
+ 
+     public SpanContainingWeight(IndexSearcher searcher, Map<Term, TermStates> terms,
+@@ -123,4 +127,4 @@ public boolean isCacheable(LeafReaderContext ctx) {
+     }
+ 
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanNearQuery.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanNearQuery.java
+index 2f219bf0e116..900f7b6df88f 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanNearQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanNearQuery.java
+@@ -187,6 +187,10 @@ public SpanWeight createWeight(IndexSearcher searcher, ScoreMode scoreMode, floa
+     return new SpanNearWeight(subWeights, searcher, scoreMode.needsScores() ? getTermStates(subWeights) : null, boost);
+   }
+ 
++  /**
++   * Creates SpanNearQuery scorer instances
++   * @lucene.internal
++   */
+   public class SpanNearWeight extends SpanWeight {
+ 
+     final List<SpanWeight> subWeights;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java
+index 5d998feb86d6..bad825f509b3 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanNotQuery.java
+@@ -106,6 +106,10 @@ public SpanWeight createWeight(IndexSearcher searcher, ScoreMode scoreMode, floa
+                                   includeWeight, excludeWeight, boost);
+   }
+ 
++  /**
++   * Creates SpanNotQuery scorer instances
++   * @lucene.internal
++   */
+   public class SpanNotWeight extends SpanWeight {
+ 
+     final SpanWeight includeWeight;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanOrQuery.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanOrQuery.java
+index 5f589e10dde0..0a8e89ededa4 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanOrQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanOrQuery.java
+@@ -136,6 +136,10 @@ public SpanWeight createWeight(IndexSearcher searcher, ScoreMode scoreMode, floa
+     return new SpanOrWeight(searcher, scoreMode.needsScores() ? getTermStates(subWeights) : null, subWeights, boost);
+   }
+ 
++  /**
++   * Creates SpanOrQuery scorer instances
++   * @lucene.internal
++   */
+   public class SpanOrWeight extends SpanWeight {
+ 
+     final List<SpanWeight> subWeights;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java
+index 3e40c6487d28..e2d09c2e18c4 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanPositionCheckQuery.java
+@@ -74,6 +74,10 @@ public SpanWeight createWeight(IndexSearcher searcher, ScoreMode scoreMode, floa
+     return new SpanPositionCheckWeight(matchWeight, searcher, scoreMode.needsScores() ? getTermStates(matchWeight) : null, boost);
+   }
+ 
++  /**
++   * Creates SpanPositionCheckQuery scorer instances
++   * @lucene.internal
++   */
+   public class SpanPositionCheckWeight extends SpanWeight {
+ 
+     final SpanWeight matchWeight;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanTermQuery.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanTermQuery.java
+index c86e7b78118c..dda3f4493556 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanTermQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanTermQuery.java
+@@ -91,6 +91,10 @@ public void visit(QueryVisitor visitor) {
+     }
+   }
+ 
++  /**
++   * Creates SpanTermQuery scorer instances
++   * @lucene.internal
++   */
+   public class SpanTermWeight extends SpanWeight {
+ 
+     final TermStates termStates;
+diff --git a/lucene/core/src/java/org/apache/lucene/search/spans/SpanWithinQuery.java b/lucene/core/src/java/org/apache/lucene/search/spans/SpanWithinQuery.java
+index fba85fe6e86a..dfe8c8335b77 100644
+--- a/lucene/core/src/java/org/apache/lucene/search/spans/SpanWithinQuery.java
++++ b/lucene/core/src/java/org/apache/lucene/search/spans/SpanWithinQuery.java
+@@ -52,6 +52,10 @@ public SpanWeight createWeight(IndexSearcher searcher, ScoreMode scoreMode, floa
+                                       bigWeight, littleWeight, boost);
+   }
+ 
++  /**
++   * Creates SpanWithinQuery scorer instances
++   * @lucene.internal
++   */
+   public class SpanWithinWeight extends SpanContainWeight {
+ 
+     public SpanWithinWeight(IndexSearcher searcher, Map<Term, TermStates> terms,
+@@ -125,4 +129,4 @@ public boolean isCacheable(LeafReaderContext ctx) {
+ 
+   }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/core/src/java/org/apache/lucene/util/PagedBytes.java b/lucene/core/src/java/org/apache/lucene/util/PagedBytes.java
+index e07046c40ef8..61278645aa48 100644
+--- a/lucene/core/src/java/org/apache/lucene/util/PagedBytes.java
++++ b/lucene/core/src/java/org/apache/lucene/util/PagedBytes.java
+@@ -282,6 +282,10 @@ public long copyUsingLengthPrefix(BytesRef bytes) {
+     return pointer;
+   }
+ 
++  /**
++   * Input that transparently iterates over pages
++   * @lucene.internal
++   */
+   public final class PagedBytesDataInput extends DataInput {
+     private int currentBlockIndex;
+     private int currentBlockUpto;
+@@ -350,6 +354,10 @@ private void nextBlock() {
+     }
+   }
+ 
++  /**
++   * Output that transparently spills to new pages as necessary
++   * @lucene.internal
++   */
+   public final class PagedBytesDataOutput extends DataOutput {
+     @Override
+     public void writeByte(byte b) {
+diff --git a/lucene/grouping/build.gradle b/lucene/grouping/build.gradle
+index b0838e3dfd23..6e719645c7e0 100644
+--- a/lucene/grouping/build.gradle
++++ b/lucene/grouping/build.gradle
+@@ -26,4 +26,4 @@ dependencies {
+   implementation project(':lucene:queries')
+ 
+   testImplementation project(':lucene:test-framework')
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/memory/src/java/org/apache/lucene/index/memory/MemoryIndex.java b/lucene/memory/src/java/org/apache/lucene/index/memory/MemoryIndex.java
+index dacee10ab44f..705e0cc744d2 100644
+--- a/lucene/memory/src/java/org/apache/lucene/index/memory/MemoryIndex.java
++++ b/lucene/memory/src/java/org/apache/lucene/index/memory/MemoryIndex.java
+@@ -629,6 +629,7 @@ private void storeTerms(Info info, TokenStream tokenStream, int positionIncremen
+ 
+   /**
+    * Set the Similarity to be used for calculating field norms
++   * @param similarity instance with custom {@link Similarity#computeNorm} implementation
+    */
+   public void setSimilarity(Similarity similarity) {
+     if (frozen)
+diff --git a/lucene/misc/build.gradle b/lucene/misc/build.gradle
+index bdf575df5628..11758f741e29 100644
+--- a/lucene/misc/build.gradle
++++ b/lucene/misc/build.gradle
+@@ -22,4 +22,4 @@ description = 'Index tools and other miscellaneous code'
+ dependencies {
+   api project(':lucene:core')
+   testImplementation project(':lucene:test-framework')
+-}
+\ No newline at end of file
++}
+diff --git a/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java b/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java
+index 7c5690ec864d..1f2cfe8cfd90 100644
+--- a/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java
++++ b/lucene/misc/src/java/org/apache/lucene/document/LazyDocument.java
+@@ -125,6 +125,7 @@ private void fetchRealValues(String name, int fieldNum) {
+ 
+ 
+   /** 
++   * Lazy-loaded field
+    * @lucene.internal 
+    */
+   public class LazyField implements IndexableField {
+diff --git a/lucene/queries/build.gradle b/lucene/queries/build.gradle
+index 64c2bf41dad0..bd56a4dd50cc 100644
+--- a/lucene/queries/build.gradle
++++ b/lucene/queries/build.gradle
+@@ -24,4 +24,5 @@ dependencies {
+ 
+   testImplementation project(':lucene:test-framework')
+   testImplementation project(':lucene:expressions')
+-}
+\ No newline at end of file
++}
++
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java b/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java
+index 9bd9ccc3e34e..92e50dfd842c 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/function/FunctionQuery.java
+@@ -53,6 +53,10 @@ public ValueSource getValueSource() {
+     return func;
+   }
+ 
++  /**
++   * Creates FunctionQuery scorer instances
++   * @lucene.internal
++   */
+   protected class FunctionWeight extends Weight {
+     protected final IndexSearcher searcher;
+     protected final float boost;
+@@ -87,6 +91,10 @@ public void visit(QueryVisitor visitor) {
+     visitor.visitLeaf(this);
+   }
+ 
++  /**
++   * Scores all documents, applying the function to each document
++   * @lucene.internal
++   */
+   protected class AllScorer extends Scorer {
+     final IndexReader reader;
+     final FunctionWeight weight;
+diff --git a/lucene/queries/src/java/org/apache/lucene/queries/function/valuesource/MultiFunction.java b/lucene/queries/src/java/org/apache/lucene/queries/function/valuesource/MultiFunction.java
+index 6b587de8e57f..e702c667ba7e 100644
+--- a/lucene/queries/src/java/org/apache/lucene/queries/function/valuesource/MultiFunction.java
++++ b/lucene/queries/src/java/org/apache/lucene/queries/function/valuesource/MultiFunction.java
+@@ -121,6 +121,7 @@ public static FunctionValues[] valsArr(List<ValueSource> sources, Map<Object, Ob
+     return valsArr;
+   }
+ 
++  /** Base implementation that wraps multiple sources */
+   public class Values extends FunctionValues {
+     final FunctionValues[] valsArr;
+ 
+diff --git a/lucene/queryparser/build.gradle b/lucene/queryparser/build.gradle
+index 077eb245bc8f..365a999b91a9 100644
+--- a/lucene/queryparser/build.gradle
++++ b/lucene/queryparser/build.gradle
+@@ -26,3 +26,5 @@ dependencies {
+ 
+   testImplementation project(':lucene:test-framework')
+ }
++
++
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/precedence/processors/package-info.java b/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/precedence/processors/package-info.java
+new file mode 100644
+index 000000000000..5d0cf3c2f0af
+--- /dev/null
++++ b/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/precedence/processors/package-info.java
+@@ -0,0 +1,39 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Lucene Precedence Query Parser Processors
++ *
++ * <p>
++ * This package contains the 2 {@link org.apache.lucene.queryparser.flexible.core.processors.QueryNodeProcessor}s used by
++ * {@link org.apache.lucene.queryparser.flexible.precedence.PrecedenceQueryParser}.
++ * </p>
++ * <p>
++ * {@link org.apache.lucene.queryparser.flexible.precedence.processors.BooleanModifiersQueryNodeProcessor}: this processor
++ * is used to apply {@link org.apache.lucene.queryparser.flexible.core.nodes.ModifierQueryNode}s on
++ * {@link org.apache.lucene.queryparser.flexible.core.nodes.BooleanQueryNode} children according to the boolean type
++ * or the default operator.
++ * </p>
++ * <p>
++ * {@link org.apache.lucene.queryparser.flexible.precedence.processors.PrecedenceQueryNodeProcessorPipeline}: this
++ * processor pipeline is used by {@link org.apache.lucene.queryparser.flexible.precedence.PrecedenceQueryParser}. It extends
++ * {@link org.apache.lucene.queryparser.flexible.standard.processors.StandardQueryNodeProcessorPipeline} and rearrange
++ * the pipeline so the boolean precedence is processed correctly. Check {@link org.apache.lucene.queryparser.flexible.precedence.processors.PrecedenceQueryNodeProcessorPipeline}
++ * for more details. 
++ * </p>
++ */
++package org.apache.lucene.queryparser.flexible.precedence.processors;
+\ No newline at end of file
+diff --git a/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/precedence/processors/package.html b/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/precedence/processors/package.html
+deleted file mode 100644
+index 1c4e093bdeb4..000000000000
+--- a/lucene/queryparser/src/java/org/apache/lucene/queryparser/flexible/precedence/processors/package.html
++++ /dev/null
+@@ -1,47 +0,0 @@
+-<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<html>
+-<head>
+-   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+-</head>
+-<body>
+-
+-Processors used by Precedence Query Parser
+-
+-<h2>Lucene Precedence Query Parser Processors</h2>
+-
+-<p>
+-This package contains the 2 {@link org.apache.lucene.queryparser.flexible.core.processors.QueryNodeProcessor}s used by
+-{@link org.apache.lucene.queryparser.flexible.precedence.PrecedenceQueryParser}.
+-</p>
+-<p>
+-{@link org.apache.lucene.queryparser.flexible.precedence.processors.BooleanModifiersQueryNodeProcessor}: this processor
+-is used to apply {@link org.apache.lucene.queryparser.flexible.core.nodes.ModifierQueryNode}s on
+-{@link org.apache.lucene.queryparser.flexible.core.nodes.BooleanQueryNode} children according to the boolean type
+-or the default operator.
+-</p>
+-<p>
+-{@link org.apache.lucene.queryparser.flexible.precedence.processors.PrecedenceQueryNodeProcessorPipeline}: this
+-processor pipeline is used by {@link org.apache.lucene.queryparser.flexible.precedence.PrecedenceQueryParser}. It extends
+-{@link org.apache.lucene.queryparser.flexible.standard.processors.StandardQueryNodeProcessorPipeline} and rearrange
+-the pipeline so the boolean precedence is processed correctly. Check {@link org.apache.lucene.queryparser.flexible.precedence.processors.PrecedenceQueryNodeProcessorPipeline}
+-for more details. 
+-</p>
+-
+-</body>
+-</html>
+diff --git a/lucene/replicator/build.gradle b/lucene/replicator/build.gradle
+index 32d5cc787323..973c77fb8e28 100644
+--- a/lucene/replicator/build.gradle
++++ b/lucene/replicator/build.gradle
+@@ -36,3 +36,4 @@ dependencies {
+ 
+   testImplementation project(':lucene:test-framework')
+ }
++
+diff --git a/lucene/spatial-extras/build.gradle b/lucene/spatial-extras/build.gradle
+index 2766f7b34a5c..83889d36f576 100644
+--- a/lucene/spatial-extras/build.gradle
++++ b/lucene/spatial-extras/build.gradle
+@@ -31,3 +31,5 @@ dependencies {
+   testImplementation 'org.locationtech.jts:jts-core'
+   testImplementation 'org.locationtech.spatial4j:spatial4j::tests'
+ }
++
++
+diff --git a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/package-info.java b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/package-info.java
+new file mode 100644
+index 000000000000..ce3163c6d733
+--- /dev/null
++++ b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/package-info.java
+@@ -0,0 +1,19 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/** Lucene advanced spatial search */
++package org.apache.lucene.spatial;
+\ No newline at end of file
+diff --git a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/package.html b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/package.html
+deleted file mode 100644
+index b109f3ae1699..000000000000
+--- a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/package.html
++++ /dev/null
+@@ -1,26 +0,0 @@
+-<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<!-- not a package-info.java, because we already defined this package in spatial/ -->
+-<html>
+-<head>
+-   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+-</head>
+-<body>
+-Lucene advanced spatial search
+-</body>
+-</html>
+diff --git a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java
+index 99a5a4a89de3..10b24a288701 100644
+--- a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java
++++ b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/PrefixTreeStrategy.java
+@@ -157,6 +157,7 @@ public Field[] createIndexableFields(Shape shape, int detailLevel) {
+     return new Field[]{field};
+   }
+ 
++  /** Tokenstream for indexing cells of a shape */
+   public class ShapeTokenStream extends BytesRefIteratorTokenStream {
+ 
+     public void setShape(Shape shape) {
+diff --git a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/tree/QuadPrefixTree.java b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/tree/QuadPrefixTree.java
+index d1407e1a44f7..89cf5e1e6f16 100644
+--- a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/tree/QuadPrefixTree.java
++++ b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/tree/QuadPrefixTree.java
+@@ -267,6 +267,7 @@ protected int battenberg(double xmid, double ymid, double xp, double yp){
+     // if we actually use the range property in the query, this could be useful
+   }
+ 
++  /** individual QuadPrefixTree grid cell */
+   protected class QuadCell extends LegacyCell {
+ 
+     QuadCell(byte[] bytes, int off, int len) {
+diff --git a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/util/package-info.java b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/util/package-info.java
+new file mode 100644
+index 000000000000..21f90eba3874
+--- /dev/null
++++ b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/util/package-info.java
+@@ -0,0 +1,19 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/** Advanced spatial utilities. */
++package org.apache.lucene.spatial.util;
+\ No newline at end of file
+diff --git a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/util/package.html b/lucene/spatial-extras/src/java/org/apache/lucene/spatial/util/package.html
+deleted file mode 100644
+index 83d9975583ec..000000000000
+--- a/lucene/spatial-extras/src/java/org/apache/lucene/spatial/util/package.html
++++ /dev/null
+@@ -1,26 +0,0 @@
+-<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<!-- not a package-info.java, because we already defined this package in spatial/ -->
+-<html>
+-<head>
+-   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+-</head>
+-<body>
+-Advanced spatial utilities. 
+-</body>
+-</html>
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/index/BaseTermVectorsFormatTestCase.java b/lucene/test-framework/src/java/org/apache/lucene/index/BaseTermVectorsFormatTestCase.java
+index 095599620beb..0e4e869f1206 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/index/BaseTermVectorsFormatTestCase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/index/BaseTermVectorsFormatTestCase.java
+@@ -332,6 +332,7 @@ public final boolean incrementToken() throws IOException {
+ 
+   }
+ 
++  /** Randomly generated document: call toDocument to index it */
+   protected class RandomDocument {
+ 
+     private final String[] fieldNames;
+@@ -366,6 +367,7 @@ public Document toDocument() {
+ 
+   }
+ 
++  /** Factory for generating random documents, call newDocument to generate each one */
+   protected class RandomDocumentFactory {
+ 
+     private final String[] fieldNames;
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/index/PointsStackTracker.java b/lucene/test-framework/src/java/org/apache/lucene/index/PointsStackTracker.java
+index 5f3535de8dc4..9a2fa9f23e71 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/index/PointsStackTracker.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/index/PointsStackTracker.java
+@@ -31,6 +31,7 @@ public class PointsStackTracker {
+ 
+   public final List<Cell> stack = new ArrayList<>();
+ 
++  /** Individual BKD stack frame */
+   public class Cell {
+     public final byte[] minPackedValue;
+     public final byte[] maxPackedValue;
+diff --git a/lucene/test-framework/src/java/org/apache/lucene/search/ShardSearchingTestBase.java b/lucene/test-framework/src/java/org/apache/lucene/search/ShardSearchingTestBase.java
+index a8f1b7daefbf..cd83f4416f3c 100644
+--- a/lucene/test-framework/src/java/org/apache/lucene/search/ShardSearchingTestBase.java
++++ b/lucene/test-framework/src/java/org/apache/lucene/search/ShardSearchingTestBase.java
+@@ -197,6 +197,7 @@ Map<Term,TermStatistics> getNodeTermStats(Set<Term> terms, int nodeID, long vers
+     return stats;
+   }
+ 
++  /** Simulated shard node under test */
+   protected final class NodeState implements Closeable {
+     public final Directory dir;
+     public final IndexWriter writer;
+diff --git a/settings.gradle b/settings.gradle
+index fdf46af7f42b..a23738e48980 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -15,6 +15,7 @@
+  * limitations under the License.
+  */
+ 
++includeBuild("dev-tools/missing-doclet")
+ 
+ include "lucene:analysis:common"
+ include "lucene:analysis:icu"
+diff --git a/solr/build.gradle b/solr/build.gradle
+index 9edc4d1aa2cf..60961744285a 100644
+--- a/solr/build.gradle
++++ b/solr/build.gradle
+@@ -19,4 +19,6 @@ description = 'Parent project for Apache Solr'
+ 
+ subprojects {
+   group "org.apache.solr"
+-}
+\ No newline at end of file
++}
++
++
+diff --git a/solr/contrib/analysis-extras/build.gradle b/solr/contrib/analysis-extras/build.gradle
+index c39629a7bee4..8e6ddd07f2d2 100644
+--- a/solr/contrib/analysis-extras/build.gradle
++++ b/solr/contrib/analysis-extras/build.gradle
+@@ -32,4 +32,3 @@ dependencies {
+ 
+   testImplementation project(':solr:test-framework')
+ }
+-
+diff --git a/solr/core/src/java/org/apache/solr/query/package-info.java b/solr/core/src/java/org/apache/solr/query/package-info.java
+new file mode 100644
+index 000000000000..1bc0840a1eb3
+--- /dev/null
++++ b/solr/core/src/java/org/apache/solr/query/package-info.java
+@@ -0,0 +1,21 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Solr Queries
++ */
++package org.apache.solr.query;
+\ No newline at end of file
+diff --git a/solr/core/src/java/org/apache/solr/query/package.html b/solr/core/src/java/org/apache/solr/query/package.html
+deleted file mode 100644
+index 03ecf5f0ea69..000000000000
+--- a/solr/core/src/java/org/apache/solr/query/package.html
++++ /dev/null
+@@ -1,27 +0,0 @@
+-<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<html>
+-<head>
+-   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+-</head>
+-<body>
+-<p>
+-Solr Queries
+-</p>
+-</body>
+-</html>
+diff --git a/solr/core/src/java/org/apache/solr/request/json/package-info.java b/solr/core/src/java/org/apache/solr/request/json/package-info.java
+new file mode 100644
+index 000000000000..2a3060dc5cdf
+--- /dev/null
++++ b/solr/core/src/java/org/apache/solr/request/json/package-info.java
+@@ -0,0 +1,21 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * JSON related classes
++ */
++package org.apache.solr.request.json;
+\ No newline at end of file
+diff --git a/solr/core/src/java/org/apache/solr/request/json/package.html b/solr/core/src/java/org/apache/solr/request/json/package.html
+deleted file mode 100644
+index d87e4a4190c0..000000000000
+--- a/solr/core/src/java/org/apache/solr/request/json/package.html
++++ /dev/null
+@@ -1,27 +0,0 @@
+-<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<html>
+-<head>
+-   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+-</head>
+-<body>
+-<p>
+-JSON related classes
+-</p>
+-</body>
+-</html>
+diff --git a/solr/core/src/java/org/apache/solr/request/macro/package-info.java b/solr/core/src/java/org/apache/solr/request/macro/package-info.java
+new file mode 100644
+index 000000000000..222f4c695355
+--- /dev/null
++++ b/solr/core/src/java/org/apache/solr/request/macro/package-info.java
+@@ -0,0 +1,21 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Parameter substitution / macro expansion.
++ */
++package org.apache.solr.request.macro;
+\ No newline at end of file
+diff --git a/solr/core/src/java/org/apache/solr/request/macro/package.html b/solr/core/src/java/org/apache/solr/request/macro/package.html
+deleted file mode 100644
+index 21856b459582..000000000000
+--- a/solr/core/src/java/org/apache/solr/request/macro/package.html
++++ /dev/null
+@@ -1,27 +0,0 @@
+-<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<html>
+-<head>
+-   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+-</head>
+-<body>
+-<p>
+-Parameter substitution / macro expansion.
+-</p>
+-</body>
+-</html>
+diff --git a/solr/core/src/java/org/apache/solr/search/facet/package-info.java b/solr/core/src/java/org/apache/solr/search/facet/package-info.java
+new file mode 100644
+index 000000000000..fbbb6255d0c1
+--- /dev/null
++++ b/solr/core/src/java/org/apache/solr/search/facet/package-info.java
+@@ -0,0 +1,22 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * APIs and classes for the JSON Facet API.
++ * This is currently experimental!
++ */
++package org.apache.solr.search.facet;
+diff --git a/solr/core/src/java/org/apache/solr/search/facet/package.html b/solr/core/src/java/org/apache/solr/search/facet/package.html
+deleted file mode 100644
+index a0590cb9a572..000000000000
+--- a/solr/core/src/java/org/apache/solr/search/facet/package.html
++++ /dev/null
+@@ -1,28 +0,0 @@
+-<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+-<!--
+- Licensed to the Apache Software Foundation (ASF) under one or more
+- contributor license agreements.  See the NOTICE file distributed with
+- this work for additional information regarding copyright ownership.
+- The ASF licenses this file to You under the Apache License, Version 2.0
+- (the "License"); you may not use this file except in compliance with
+- the License.  You may obtain a copy of the License at
+-
+-     http://www.apache.org/licenses/LICENSE-2.0
+-
+- Unless required by applicable law or agreed to in writing, software
+- distributed under the License is distributed on an "AS IS" BASIS,
+- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- See the License for the specific language governing permissions and
+- limitations under the License.
+--->
+-<html>
+-<head>
+-   <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+-</head>
+-<body>
+-<p>
+-APIs and classes for the JSON Facet API.
+-This is currently experimental!
+-</p>
+-</body>
+-</html>
+diff --git a/solr/core/src/java/org/apache/solr/util/circuitbreaker/package-info.java b/solr/core/src/java/org/apache/solr/util/circuitbreaker/package-info.java
+new file mode 100644
+index 000000000000..75718b5a5458
+--- /dev/null
++++ b/solr/core/src/java/org/apache/solr/util/circuitbreaker/package-info.java
+@@ -0,0 +1,21 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Support for triggering exceptions on excessive resource usage
++ */
++package org.apache.solr.util.circuitbreaker;
+\ No newline at end of file
+diff --git a/solr/test-framework/build.gradle b/solr/test-framework/build.gradle
+index 62a724c506dd..1f4064c81311 100644
+--- a/solr/test-framework/build.gradle
++++ b/solr/test-framework/build.gradle
+@@ -31,3 +31,4 @@ dependencies {
+   implementation 'io.dropwizard.metrics:metrics-jetty9'
+   implementation 'com.lmax:disruptor'
+ }
++

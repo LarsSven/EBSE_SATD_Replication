@@ -1,0 +1,1571 @@
+diff --git a/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/runtime/jobmanager/JMXJobManagerMetricTest.java b/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/runtime/jobmanager/JMXJobManagerMetricTest.java
+index 10f6356a9469e..0ed84970e2969 100644
+--- a/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/runtime/jobmanager/JMXJobManagerMetricTest.java
++++ b/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/runtime/jobmanager/JMXJobManagerMetricTest.java
+@@ -32,7 +32,6 @@
+ import org.apache.flink.runtime.execution.Environment;
+ import org.apache.flink.runtime.jobgraph.JobGraph;
+ import org.apache.flink.runtime.jobgraph.JobVertex;
+-import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
+ import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
+ import org.apache.flink.runtime.jobgraph.tasks.JobCheckpointingSettings;
+@@ -50,7 +49,6 @@
+ 
+ import java.lang.management.ManagementFactory;
+ import java.time.Duration;
+-import java.util.Collections;
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -93,9 +91,6 @@ public void testJobManagerJMXMetricAccess() throws Exception {
+             JobGraph jobGraph = new JobGraph("TestingJob", sourceJobVertex);
+             jobGraph.setSnapshotSettings(
+                     new JobCheckpointingSettings(
+-                            Collections.<JobVertexID>emptyList(),
+-                            Collections.<JobVertexID>emptyList(),
+-                            Collections.<JobVertexID>emptyList(),
+                             new CheckpointCoordinatorConfiguration(
+                                     500,
+                                     500,
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinator.java b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinator.java
+index 09890b31dbbb8..d4fa785e437ed 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinator.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinator.java
+@@ -23,7 +23,6 @@
+ import org.apache.flink.runtime.checkpoint.hooks.MasterHooks;
+ import org.apache.flink.runtime.concurrent.FutureUtils;
+ import org.apache.flink.runtime.concurrent.ScheduledExecutor;
+-import org.apache.flink.runtime.execution.ExecutionState;
+ import org.apache.flink.runtime.executiongraph.Execution;
+ import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+ import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
+@@ -113,16 +112,6 @@ public class CheckpointCoordinator {
+ 
+     private final CheckpointsCleaner checkpointsCleaner;
+ 
+-    /** Tasks who need to be sent a message when a checkpoint is started. */
+-    private final ExecutionVertex[] tasksToTrigger;
+-
+-    /** Tasks who need to acknowledge a checkpoint before it succeeds. */
+-    private final ExecutionVertex[] tasksToWaitFor;
+-
+-    /** Tasks who need to be sent a message when a checkpoint is confirmed. */
+-    // TODO currently we use commit vertices to receive "abort checkpoint" messages.
+-    private final ExecutionVertex[] tasksToCommitTo;
+-
+     /** The operator coordinators that need to be checkpointed. */
+     private final Collection<OperatorCoordinatorCheckpointContext> coordinatorsToCheckpoint;
+ 
+@@ -223,16 +212,16 @@ public class CheckpointCoordinator {
+     private boolean isTriggering = false;
+ 
+     private final CheckpointRequestDecider requestDecider;
+-    private final LinkedHashMap<ExecutionAttemptID, ExecutionVertex> cachedTasksById;
++
++    private final CheckpointPlanCalculator checkpointPlanCalculator;
++
++    private final ExecutionAttemptMappingProvider attemptMappingProvider;
+ 
+     // --------------------------------------------------------------------------------------------
+ 
+     public CheckpointCoordinator(
+             JobID job,
+             CheckpointCoordinatorConfiguration chkConfig,
+-            ExecutionVertex[] tasksToTrigger,
+-            ExecutionVertex[] tasksToWaitFor,
+-            ExecutionVertex[] tasksToCommitTo,
+             Collection<OperatorCoordinatorCheckpointContext> coordinatorsToCheckpoint,
+             CheckpointIDCounter checkpointIDCounter,
+             CompletedCheckpointStore completedCheckpointStore,
+@@ -241,14 +230,13 @@ public CheckpointCoordinator(
+             CheckpointsCleaner checkpointsCleaner,
+             ScheduledExecutor timer,
+             SharedStateRegistryFactory sharedStateRegistryFactory,
+-            CheckpointFailureManager failureManager) {
++            CheckpointFailureManager failureManager,
++            CheckpointPlanCalculator checkpointPlanCalculator,
++            ExecutionAttemptMappingProvider attemptMappingProvider) {
+ 
+         this(
+                 job,
+                 chkConfig,
+-                tasksToTrigger,
+-                tasksToWaitFor,
+-                tasksToCommitTo,
+                 coordinatorsToCheckpoint,
+                 checkpointIDCounter,
+                 completedCheckpointStore,
+@@ -258,6 +246,8 @@ public CheckpointCoordinator(
+                 timer,
+                 sharedStateRegistryFactory,
+                 failureManager,
++                checkpointPlanCalculator,
++                attemptMappingProvider,
+                 SystemClock.getInstance());
+     }
+ 
+@@ -265,9 +255,6 @@ public CheckpointCoordinator(
+     public CheckpointCoordinator(
+             JobID job,
+             CheckpointCoordinatorConfiguration chkConfig,
+-            ExecutionVertex[] tasksToTrigger,
+-            ExecutionVertex[] tasksToWaitFor,
+-            ExecutionVertex[] tasksToCommitTo,
+             Collection<OperatorCoordinatorCheckpointContext> coordinatorsToCheckpoint,
+             CheckpointIDCounter checkpointIDCounter,
+             CompletedCheckpointStore completedCheckpointStore,
+@@ -277,6 +264,8 @@ public CheckpointCoordinator(
+             ScheduledExecutor timer,
+             SharedStateRegistryFactory sharedStateRegistryFactory,
+             CheckpointFailureManager failureManager,
++            CheckpointPlanCalculator checkpointPlanCalculator,
++            ExecutionAttemptMappingProvider attemptMappingProvider,
+             Clock clock) {
+ 
+         // sanity checks
+@@ -299,9 +288,6 @@ public CheckpointCoordinator(
+         this.baseInterval = baseInterval;
+         this.checkpointTimeout = chkConfig.getCheckpointTimeout();
+         this.minPauseBetweenCheckpoints = minPauseBetweenCheckpoints;
+-        this.tasksToTrigger = checkNotNull(tasksToTrigger);
+-        this.tasksToWaitFor = checkNotNull(tasksToWaitFor);
+-        this.tasksToCommitTo = checkNotNull(tasksToCommitTo);
+         this.coordinatorsToCheckpoint =
+                 Collections.unmodifiableCollection(coordinatorsToCheckpoint);
+         this.pendingCheckpoints = new LinkedHashMap<>();
+@@ -313,6 +299,8 @@ public CheckpointCoordinator(
+         this.sharedStateRegistry = sharedStateRegistryFactory.create(executor);
+         this.isPreferCheckpointForRecovery = chkConfig.isPreferCheckpointForRecovery();
+         this.failureManager = checkNotNull(failureManager);
++        this.checkpointPlanCalculator = checkNotNull(checkpointPlanCalculator);
++        this.attemptMappingProvider = checkNotNull(attemptMappingProvider);
+         this.clock = checkNotNull(clock);
+         this.isExactlyOnceMode = chkConfig.isExactlyOnce();
+         this.unalignedCheckpointsEnabled = chkConfig.isUnalignedCheckpointsEnabled();
+@@ -350,15 +338,6 @@ public CheckpointCoordinator(
+                         this.minPauseBetweenCheckpoints,
+                         this.pendingCheckpoints::size,
+                         this.checkpointsCleaner::getNumberOfCheckpointsToClean);
+-        this.cachedTasksById =
+-                new LinkedHashMap<ExecutionAttemptID, ExecutionVertex>(tasksToWaitFor.length) {
+-
+-                    @Override
+-                    protected boolean removeEldestEntry(
+-                            Map.Entry<ExecutionAttemptID, ExecutionVertex> eldest) {
+-                        return size() > CheckpointCoordinator.this.tasksToWaitFor.length;
+-                    }
+-                };
+     }
+ 
+     // --------------------------------------------------------------------------------------------
+@@ -548,8 +527,7 @@ private void startTriggeringCheckpoint(CheckpointTriggerRequest request) {
+                 preCheckGlobalState(request.isPeriodic);
+             }
+ 
+-            final Execution[] executions = getTriggerExecutions();
+-            final Map<ExecutionAttemptID, ExecutionVertex> ackTasks = getAckTasks();
++            CheckpointPlan checkpointPlan = checkpointPlanCalculator.calculateCheckpointPlan();
+ 
+             // we will actually trigger this checkpoint!
+             Preconditions.checkState(!isTriggering);
+@@ -563,7 +541,7 @@ private void startTriggeringCheckpoint(CheckpointTriggerRequest request) {
+                                             createPendingCheckpoint(
+                                                     timestamp,
+                                                     request.props,
+-                                                    ackTasks,
++                                                    checkpointPlan,
+                                                     request.isPeriodic,
+                                                     checkpointIdAndStorageLocation.checkpointId,
+                                                     checkpointIdAndStorageLocation
+@@ -636,7 +614,7 @@ private void startTriggeringCheckpoint(CheckpointTriggerRequest request) {
+                                                         checkpointId,
+                                                         checkpoint.getCheckpointStorageLocation(),
+                                                         request.props,
+-                                                        executions,
++                                                        checkpointPlan.getTasksToTrigger(),
+                                                         request.advanceToEndOfTime);
+ 
+                                                 coordinatorsToCheckpoint.forEach(
+@@ -711,7 +689,7 @@ private CompletableFuture<CheckpointIdAndStorageLocation> initializeCheckpoint(
+     private PendingCheckpoint createPendingCheckpoint(
+             long timestamp,
+             CheckpointProperties props,
+-            Map<ExecutionAttemptID, ExecutionVertex> ackTasks,
++            CheckpointPlan checkpointPlan,
+             boolean isPeriodic,
+             long checkpointID,
+             CheckpointStorageLocation checkpointStorageLocation,
+@@ -732,14 +710,14 @@ private PendingCheckpoint createPendingCheckpoint(
+                         job,
+                         checkpointID,
+                         timestamp,
+-                        ackTasks,
++                        checkpointPlan,
+                         OperatorInfo.getIds(coordinatorsToCheckpoint),
+                         masterHooks.keySet(),
+                         props,
+                         checkpointStorageLocation,
+                         onCompletionPromise);
+ 
+-        reportToStatsTracker(checkpoint, ackTasks);
++        reportToStatsTracker(checkpoint, checkpointPlan.getTasksToWaitFor());
+ 
+         synchronized (lock) {
+             pendingCheckpoints.put(checkpointID, checkpoint);
+@@ -822,7 +800,7 @@ private CompletableFuture<Void> snapshotMasterState(PendingCheckpoint checkpoint
+      * @param checkpointID the checkpoint id
+      * @param checkpointStorageLocation the checkpoint location
+      * @param props the checkpoint properties
+-     * @param executions the executions which should be triggered
++     * @param tasksToTrigger the executions which should be triggered
+      * @param advanceToEndOfTime Flag indicating if the source should inject a {@code MAX_WATERMARK}
+      *     in the pipeline to fire any registered event-time timers.
+      */
+@@ -831,7 +809,7 @@ private void snapshotTaskState(
+             long checkpointID,
+             CheckpointStorageLocation checkpointStorageLocation,
+             CheckpointProperties props,
+-            Execution[] executions,
++            List<Execution> tasksToTrigger,
+             boolean advanceToEndOfTime) {
+ 
+         final CheckpointOptions checkpointOptions =
+@@ -843,7 +821,7 @@ private void snapshotTaskState(
+                         alignmentTimeout);
+ 
+         // send the messages to the tasks that trigger their checkpoint
+-        for (Execution execution : executions) {
++        for (Execution execution : tasksToTrigger) {
+             if (props.isSynchronous()) {
+                 execution.triggerSynchronousSavepoint(
+                         checkpointID, timestamp, checkpointOptions, advanceToEndOfTime);
+@@ -1236,7 +1214,10 @@ public void run() {
+                             }
+                         });
+ 
+-                sendAbortedMessages(checkpointId, pendingCheckpoint.getCheckpointTimestamp());
++                sendAbortedMessages(
++                        pendingCheckpoint.getCheckpointPlan().getTasksToCommitTo(),
++                        checkpointId,
++                        pendingCheckpoint.getCheckpointTimestamp());
+                 throw new CheckpointException(
+                         "Could not complete the pending checkpoint " + checkpointId + '.',
+                         CheckpointFailureReason.FINALIZE_CHECKPOINT_FAILURE,
+@@ -1277,7 +1258,10 @@ public void run() {
+         }
+ 
+         // send the "notify complete" call to all vertices, coordinators, etc.
+-        sendAcknowledgeMessages(checkpointId, completedCheckpoint.getTimestamp());
++        sendAcknowledgeMessages(
++                pendingCheckpoint.getCheckpointPlan().getTasksToCommitTo(),
++                checkpointId,
++                completedCheckpoint.getTimestamp());
+     }
+ 
+     void scheduleTriggerRequest() {
+@@ -1291,9 +1275,10 @@ void scheduleTriggerRequest() {
+         }
+     }
+ 
+-    private void sendAcknowledgeMessages(long checkpointId, long timestamp) {
++    private void sendAcknowledgeMessages(
++            List<ExecutionVertex> tasksToCommit, long checkpointId, long timestamp) {
+         // commit tasks
+-        for (ExecutionVertex ev : tasksToCommitTo) {
++        for (ExecutionVertex ev : tasksToCommit) {
+             Execution ee = ev.getCurrentExecutionAttempt();
+             if (ee != null) {
+                 ee.notifyCheckpointComplete(checkpointId, timestamp);
+@@ -1306,12 +1291,13 @@ private void sendAcknowledgeMessages(long checkpointId, long timestamp) {
+         }
+     }
+ 
+-    private void sendAbortedMessages(long checkpointId, long timeStamp) {
++    private void sendAbortedMessages(
++            List<ExecutionVertex> tasksToAbort, long checkpointId, long timeStamp) {
+         // send notification of aborted checkpoints asynchronously.
+         executor.execute(
+                 () -> {
+                     // send the "abort checkpoint" messages to necessary vertices.
+-                    for (ExecutionVertex ev : tasksToCommitTo) {
++                    for (ExecutionVertex ev : tasksToAbort) {
+                         Execution ee = ev.getCurrentExecutionAttempt();
+                         if (ee != null) {
+                             ee.notifyCheckpointAborted(checkpointId, timeStamp);
+@@ -1844,7 +1830,8 @@ int getNumQueuedRequests() {
+     public void reportStats(long id, ExecutionAttemptID attemptId, CheckpointMetrics metrics)
+             throws CheckpointException {
+         if (statsTracker != null) {
+-            getVertex(attemptId)
++            attemptMappingProvider
++                    .getVertex(attemptId)
+                     .ifPresent(ev -> statsTracker.reportIncompleteStats(id, ev, metrics));
+         }
+     }
+@@ -1935,6 +1922,7 @@ private void abortPendingCheckpoint(
+                 }
+             } finally {
+                 sendAbortedMessages(
++                        pendingCheckpoint.getCheckpointPlan().getTasksToCommitTo(),
+                         pendingCheckpoint.getCheckpointId(),
+                         pendingCheckpoint.getCheckpointTimestamp());
+                 pendingCheckpoints.remove(pendingCheckpoint.getCheckpointId());
+@@ -1956,65 +1944,6 @@ private void preCheckGlobalState(boolean isPeriodic) throws CheckpointException
+         }
+     }
+ 
+-    /**
+-     * Check if all tasks that we need to trigger are running. If not, abort the checkpoint.
+-     *
+-     * @return the executions need to be triggered.
+-     * @throws CheckpointException the exception fails checking
+-     */
+-    private Execution[] getTriggerExecutions() throws CheckpointException {
+-        Execution[] executions = new Execution[tasksToTrigger.length];
+-        for (int i = 0; i < tasksToTrigger.length; i++) {
+-            Execution ee = tasksToTrigger[i].getCurrentExecutionAttempt();
+-            if (ee == null) {
+-                LOG.info(
+-                        "Checkpoint triggering task {} of job {} is not being executed at the moment. Aborting checkpoint.",
+-                        tasksToTrigger[i].getTaskNameWithSubtaskIndex(),
+-                        job);
+-                throw new CheckpointException(
+-                        CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
+-            } else if (ee.getState() == ExecutionState.RUNNING) {
+-                executions[i] = ee;
+-            } else {
+-                LOG.info(
+-                        "Checkpoint triggering task {} of job {} is not in state {} but {} instead. Aborting checkpoint.",
+-                        tasksToTrigger[i].getTaskNameWithSubtaskIndex(),
+-                        job,
+-                        ExecutionState.RUNNING,
+-                        ee.getState());
+-                throw new CheckpointException(
+-                        CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
+-            }
+-        }
+-        return executions;
+-    }
+-
+-    /**
+-     * Check if all tasks that need to acknowledge the checkpoint are running. If not, abort the
+-     * checkpoint
+-     *
+-     * @return the execution vertices which should give an ack response
+-     * @throws CheckpointException the exception fails checking
+-     */
+-    private Map<ExecutionAttemptID, ExecutionVertex> getAckTasks() throws CheckpointException {
+-        Map<ExecutionAttemptID, ExecutionVertex> ackTasks = new HashMap<>(tasksToWaitFor.length);
+-
+-        for (ExecutionVertex ev : tasksToWaitFor) {
+-            Execution ee = ev.getCurrentExecutionAttempt();
+-            if (ee != null) {
+-                ackTasks.put(ee.getAttemptId(), ev);
+-            } else {
+-                LOG.info(
+-                        "Checkpoint acknowledging task {} of job {} is not being executed at the moment. Aborting checkpoint.",
+-                        ev.getTaskNameWithSubtaskIndex(),
+-                        job);
+-                throw new CheckpointException(
+-                        CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
+-            }
+-        }
+-        return ackTasks;
+-    }
+-
+     private void abortPendingAndQueuedCheckpoints(CheckpointException exception) {
+         assert (Thread.holdsLock(lock));
+         requestDecider.abortAll(exception);
+@@ -2120,17 +2049,6 @@ private enum OperatorCoordinatorRestoreBehavior {
+         SKIP;
+     }
+ 
+-    private Optional<ExecutionVertex> getVertex(ExecutionAttemptID id) throws CheckpointException {
+-        if (!cachedTasksById.containsKey(id)) {
+-            cachedTasksById.putAll(getAckTasks());
+-            if (!cachedTasksById.containsKey(id)) {
+-                // the task probably gone after a restart
+-                cachedTasksById.put(id, null);
+-            }
+-        }
+-        return Optional.ofNullable(cachedTasksById.get(id));
+-    }
+-
+     private void reportToStatsTracker(
+             PendingCheckpoint checkpoint, Map<ExecutionAttemptID, ExecutionVertex> tasks) {
+         if (statsTracker == null) {
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointPlan.java b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointPlan.java
+new file mode 100644
+index 0000000000000..4a0f147f42fff
+--- /dev/null
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointPlan.java
+@@ -0,0 +1,69 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.runtime.checkpoint;
++
++import org.apache.flink.runtime.executiongraph.Execution;
++import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
++import org.apache.flink.runtime.executiongraph.ExecutionVertex;
++
++import java.util.List;
++import java.util.Map;
++
++import static org.apache.flink.util.Preconditions.checkNotNull;
++
++/**
++ * The brief of one checkpoint, indicating which tasks to trigger, waiting for acknowledge or commit
++ * for one specific checkpoint.
++ */
++class CheckpointPlan {
++
++    /** Tasks who need to be sent a message when a checkpoint is started. */
++    private final List<Execution> tasksToTrigger;
++
++    /** Tasks who need to acknowledge a checkpoint before it succeeds. */
++    private final Map<ExecutionAttemptID, ExecutionVertex> tasksToWaitFor;
++
++    /**
++     * Tasks that are still running when taking the checkpoint, these need to be sent a message when
++     * the checkpoint is confirmed.
++     */
++    private final List<ExecutionVertex> tasksToCommitTo;
++
++    CheckpointPlan(
++            List<Execution> tasksToTrigger,
++            Map<ExecutionAttemptID, ExecutionVertex> tasksToWaitFor,
++            List<ExecutionVertex> tasksToCommitTo) {
++
++        this.tasksToTrigger = checkNotNull(tasksToTrigger);
++        this.tasksToWaitFor = checkNotNull(tasksToWaitFor);
++        this.tasksToCommitTo = checkNotNull(tasksToCommitTo);
++    }
++
++    List<Execution> getTasksToTrigger() {
++        return tasksToTrigger;
++    }
++
++    Map<ExecutionAttemptID, ExecutionVertex> getTasksToWaitFor() {
++        return tasksToWaitFor;
++    }
++
++    List<ExecutionVertex> getTasksToCommitTo() {
++        return tasksToCommitTo;
++    }
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointPlanCalculator.java b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointPlanCalculator.java
+new file mode 100644
+index 0000000000000..806afc5c6b1c5
+--- /dev/null
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/CheckpointPlanCalculator.java
+@@ -0,0 +1,126 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.runtime.checkpoint;
++
++import org.apache.flink.api.common.JobID;
++import org.apache.flink.runtime.execution.ExecutionState;
++import org.apache.flink.runtime.executiongraph.Execution;
++import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
++import org.apache.flink.runtime.executiongraph.ExecutionVertex;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++/** Computes the tasks to trigger, wait or commit for each checkpoint. */
++public class CheckpointPlanCalculator {
++    private static final Logger LOG = LoggerFactory.getLogger(CheckpointPlanCalculator.class);
++
++    private final JobID jobId;
++
++    private final List<ExecutionVertex> tasksToTrigger;
++
++    private final List<ExecutionVertex> tasksToWait;
++
++    private final List<ExecutionVertex> tasksToCommitTo;
++
++    public CheckpointPlanCalculator(
++            JobID jobId,
++            List<ExecutionVertex> tasksToTrigger,
++            List<ExecutionVertex> tasksToWait,
++            List<ExecutionVertex> tasksToCommitTo) {
++
++        this.jobId = jobId;
++        this.tasksToTrigger = Collections.unmodifiableList(tasksToTrigger);
++        this.tasksToWait = Collections.unmodifiableList(tasksToWait);
++        this.tasksToCommitTo = Collections.unmodifiableList(tasksToCommitTo);
++    }
++
++    public CheckpointPlan calculateCheckpointPlan() throws CheckpointException {
++        return new CheckpointPlan(
++                Collections.unmodifiableList(getTriggerExecutions()),
++                Collections.unmodifiableMap(getAckTasks()),
++                tasksToCommitTo);
++    }
++
++    /**
++     * Check if all tasks that we need to trigger are running. If not, abort the checkpoint.
++     *
++     * @return the executions need to be triggered.
++     * @throws CheckpointException the exception fails checking
++     */
++    private List<Execution> getTriggerExecutions() throws CheckpointException {
++        List<Execution> executionsToTrigger = new ArrayList<>(tasksToTrigger.size());
++        for (ExecutionVertex executionVertex : tasksToTrigger) {
++            Execution ee = executionVertex.getCurrentExecutionAttempt();
++            if (ee == null) {
++                LOG.info(
++                        "Checkpoint triggering task {} of job {} is not being executed at the moment. Aborting checkpoint.",
++                        executionVertex.getTaskNameWithSubtaskIndex(),
++                        executionVertex.getJobId());
++                throw new CheckpointException(
++                        CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
++            } else if (ee.getState() == ExecutionState.RUNNING) {
++                executionsToTrigger.add(ee);
++            } else {
++                LOG.info(
++                        "Checkpoint triggering task {} of job {} is not in state {} but {} instead. Aborting checkpoint.",
++                        executionVertex.getTaskNameWithSubtaskIndex(),
++                        jobId,
++                        ExecutionState.RUNNING,
++                        ee.getState());
++                throw new CheckpointException(
++                        CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
++            }
++        }
++
++        return executionsToTrigger;
++    }
++
++    /**
++     * Check if all tasks that need to acknowledge the checkpoint are running. If not, abort the
++     * checkpoint
++     *
++     * @return the execution vertices which should give an ack response
++     * @throws CheckpointException the exception fails checking
++     */
++    private Map<ExecutionAttemptID, ExecutionVertex> getAckTasks() throws CheckpointException {
++        Map<ExecutionAttemptID, ExecutionVertex> ackTasks = new HashMap<>(tasksToWait.size());
++
++        for (ExecutionVertex ev : tasksToWait) {
++            Execution ee = ev.getCurrentExecutionAttempt();
++            if (ee != null) {
++                ackTasks.put(ee.getAttemptId(), ev);
++            } else {
++                LOG.info(
++                        "Checkpoint acknowledging task {} of job {} is not being executed at the moment. Aborting checkpoint.",
++                        ev.getTaskNameWithSubtaskIndex(),
++                        jobId);
++                throw new CheckpointException(
++                        CheckpointFailureReason.NOT_ALL_REQUIRED_TASKS_RUNNING);
++            }
++        }
++        return ackTasks;
++    }
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/ExecutionAttemptMappingProvider.java b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/ExecutionAttemptMappingProvider.java
+new file mode 100644
+index 0000000000000..14ab9a552e495
+--- /dev/null
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/ExecutionAttemptMappingProvider.java
+@@ -0,0 +1,77 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.runtime.checkpoint;
++
++import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
++import org.apache.flink.runtime.executiongraph.ExecutionVertex;
++
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++
++import static org.apache.flink.util.Preconditions.checkNotNull;
++
++/**
++ * Provides a mapping from {@link ExecutionAttemptID} to {@link ExecutionVertex} for currently
++ * running execution attempts.
++ */
++public class ExecutionAttemptMappingProvider {
++
++    /** A full list of tasks. */
++    private final List<ExecutionVertex> tasks;
++
++    /** The cached mapping, which would only be updated on miss. */
++    private final LinkedHashMap<ExecutionAttemptID, ExecutionVertex> cachedTasksById;
++
++    public ExecutionAttemptMappingProvider(List<ExecutionVertex> tasks) {
++        this.tasks = checkNotNull(tasks);
++
++        this.cachedTasksById =
++                new LinkedHashMap<ExecutionAttemptID, ExecutionVertex>(tasks.size()) {
++
++                    @Override
++                    protected boolean removeEldestEntry(
++                            Map.Entry<ExecutionAttemptID, ExecutionVertex> eldest) {
++                        return size() > tasks.size();
++                    }
++                };
++    }
++
++    public Optional<ExecutionVertex> getVertex(ExecutionAttemptID id) {
++        if (!cachedTasksById.containsKey(id)) {
++            cachedTasksById.putAll(getCurrentAttemptMappings());
++            if (!cachedTasksById.containsKey(id)) {
++                // the task probably gone after a restart
++                cachedTasksById.put(id, null);
++            }
++        }
++        return Optional.ofNullable(cachedTasksById.get(id));
++    }
++
++    private Map<ExecutionAttemptID, ExecutionVertex> getCurrentAttemptMappings() {
++        Map<ExecutionAttemptID, ExecutionVertex> attemptMappings = new HashMap<>(tasks.size());
++        for (ExecutionVertex task : tasks) {
++            attemptMappings.put(task.getCurrentExecutionAttempt().getAttemptId(), task);
++        }
++
++        return attemptMappings;
++    }
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/PendingCheckpoint.java b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/PendingCheckpoint.java
+index a2e1784e13a97..6123e19a3e0e1 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/PendingCheckpoint.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/checkpoint/PendingCheckpoint.java
+@@ -88,6 +88,8 @@ public enum TaskAcknowledgeResult {
+ 
+     private final Map<OperatorID, OperatorState> operatorStates;
+ 
++    private final CheckpointPlan checkpointPlan;
++
+     private final Map<ExecutionAttemptID, ExecutionVertex> notYetAcknowledgedTasks;
+ 
+     private final Set<OperatorID> notYetAcknowledgedOperatorCoordinators;
+@@ -127,7 +129,7 @@ public PendingCheckpoint(
+             JobID jobId,
+             long checkpointId,
+             long checkpointTimestamp,
+-            Map<ExecutionAttemptID, ExecutionVertex> verticesToConfirm,
++            CheckpointPlan checkpointPlan,
+             Collection<OperatorID> operatorCoordinatorsToConfirm,
+             Collection<String> masterStateIdentifiers,
+             CheckpointProperties props,
+@@ -135,13 +137,14 @@ public PendingCheckpoint(
+             CompletableFuture<CompletedCheckpoint> onCompletionPromise) {
+ 
+         checkArgument(
+-                verticesToConfirm.size() > 0,
++                checkpointPlan.getTasksToWaitFor().size() > 0,
+                 "Checkpoint needs at least one vertex that commits the checkpoint");
+ 
+         this.jobId = checkNotNull(jobId);
+         this.checkpointId = checkpointId;
+         this.checkpointTimestamp = checkpointTimestamp;
+-        this.notYetAcknowledgedTasks = checkNotNull(verticesToConfirm);
++        this.checkpointPlan = checkNotNull(checkpointPlan);
++        this.notYetAcknowledgedTasks = new HashMap<>(checkpointPlan.getTasksToWaitFor());
+         this.props = checkNotNull(props);
+         this.targetLocation = checkNotNull(targetLocation);
+ 
+@@ -155,7 +158,7 @@ public PendingCheckpoint(
+                 operatorCoordinatorsToConfirm.isEmpty()
+                         ? Collections.emptySet()
+                         : new HashSet<>(operatorCoordinatorsToConfirm);
+-        this.acknowledgedTasks = new HashSet<>(verticesToConfirm.size());
++        this.acknowledgedTasks = new HashSet<>(checkpointPlan.getTasksToWaitFor().size());
+         this.onCompletionPromise = checkNotNull(onCompletionPromise);
+     }
+ 
+@@ -196,6 +199,10 @@ public int getNumberOfNonAcknowledgedOperatorCoordinators() {
+         return notYetAcknowledgedOperatorCoordinators.size();
+     }
+ 
++    public CheckpointPlan getCheckpointPlan() {
++        return checkpointPlan;
++    }
++
+     public int getNumberOfAcknowledgedTasks() {
+         return numAcknowledgedTasks;
+     }
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraph.java b/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraph.java
+index 65d2dd49ad089..a057b8c21295b 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraph.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraph.java
+@@ -26,6 +26,7 @@
+ import org.apache.flink.api.common.accumulators.Accumulator;
+ import org.apache.flink.api.common.accumulators.AccumulatorHelper;
+ import org.apache.flink.api.common.time.Time;
++import org.apache.flink.api.java.tuple.Tuple2;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.metrics.Counter;
+ import org.apache.flink.metrics.SimpleCounter;
+@@ -37,10 +38,12 @@
+ import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
+ import org.apache.flink.runtime.checkpoint.CheckpointFailureManager;
+ import org.apache.flink.runtime.checkpoint.CheckpointIDCounter;
++import org.apache.flink.runtime.checkpoint.CheckpointPlanCalculator;
+ import org.apache.flink.runtime.checkpoint.CheckpointStatsSnapshot;
+ import org.apache.flink.runtime.checkpoint.CheckpointStatsTracker;
+ import org.apache.flink.runtime.checkpoint.CheckpointsCleaner;
+ import org.apache.flink.runtime.checkpoint.CompletedCheckpointStore;
++import org.apache.flink.runtime.checkpoint.ExecutionAttemptMappingProvider;
+ import org.apache.flink.runtime.checkpoint.MasterTriggerRestoreHook;
+ import org.apache.flink.runtime.checkpoint.OperatorCoordinatorCheckpointContext;
+ import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
+@@ -87,7 +90,6 @@
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -398,9 +400,6 @@ public Optional<String> getCheckpointStorageName() {
+ 
+     public void enableCheckpointing(
+             CheckpointCoordinatorConfiguration chkConfig,
+-            List<ExecutionJobVertex> verticesToTrigger,
+-            List<ExecutionJobVertex> verticesToWaitFor,
+-            List<ExecutionJobVertex> verticesToCommitTo,
+             List<MasterTriggerRestoreHook<?>> masterHooks,
+             CheckpointIDCounter checkpointIDCounter,
+             CompletedCheckpointStore checkpointStore,
+@@ -412,10 +411,6 @@ public void enableCheckpointing(
+         checkState(state == JobStatus.CREATED, "Job must be in CREATED state");
+         checkState(checkpointCoordinator == null, "checkpointing already enabled");
+ 
+-        ExecutionVertex[] tasksToTrigger = collectExecutionVertices(verticesToTrigger);
+-        ExecutionVertex[] tasksToWaitFor = collectExecutionVertices(verticesToWaitFor);
+-        ExecutionVertex[] tasksToCommitTo = collectExecutionVertices(verticesToCommitTo);
+-
+         final Collection<OperatorCoordinatorCheckpointContext> operatorCoordinators =
+                 buildOpCoordinatorCheckpointContexts();
+ 
+@@ -448,14 +443,14 @@ public void failJobDueToTaskFailure(
+                         new DispatcherThreadFactory(
+                                 Thread.currentThread().getThreadGroup(), "Checkpoint Timer"));
+ 
++        Tuple2<List<ExecutionVertex>, List<ExecutionVertex>> sourceAndAllVertices =
++                getSourceAndAllVertices();
++
+         // create the coordinator that triggers and commits checkpoints and holds the state
+         checkpointCoordinator =
+                 new CheckpointCoordinator(
+                         jobInformation.getJobId(),
+                         chkConfig,
+-                        tasksToTrigger,
+-                        tasksToWaitFor,
+-                        tasksToCommitTo,
+                         operatorCoordinators,
+                         checkpointIDCounter,
+                         checkpointStore,
+@@ -464,7 +459,13 @@ public void failJobDueToTaskFailure(
+                         checkpointsCleaner,
+                         new ScheduledExecutorServiceAdapter(checkpointCoordinatorTimer),
+                         SharedStateRegistry.DEFAULT_FACTORY,
+-                        failureManager);
++                        failureManager,
++                        new CheckpointPlanCalculator(
++                                getJobID(),
++                                sourceAndAllVertices.f0,
++                                sourceAndAllVertices.f1,
++                                sourceAndAllVertices.f1),
++                        new ExecutionAttemptMappingProvider(sourceAndAllVertices.f1));
+ 
+         // register the master hooks on the checkpoint coordinator
+         for (MasterTriggerRestoreHook<?> hook : masterHooks) {
+@@ -490,6 +491,20 @@ public void failJobDueToTaskFailure(
+         this.checkpointStorageName = checkpointStorage.getClass().getSimpleName();
+     }
+ 
++    private Tuple2<List<ExecutionVertex>, List<ExecutionVertex>> getSourceAndAllVertices() {
++        List<ExecutionVertex> sourceVertices = new ArrayList<>();
++        List<ExecutionVertex> allVertices = new ArrayList<>();
++        for (ExecutionVertex executionVertex : getAllExecutionVertices()) {
++            if (executionVertex.getJobVertex().getJobVertex().isInputVertex()) {
++                sourceVertices.add(executionVertex);
++            }
++
++            allVertices.add(executionVertex);
++        }
++
++        return new Tuple2<>(sourceVertices, allVertices);
++    }
++
+     @Nullable
+     public CheckpointCoordinator getCheckpointCoordinator() {
+         return checkpointCoordinator;
+@@ -517,27 +532,6 @@ public CheckpointStatsSnapshot getCheckpointStatsSnapshot() {
+         }
+     }
+ 
+-    private ExecutionVertex[] collectExecutionVertices(List<ExecutionJobVertex> jobVertices) {
+-        if (jobVertices.size() == 1) {
+-            ExecutionJobVertex jv = jobVertices.get(0);
+-            if (jv.getGraph() != this) {
+-                throw new IllegalArgumentException(
+-                        "Can only use ExecutionJobVertices of this ExecutionGraph");
+-            }
+-            return jv.getTaskVertices();
+-        } else {
+-            ArrayList<ExecutionVertex> all = new ArrayList<>();
+-            for (ExecutionJobVertex jv : jobVertices) {
+-                if (jv.getGraph() != this) {
+-                    throw new IllegalArgumentException(
+-                            "Can only use ExecutionJobVertices of this ExecutionGraph");
+-                }
+-                all.addAll(Arrays.asList(jv.getTaskVertices()));
+-            }
+-            return all.toArray(new ExecutionVertex[all.size()]);
+-        }
+-    }
+-
+     private Collection<OperatorCoordinatorCheckpointContext>
+             buildOpCoordinatorCheckpointContexts() {
+         final ArrayList<OperatorCoordinatorCheckpointContext> contexts = new ArrayList<>();
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraphBuilder.java b/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraphBuilder.java
+index c70fd8cc43b57..fc637f896c361 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraphBuilder.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/executiongraph/ExecutionGraphBuilder.java
+@@ -43,7 +43,6 @@
+ import org.apache.flink.runtime.io.network.partition.JobMasterPartitionTracker;
+ import org.apache.flink.runtime.jobgraph.JobGraph;
+ import org.apache.flink.runtime.jobgraph.JobVertex;
+-import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.jobgraph.jsonplan.JsonPlanGenerator;
+ import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
+ import org.apache.flink.runtime.jobgraph.tasks.JobCheckpointingSettings;
+@@ -197,14 +196,6 @@ public static ExecutionGraph buildGraph(
+         // configure the state checkpointing
+         if (isCheckpointingEnabled(jobGraph)) {
+             JobCheckpointingSettings snapshotSettings = jobGraph.getCheckpointingSettings();
+-            List<ExecutionJobVertex> triggerVertices =
+-                    idToVertex(snapshotSettings.getVerticesToTrigger(), executionGraph);
+-
+-            List<ExecutionJobVertex> ackVertices =
+-                    idToVertex(snapshotSettings.getVerticesToAcknowledge(), executionGraph);
+-
+-            List<ExecutionJobVertex> confirmVertices =
+-                    idToVertex(snapshotSettings.getVerticesToConfirm(), executionGraph);
+ 
+             // Maximum number of remembered checkpoints
+             int historySize = jobManagerConfig.getInteger(WebOptions.CHECKPOINTS_HISTORY_SIZE);
+@@ -311,9 +302,6 @@ public static ExecutionGraph buildGraph(
+ 
+             executionGraph.enableCheckpointing(
+                     chkConfig,
+-                    triggerVertices,
+-                    ackVertices,
+-                    confirmVertices,
+                     hooks,
+                     checkpointIdCounter,
+                     completedCheckpointStore,
+@@ -336,25 +324,6 @@ public static boolean isCheckpointingEnabled(JobGraph jobGraph) {
+         return jobGraph.getCheckpointingSettings() != null;
+     }
+ 
+-    private static List<ExecutionJobVertex> idToVertex(
+-            List<JobVertexID> jobVertices, ExecutionGraph executionGraph)
+-            throws IllegalArgumentException {
+-
+-        List<ExecutionJobVertex> result = new ArrayList<>(jobVertices.size());
+-
+-        for (JobVertexID id : jobVertices) {
+-            ExecutionJobVertex vertex = executionGraph.getJobVertex(id);
+-            if (vertex != null) {
+-                result.add(vertex);
+-            } else {
+-                throw new IllegalArgumentException(
+-                        "The snapshot checkpointing settings refer to non-existent vertex " + id);
+-            }
+-        }
+-
+-        return result;
+-    }
+-
+     // ------------------------------------------------------------------------
+ 
+     /** This class is not supposed to be instantiated. */
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettings.java b/flink-runtime/src/main/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettings.java
+index ece62137dc88d..86d02bf4ff6be 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettings.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettings.java
+@@ -19,7 +19,6 @@
+ package org.apache.flink.runtime.jobgraph.tasks;
+ 
+ import org.apache.flink.runtime.checkpoint.MasterTriggerRestoreHook;
+-import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.state.CheckpointStorage;
+ import org.apache.flink.runtime.state.StateBackend;
+ import org.apache.flink.util.Preconditions;
+@@ -28,25 +27,15 @@
+ import javax.annotation.Nullable;
+ 
+ import java.io.Serializable;
+-import java.util.List;
+-
+-import static java.util.Objects.requireNonNull;
+ 
+ /**
+  * The JobCheckpointingSettings are attached to a JobGraph and describe the settings for the
+- * asynchronous checkpoints of the JobGraph, such as interval, and which vertices need to
+- * participate.
++ * asynchronous checkpoints of the JobGraph, such as interval.
+  */
+ public class JobCheckpointingSettings implements Serializable {
+ 
+     private static final long serialVersionUID = -2593319571078198180L;
+ 
+-    private final List<JobVertexID> verticesToTrigger;
+-
+-    private final List<JobVertexID> verticesToAcknowledge;
+-
+-    private final List<JobVertexID> verticesToConfirm;
+-
+     /** Contains configuration settings for the CheckpointCoordinator */
+     private final CheckpointCoordinatorConfiguration checkpointCoordinatorConfiguration;
+ 
+@@ -60,34 +49,18 @@ public class JobCheckpointingSettings implements Serializable {
+     @Nullable private final SerializedValue<MasterTriggerRestoreHook.Factory[]> masterHooks;
+ 
+     public JobCheckpointingSettings(
+-            List<JobVertexID> verticesToTrigger,
+-            List<JobVertexID> verticesToAcknowledge,
+-            List<JobVertexID> verticesToConfirm,
+             CheckpointCoordinatorConfiguration checkpointCoordinatorConfiguration,
+             @Nullable SerializedValue<StateBackend> defaultStateBackend) {
+ 
+-        this(
+-                verticesToTrigger,
+-                verticesToAcknowledge,
+-                verticesToConfirm,
+-                checkpointCoordinatorConfiguration,
+-                defaultStateBackend,
+-                null,
+-                null);
++        this(checkpointCoordinatorConfiguration, defaultStateBackend, null, null);
+     }
+ 
+     public JobCheckpointingSettings(
+-            List<JobVertexID> verticesToTrigger,
+-            List<JobVertexID> verticesToAcknowledge,
+-            List<JobVertexID> verticesToConfirm,
+             CheckpointCoordinatorConfiguration checkpointCoordinatorConfiguration,
+             @Nullable SerializedValue<StateBackend> defaultStateBackend,
+             @Nullable SerializedValue<CheckpointStorage> defaultCheckpointStorage,
+             @Nullable SerializedValue<MasterTriggerRestoreHook.Factory[]> masterHooks) {
+ 
+-        this.verticesToTrigger = requireNonNull(verticesToTrigger);
+-        this.verticesToAcknowledge = requireNonNull(verticesToAcknowledge);
+-        this.verticesToConfirm = requireNonNull(verticesToConfirm);
+         this.checkpointCoordinatorConfiguration =
+                 Preconditions.checkNotNull(checkpointCoordinatorConfiguration);
+         this.defaultStateBackend = defaultStateBackend;
+@@ -97,18 +70,6 @@ public JobCheckpointingSettings(
+ 
+     // --------------------------------------------------------------------------------------------
+ 
+-    public List<JobVertexID> getVerticesToTrigger() {
+-        return verticesToTrigger;
+-    }
+-
+-    public List<JobVertexID> getVerticesToAcknowledge() {
+-        return verticesToAcknowledge;
+-    }
+-
+-    public List<JobVertexID> getVerticesToConfirm() {
+-        return verticesToConfirm;
+-    }
+-
+     public CheckpointCoordinatorConfiguration getCheckpointCoordinatorConfiguration() {
+         return checkpointCoordinatorConfiguration;
+     }
+@@ -132,11 +93,6 @@ public SerializedValue<MasterTriggerRestoreHook.Factory[]> getMasterHooks() {
+ 
+     @Override
+     public String toString() {
+-        return String.format(
+-                "SnapshotSettings: config=%s, trigger=%s, ack=%s, commit=%s",
+-                checkpointCoordinatorConfiguration,
+-                verticesToTrigger,
+-                verticesToAcknowledge,
+-                verticesToConfirm);
++        return String.format("SnapshotSettings: config=%s", checkpointCoordinatorConfiguration);
+     }
+ }
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorMasterHooksTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorMasterHooksTest.java
+index 07f31462a6550..0d14495ec9a7c 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorMasterHooksTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorMasterHooksTest.java
+@@ -39,6 +39,7 @@
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+@@ -458,9 +459,6 @@ private CheckpointCoordinator instantiateCheckpointCoordinator(
+         return new CheckpointCoordinator(
+                 jid,
+                 chkConfig,
+-                new ExecutionVertex[0],
+-                ackVertices,
+-                new ExecutionVertex[0],
+                 Collections.emptyList(),
+                 new StandaloneCheckpointIDCounter(),
+                 new StandaloneCompletedCheckpointStore(10),
+@@ -469,7 +467,10 @@ private CheckpointCoordinator instantiateCheckpointCoordinator(
+                 new CheckpointsCleaner(),
+                 testingScheduledExecutor,
+                 SharedStateRegistry.DEFAULT_FACTORY,
+-                new CheckpointFailureManager(0, NoOpFailJobCall.INSTANCE));
++                new CheckpointFailureManager(0, NoOpFailJobCall.INSTANCE),
++                new CheckpointPlanCalculator(
++                        jid, new ArrayList<>(), Arrays.asList(ackVertices), new ArrayList<>()),
++                new ExecutionAttemptMappingProvider(Arrays.asList(ackVertices)));
+     }
+ 
+     private static <T> T mockGeneric(Class<?> clazz) {
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorTestingUtils.java b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorTestingUtils.java
+index ffe8201c01a62..a8281b888fb41 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorTestingUtils.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointCoordinatorTestingUtils.java
+@@ -69,6 +69,7 @@
+ import java.io.Serializable;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -386,6 +387,7 @@ static ExecutionJobVertex mockExecutionJobVertex(
+                             ExecutionState.RUNNING);
+ 
+             when(executionVertices[i].getParallelSubtaskIndex()).thenReturn(i);
++            when(executionVertices[i].getJobVertex()).thenReturn(executionJobVertex);
+         }
+ 
+         when(executionJobVertex.getJobVertexId()).thenReturn(jobVertexID);
+@@ -756,9 +758,6 @@ public CheckpointCoordinator build() {
+             return new CheckpointCoordinator(
+                     jobId,
+                     checkpointCoordinatorConfiguration,
+-                    tasksToTrigger,
+-                    tasksToWaitFor,
+-                    tasksToCommitTo,
+                     coordinatorsToCheckpoint,
+                     checkpointIDCounter,
+                     completedCheckpointStore,
+@@ -767,7 +766,13 @@ public CheckpointCoordinator build() {
+                     checkpointsCleaner,
+                     timer,
+                     sharedStateRegistryFactory,
+-                    failureManager);
++                    failureManager,
++                    new CheckpointPlanCalculator(
++                            jobId,
++                            Arrays.asList(tasksToTrigger),
++                            Arrays.asList(tasksToWaitFor),
++                            Arrays.asList(tasksToCommitTo)),
++                    new ExecutionAttemptMappingProvider(Arrays.asList(tasksToWaitFor)));
+         }
+     }
+ 
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointSettingsSerializableTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointSettingsSerializableTest.java
+index dd2fd440d08f6..07c7c6dc4184d 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointSettingsSerializableTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointSettingsSerializableTest.java
+@@ -27,7 +27,6 @@
+ import org.apache.flink.runtime.executiongraph.ExecutionGraph;
+ import org.apache.flink.runtime.executiongraph.TestingExecutionGraphBuilder;
+ import org.apache.flink.runtime.jobgraph.JobGraph;
+-import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
+ import org.apache.flink.runtime.jobgraph.tasks.JobCheckpointingSettings;
+ import org.apache.flink.runtime.query.TaskKvStateRegistry;
+@@ -52,7 +51,6 @@
+ import java.io.IOException;
+ import java.io.Serializable;
+ import java.util.Collection;
+-import java.util.Collections;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+@@ -78,9 +76,6 @@ public void testDeserializationOfUserCodeWithUserClassLoader() throws Exception
+ 
+         final JobCheckpointingSettings checkpointingSettings =
+                 new JobCheckpointingSettings(
+-                        Collections.<JobVertexID>emptyList(),
+-                        Collections.<JobVertexID>emptyList(),
+-                        Collections.<JobVertexID>emptyList(),
+                         new CheckpointCoordinatorConfiguration(
+                                 1000L,
+                                 10000L,
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointStatsTrackerTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointStatsTrackerTest.java
+index 070f9964a8a6e..fa92cfc4ff4b5 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointStatsTrackerTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/CheckpointStatsTrackerTest.java
+@@ -30,7 +30,6 @@
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+-import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.Map;
+@@ -50,9 +49,6 @@ public class CheckpointStatsTrackerTest {
+     public void testGetSnapshottingSettings() throws Exception {
+         JobCheckpointingSettings snapshottingSettings =
+                 new JobCheckpointingSettings(
+-                        Collections.singletonList(new JobVertexID()),
+-                        Collections.singletonList(new JobVertexID()),
+-                        Collections.singletonList(new JobVertexID()),
+                         new CheckpointCoordinatorConfiguration(
+                                 181238123L,
+                                 19191992L,
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/ExecutionGraphCheckpointCoordinatorTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/ExecutionGraphCheckpointCoordinatorTest.java
+index 837536759c1f6..e9325fa9a8aa8 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/ExecutionGraphCheckpointCoordinatorTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/ExecutionGraphCheckpointCoordinatorTest.java
+@@ -152,12 +152,7 @@ private SchedulerBase createSchedulerAndEnableCheckpointing(
+                         false,
+                         0);
+         final JobCheckpointingSettings checkpointingSettings =
+-                new JobCheckpointingSettings(
+-                        Collections.emptyList(),
+-                        Collections.emptyList(),
+-                        Collections.emptyList(),
+-                        chkConfig,
+-                        null);
++                new JobCheckpointingSettings(chkConfig, null);
+         jobGraph.setSnapshotSettings(checkpointingSettings);
+ 
+         final SchedulerBase scheduler =
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/FailoverStrategyCheckpointCoordinatorTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/FailoverStrategyCheckpointCoordinatorTest.java
+index 69e70a5108cd1..10fad2883fce6 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/FailoverStrategyCheckpointCoordinatorTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/FailoverStrategyCheckpointCoordinatorTest.java
+@@ -59,6 +59,7 @@ public void setUp() {
+     public void testAbortPendingCheckpointsWithTriggerValidation() {
+         final int maxConcurrentCheckpoints = ThreadLocalRandom.current().nextInt(10) + 1;
+         ExecutionVertex executionVertex = mockExecutionVertex();
++        JobID jobId = new JobID();
+         CheckpointCoordinatorConfiguration checkpointCoordinatorConfiguration =
+                 new CheckpointCoordinatorConfiguration(
+                         Integer.MAX_VALUE,
+@@ -72,11 +73,8 @@ public void testAbortPendingCheckpointsWithTriggerValidation() {
+                         0);
+         CheckpointCoordinator checkpointCoordinator =
+                 new CheckpointCoordinator(
+-                        new JobID(),
++                        jobId,
+                         checkpointCoordinatorConfiguration,
+-                        new ExecutionVertex[] {executionVertex},
+-                        new ExecutionVertex[] {executionVertex},
+-                        new ExecutionVertex[] {executionVertex},
+                         Collections.emptyList(),
+                         new StandaloneCheckpointIDCounter(),
+                         new StandaloneCompletedCheckpointStore(1),
+@@ -85,7 +83,14 @@ public void testAbortPendingCheckpointsWithTriggerValidation() {
+                         new CheckpointsCleaner(),
+                         manualThreadExecutor,
+                         SharedStateRegistry.DEFAULT_FACTORY,
+-                        mock(CheckpointFailureManager.class));
++                        mock(CheckpointFailureManager.class),
++                        new CheckpointPlanCalculator(
++                                jobId,
++                                Collections.singletonList(executionVertex),
++                                Collections.singletonList(executionVertex),
++                                Collections.singletonList(executionVertex)),
++                        new ExecutionAttemptMappingProvider(
++                                Collections.singletonList(executionVertex)));
+ 
+         // switch current execution's state to running to allow checkpoint could be triggered.
+         mockExecutionRunning(executionVertex);
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/PendingCheckpointTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/PendingCheckpointTest.java
+index 1a0b1672dd716..6b72ebfeb14b4 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/PendingCheckpointTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/checkpoint/PendingCheckpointTest.java
+@@ -83,6 +83,7 @@
+ public class PendingCheckpointTest {
+ 
+     private static final Map<ExecutionAttemptID, ExecutionVertex> ACK_TASKS = new HashMap<>();
++    private static final List<ExecutionVertex> TASKS_TO_COMMIT = new ArrayList<>();
+     private static final ExecutionAttemptID ATTEMPT_ID = new ExecutionAttemptID();
+ 
+     static {
+@@ -97,6 +98,7 @@ public class PendingCheckpointTest {
+         when(vertex.getTotalNumberOfParallelSubtasks()).thenReturn(1);
+         when(vertex.getJobVertex()).thenReturn(jobVertex);
+         ACK_TASKS.put(ATTEMPT_ID, vertex);
++        TASKS_TO_COMMIT.add(vertex);
+     }
+ 
+     @Rule public final TemporaryFolder tmpFolder = new TemporaryFolder();
+@@ -686,12 +688,13 @@ private PendingCheckpoint createPendingCheckpoint(
+                         4096);
+ 
+         final Map<ExecutionAttemptID, ExecutionVertex> ackTasks = new HashMap<>(ACK_TASKS);
++        final List<ExecutionVertex> tasksToCommit = new ArrayList<>(TASKS_TO_COMMIT);
+ 
+         return new PendingCheckpoint(
+                 new JobID(),
+                 0,
+                 1,
+-                ackTasks,
++                new CheckpointPlan(Collections.emptyList(), ackTasks, tasksToCommit),
+                 operatorCoordinators,
+                 masterStateIdentifiers,
+                 props,
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ArchivedExecutionGraphTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ArchivedExecutionGraphTest.java
+index 11448defce61d..4ae7565938e88 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ArchivedExecutionGraphTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ArchivedExecutionGraphTest.java
+@@ -46,7 +46,6 @@
+ import org.junit.Test;
+ 
+ import java.io.IOException;
+-import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.Map;
+@@ -106,12 +105,7 @@ public static void setupExecutionGraph() throws Exception {
+                         false,
+                         0);
+         JobCheckpointingSettings checkpointingSettings =
+-                new JobCheckpointingSettings(
+-                        Arrays.asList(v1ID, v2ID),
+-                        Arrays.asList(v1ID, v2ID),
+-                        Arrays.asList(v1ID, v2ID),
+-                        chkConfig,
+-                        null);
++                new JobCheckpointingSettings(chkConfig, null);
+         jobGraph.setSnapshotSettings(checkpointingSettings);
+ 
+         SchedulerBase scheduler =
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ExecutionGraphDeploymentTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ExecutionGraphDeploymentTest.java
+index 40bfa0793c244..702b489f5d81e 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ExecutionGraphDeploymentTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/executiongraph/ExecutionGraphDeploymentTest.java
+@@ -665,9 +665,6 @@ private ExecutionGraph createExecutionGraph(Configuration configuration) throws
+         final JobGraph jobGraph = new JobGraph(jobId, "test");
+         jobGraph.setSnapshotSettings(
+                 new JobCheckpointingSettings(
+-                        Collections.<JobVertexID>emptyList(),
+-                        Collections.<JobVertexID>emptyList(),
+-                        Collections.<JobVertexID>emptyList(),
+                         new CheckpointCoordinatorConfiguration(
+                                 100,
+                                 10 * 60 * 1000,
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/JobGraphTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/JobGraphTest.java
+index b7df3a1ab58f1..db281ebefb816 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/JobGraphTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/JobGraphTest.java
+@@ -34,7 +34,6 @@
+ import org.junit.Test;
+ 
+ import java.io.IOException;
+-import java.util.Collections;
+ import java.util.List;
+ 
+ import static org.hamcrest.Matchers.containsInAnyOrder;
+@@ -397,12 +396,7 @@ private static JobCheckpointingSettings createCheckpointSettingsWithInterval(
+                         false,
+                         0);
+ 
+-        return new JobCheckpointingSettings(
+-                Collections.emptyList(),
+-                Collections.emptyList(),
+-                Collections.emptyList(),
+-                checkpointCoordinatorConfiguration,
+-                null);
++        return new JobCheckpointingSettings(checkpointCoordinatorConfiguration, null);
+     }
+ 
+     @Test
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettingsTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettingsTest.java
+index 85c8a8fa833f3..3677785cb7f6f 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettingsTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/jobgraph/tasks/JobCheckpointingSettingsTest.java
+@@ -20,14 +20,11 @@
+ 
+ import org.apache.flink.core.testutils.CommonTestUtils;
+ import org.apache.flink.runtime.checkpoint.CheckpointRetentionPolicy;
+-import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+ import org.apache.flink.util.SerializedValue;
+ 
+ import org.junit.Test;
+ 
+-import java.util.Arrays;
+-
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+@@ -39,9 +36,6 @@ public class JobCheckpointingSettingsTest {
+     public void testIsJavaSerializable() throws Exception {
+         JobCheckpointingSettings settings =
+                 new JobCheckpointingSettings(
+-                        Arrays.asList(new JobVertexID(), new JobVertexID()),
+-                        Arrays.asList(new JobVertexID(), new JobVertexID()),
+-                        Arrays.asList(new JobVertexID(), new JobVertexID()),
+                         new CheckpointCoordinatorConfiguration(
+                                 1231231,
+                                 1231,
+@@ -55,9 +49,6 @@ public void testIsJavaSerializable() throws Exception {
+                         new SerializedValue<>(new MemoryStateBackend()));
+ 
+         JobCheckpointingSettings copy = CommonTestUtils.createCopySerializable(settings);
+-        assertEquals(settings.getVerticesToAcknowledge(), copy.getVerticesToAcknowledge());
+-        assertEquals(settings.getVerticesToConfirm(), copy.getVerticesToConfirm());
+-        assertEquals(settings.getVerticesToTrigger(), copy.getVerticesToTrigger());
+         assertEquals(
+                 settings.getCheckpointCoordinatorConfiguration(),
+                 copy.getCheckpointCoordinatorConfiguration());
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTest.java
+index 92815639fca1d..ded83d72384cc 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTest.java
+@@ -2182,12 +2182,7 @@ private JobGraph createJobGraphFromJobVerticesWithCheckpointing(
+                         false,
+                         0);
+         final JobCheckpointingSettings checkpointingSettings =
+-                new JobCheckpointingSettings(
+-                        Collections.emptyList(),
+-                        Collections.emptyList(),
+-                        Collections.emptyList(),
+-                        checkpoinCoordinatorConfiguration,
+-                        null);
++                new JobCheckpointingSettings(checkpoinCoordinatorConfiguration, null);
+         jobGraph.setSnapshotSettings(checkpointingSettings);
+         jobGraph.setSavepointRestoreSettings(savepointRestoreSettings);
+ 
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/operators/coordination/CoordinatorEventsExactlyOnceITCase.java b/flink-runtime/src/test/java/org/apache/flink/runtime/operators/coordination/CoordinatorEventsExactlyOnceITCase.java
+index 302bca8ad7f74..3bdc2f96f51f1 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/operators/coordination/CoordinatorEventsExactlyOnceITCase.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/operators/coordination/CoordinatorEventsExactlyOnceITCase.java
+@@ -34,7 +34,6 @@
+ import org.apache.flink.runtime.execution.Environment;
+ import org.apache.flink.runtime.jobgraph.JobGraph;
+ import org.apache.flink.runtime.jobgraph.JobVertex;
+-import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.jobgraph.OperatorID;
+ import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
+ import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
+@@ -64,7 +63,6 @@
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+ import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Random;
+@@ -75,7 +73,6 @@
+ import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.ScheduledFuture;
+ import java.util.concurrent.TimeUnit;
+-import java.util.stream.Collectors;
+ 
+ import static org.apache.flink.util.Preconditions.checkArgument;
+ import static org.junit.Assert.assertEquals;
+@@ -202,9 +199,6 @@ public OperatorCoordinator create(OperatorCoordinator.Context context) {
+     }
+ 
+     private static JobCheckpointingSettings createCheckpointSettings(JobVertex... vertices) {
+-        final List<JobVertexID> ids =
+-                Arrays.stream(vertices).map(JobVertex::getID).collect(Collectors.toList());
+-
+         final CheckpointCoordinatorConfiguration coordCfg =
+                 new CheckpointCoordinatorConfiguration.CheckpointCoordinatorConfigurationBuilder()
+                         .setMaxConcurrentCheckpoints(1)
+@@ -212,7 +206,7 @@ private static JobCheckpointingSettings createCheckpointSettings(JobVertex... ve
+                         .setCheckpointTimeout(100_000)
+                         .build();
+ 
+-        return new JobCheckpointingSettings(ids, ids, ids, coordCfg, null);
++        return new JobCheckpointingSettings(coordCfg, null);
+     }
+ 
+     // ------------------------------------------------------------------------
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/scheduler/SchedulerTestingUtils.java b/flink-runtime/src/test/java/org/apache/flink/runtime/scheduler/SchedulerTestingUtils.java
+index 3731bce926d18..9ff306d2297d7 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/scheduler/SchedulerTestingUtils.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/scheduler/SchedulerTestingUtils.java
+@@ -47,7 +47,6 @@
+ import org.apache.flink.runtime.io.network.partition.JobMasterPartitionTracker;
+ import org.apache.flink.runtime.io.network.partition.NoOpJobMasterPartitionTracker;
+ import org.apache.flink.runtime.jobgraph.JobGraph;
+-import org.apache.flink.runtime.jobgraph.JobVertex;
+ import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.jobgraph.OperatorID;
+ import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
+@@ -78,9 +77,7 @@
+ import javax.annotation.Nullable;
+ 
+ import java.io.IOException;
+-import java.util.ArrayList;
+ import java.util.Collection;
+-import java.util.List;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.ScheduledExecutorService;
+@@ -154,15 +151,6 @@ public static void enableCheckpointing(
+             final JobGraph jobGraph,
+             @Nullable StateBackend stateBackend,
+             @Nullable CheckpointStorage checkpointStorage) {
+-        final List<JobVertexID> triggerVertices = new ArrayList<>();
+-        final List<JobVertexID> allVertices = new ArrayList<>();
+-
+-        for (JobVertex vertex : jobGraph.getVertices()) {
+-            if (vertex.isInputVertex()) {
+-                triggerVertices.add(vertex.getID());
+-            }
+-            allVertices.add(vertex.getID());
+-        }
+ 
+         final CheckpointCoordinatorConfiguration config =
+                 new CheckpointCoordinatorConfiguration(
+@@ -196,13 +184,7 @@ public static void enableCheckpointing(
+ 
+         jobGraph.setSnapshotSettings(
+                 new JobCheckpointingSettings(
+-                        triggerVertices,
+-                        allVertices,
+-                        allVertices,
+-                        config,
+-                        serializedStateBackend,
+-                        serializedCheckpointStorage,
+-                        null));
++                        config, serializedStateBackend, serializedCheckpointStorage, null));
+     }
+ 
+     public static Collection<ExecutionAttemptID> getAllCurrentExecutionAttempts(
+diff --git a/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/graph/StreamingJobGraphGenerator.java b/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/graph/StreamingJobGraphGenerator.java
+index 6ab5a4fc6cba5..ecc85a7a00118 100644
+--- a/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/graph/StreamingJobGraphGenerator.java
++++ b/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/graph/StreamingJobGraphGenerator.java
+@@ -1213,28 +1213,6 @@ private void configureCheckpointing() {
+             interval = Long.MAX_VALUE;
+         }
+ 
+-        //  --- configure the participating vertices ---
+-
+-        // collect the vertices that receive "trigger checkpoint" messages.
+-        // currently, these are all the sources
+-        List<JobVertexID> triggerVertices = new ArrayList<>();
+-
+-        // collect the vertices that need to acknowledge the checkpoint
+-        // currently, these are all vertices
+-        List<JobVertexID> ackVertices = new ArrayList<>(jobVertices.size());
+-
+-        // collect the vertices that receive "commit checkpoint" messages
+-        // currently, these are all vertices
+-        List<JobVertexID> commitVertices = new ArrayList<>(jobVertices.size());
+-
+-        for (JobVertex vertex : jobVertices.values()) {
+-            if (vertex.isInputVertex()) {
+-                triggerVertices.add(vertex.getID());
+-            }
+-            commitVertices.add(vertex.getID());
+-            ackVertices.add(vertex.getID());
+-        }
+-
+         //  --- configure options ---
+ 
+         CheckpointRetentionPolicy retentionAfterTermination;
+@@ -1318,9 +1296,6 @@ private void configureCheckpointing() {
+ 
+         JobCheckpointingSettings settings =
+                 new JobCheckpointingSettings(
+-                        triggerVertices,
+-                        ackVertices,
+-                        commitVertices,
+                         CheckpointCoordinatorConfiguration.builder()
+                                 .setCheckpointInterval(interval)
+                                 .setCheckpointTimeout(cfg.getCheckpointTimeout())
+diff --git a/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterStopWithSavepointIT.java b/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterStopWithSavepointIT.java
+index aef16366e57be..15c22addd9b5a 100644
+--- a/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterStopWithSavepointIT.java
++++ b/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterStopWithSavepointIT.java
+@@ -290,9 +290,6 @@ private void setUpJobGraph(
+ 
+         jobGraph.setSnapshotSettings(
+                 new JobCheckpointingSettings(
+-                        Collections.singletonList(vertex.getID()),
+-                        Collections.singletonList(vertex.getID()),
+-                        Collections.singletonList(vertex.getID()),
+                         new CheckpointCoordinatorConfiguration(
+                                 CHECKPOINT_INTERVAL,
+                                 60_000,
+diff --git a/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTriggerSavepointITCase.java b/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTriggerSavepointITCase.java
+index 7894adfe36b14..bdc4c2cbf2973 100644
+--- a/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTriggerSavepointITCase.java
++++ b/flink-tests/src/test/java/org/apache/flink/runtime/jobmaster/JobMasterTriggerSavepointITCase.java
+@@ -100,9 +100,6 @@ private void setUpWithCheckpointInterval(long checkpointInterval) throws Excepti
+ 
+         jobGraph.setSnapshotSettings(
+                 new JobCheckpointingSettings(
+-                        Collections.singletonList(vertex.getID()),
+-                        Collections.singletonList(vertex.getID()),
+-                        Collections.singletonList(vertex.getID()),
+                         new CheckpointCoordinatorConfiguration(
+                                 checkpointInterval,
+                                 60_000,

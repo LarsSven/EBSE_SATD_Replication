@@ -1,0 +1,2272 @@
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/ArrowVectorIterator.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/ArrowVectorIterator.java
+index 866ac2a94e13..1be81caa3706 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/ArrowVectorIterator.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/ArrowVectorIterator.java
+@@ -40,7 +40,7 @@ public class ArrowVectorIterator implements Iterator<VectorSchemaRoot>, AutoClos
+   private final ResultSetMetaData rsmd;
+ 
+   private final JdbcConsumer[] consumers;
+-  private final CompositeJdbcConsumer compositeConsumer;
++  final CompositeJdbcConsumer compositeConsumer;
+ 
+   private VectorSchemaRoot nextBatch;
+ 
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/JdbcToArrowUtils.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/JdbcToArrowUtils.java
+index 918d2b46b302..21278e4cabdc 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/JdbcToArrowUtils.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/JdbcToArrowUtils.java
+@@ -371,43 +371,46 @@ public static void jdbcToArrowVectors(ResultSet rs, VectorSchemaRoot root, JdbcT
+   static JdbcConsumer getConsumer(ResultSet resultSet, int columnIndex, int jdbcColType,
+       FieldVector vector, JdbcToArrowConfig config) throws SQLException {
+     final Calendar calendar = config.getCalendar();
++    int nullableValue = resultSet.getMetaData().isNullable(columnIndex);
++    boolean nullable = nullableValue == ResultSetMetaData.columnNullable ||
++            nullableValue == ResultSetMetaData.columnNullableUnknown;
+     switch (jdbcColType) {
+       case Types.BOOLEAN:
+       case Types.BIT:
+-        return new BitConsumer((BitVector) vector, columnIndex);
++        return BitConsumer.createConsumer((BitVector) vector, columnIndex, nullable);
+       case Types.TINYINT:
+-        return new TinyIntConsumer((TinyIntVector) vector, columnIndex);
++        return TinyIntConsumer.createConsumer((TinyIntVector) vector, columnIndex, nullable);
+       case Types.SMALLINT:
+-        return new SmallIntConsumer((SmallIntVector) vector, columnIndex);
++        return SmallIntConsumer.createConsumer((SmallIntVector) vector, columnIndex, nullable);
+       case Types.INTEGER:
+-        return new IntConsumer((IntVector) vector, columnIndex);
++        return IntConsumer.createConsumer((IntVector) vector, columnIndex, nullable);
+       case Types.BIGINT:
+-        return new BigIntConsumer((BigIntVector) vector, columnIndex);
++        return BigIntConsumer.createConsumer((BigIntVector) vector, columnIndex, nullable);
+       case Types.NUMERIC:
+       case Types.DECIMAL:
+-        return new DecimalConsumer((DecimalVector) vector, columnIndex);
++        return DecimalConsumer.createConsumer((DecimalVector) vector, columnIndex, nullable);
+       case Types.REAL:
+       case Types.FLOAT:
+-        return new FloatConsumer((Float4Vector) vector, columnIndex);
++        return FloatConsumer.createConsumer((Float4Vector) vector, columnIndex, nullable);
+       case Types.DOUBLE:
+-        return new DoubleConsumer((Float8Vector) vector, columnIndex);
++        return DoubleConsumer.createConsumer((Float8Vector) vector, columnIndex, nullable);
+       case Types.CHAR:
+       case Types.NCHAR:
+       case Types.VARCHAR:
+       case Types.NVARCHAR:
+       case Types.LONGVARCHAR:
+       case Types.LONGNVARCHAR:
+-        return new VarCharConsumer((VarCharVector) vector, columnIndex);
++        return VarCharConsumer.createConsumer((VarCharVector) vector, columnIndex, nullable);
+       case Types.DATE:
+-        return new DateConsumer((DateMilliVector) vector, columnIndex, calendar);
++        return DateConsumer.createConsumer((DateMilliVector) vector, columnIndex, nullable, calendar);
+       case Types.TIME:
+-        return new TimeConsumer((TimeMilliVector) vector, columnIndex, calendar);
++        return TimeConsumer.createConsumer((TimeMilliVector) vector, columnIndex, nullable, calendar);
+       case Types.TIMESTAMP:
+-        return new TimestampConsumer((TimeStampMilliTZVector) vector, columnIndex, calendar);
++        return TimestampConsumer.createConsumer((TimeStampMilliTZVector) vector, columnIndex, nullable, calendar);
+       case Types.BINARY:
+       case Types.VARBINARY:
+       case Types.LONGVARBINARY:
+-        return new BinaryConsumer((VarBinaryVector) vector, columnIndex);
++        return BinaryConsumer.createConsumer((VarBinaryVector) vector, columnIndex, nullable);
+       case Types.ARRAY:
+         final JdbcFieldInfo fieldInfo = getJdbcFieldInfoForArraySubType(resultSet.getMetaData(), columnIndex, config);
+         if (fieldInfo == null) {
+@@ -415,12 +418,13 @@ static JdbcConsumer getConsumer(ResultSet resultSet, int columnIndex, int jdbcCo
+         }
+         JdbcConsumer delegate = getConsumer(resultSet, JDBC_ARRAY_VALUE_COLUMN,
+             fieldInfo.getJdbcType(), ((ListVector)vector).getDataVector(), config);
+-        return new ArrayConsumer((ListVector) vector, delegate, columnIndex);
++        return ArrayConsumer.createConsumer((ListVector) vector, delegate, columnIndex, nullable);
+       case Types.CLOB:
+-        return new ClobConsumer((VarCharVector) vector, columnIndex);
++        return ClobConsumer.createConsumer((VarCharVector) vector, columnIndex, nullable);
+       case Types.BLOB:
+-        BinaryConsumer blobDelegate = new BinaryConsumer((VarBinaryVector) vector, columnIndex);
+-        return new BlobConsumer(blobDelegate, columnIndex);
++        BinaryConsumer blobDelegate =
++                BinaryConsumer.createConsumer((VarBinaryVector) vector, columnIndex, nullable);
++        return BlobConsumer.createConsumer(blobDelegate, columnIndex, nullable);
+       case Types.NULL:
+         return new NullConsumer((NullVector) vector);
+       default:
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ArrayConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ArrayConsumer.java
+index 1f4a588d62f0..2aaddec66565 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ArrayConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ArrayConsumer.java
+@@ -28,13 +28,25 @@
+  * Consumer which consume array type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.complex.ListVector}.
+  */
+-public class ArrayConsumer implements JdbcConsumer<ListVector> {
++public abstract class ArrayConsumer implements JdbcConsumer<ListVector> {
+ 
+-  private final JdbcConsumer delegate;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link ListVector}.
++   */
++  public static ArrayConsumer createConsumer(
++          ListVector vector, JdbcConsumer delegate, int index, boolean nullable) {
++    if (nullable) {
++      return new ArrayConsumer.NullableArrayConsumer(vector, delegate, index);
++    } else {
++      return new ArrayConsumer.NonNullableArrayConsumer(vector, delegate, index);
++    }
++  }
++
++  protected final JdbcConsumer delegate;
++  protected final int columnIndexInResultSet;
+ 
+-  private ListVector vector;
+-  private int currentIndex;
++  protected ListVector vector;
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a ArrayConsumer.
+@@ -46,10 +58,62 @@ public ArrayConsumer(ListVector vector, JdbcConsumer delegate, int index) {
+   }
+ 
+   @Override
+-  public void consume(ResultSet resultSet) throws SQLException, IOException {
+-    final Array array = resultSet.getArray(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
++  public void close() throws Exception {
++    this.vector.close();
++    this.delegate.close();
++  }
++
++  @Override
++  public void resetValueVector(ListVector vector) {
++    this.vector = vector;
++    this.currentIndex = 0;
++  }
++
++  /**
++   * Nullable consumer for {@link ListVector}.
++   */
++  static class NullableArrayConsumer extends ArrayConsumer {
++
++    /**
++     * Instantiate a nullable array consumer.
++     */
++    public NullableArrayConsumer(ListVector vector, JdbcConsumer delegate, int index) {
++      super(vector, delegate, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException, IOException {
++      final Array array = resultSet.getArray(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.startNewValue(currentIndex);
++        int count = 0;
++        try (ResultSet rs = array.getResultSet()) {
++          while (rs.next()) {
++            delegate.consume(rs);
++            count++;
++          }
++        }
++        vector.endValue(currentIndex, count);
++      }
++      currentIndex++;
++    }
++  }
+ 
++  /**
++   * Non-nullable consumer for {@link ListVector}.
++   */
++  static class NonNullableArrayConsumer extends ArrayConsumer {
++
++    /**
++     * Instantiate a nullable array consumer.
++     */
++    public NonNullableArrayConsumer(ListVector vector, JdbcConsumer delegate, int index) {
++      super(vector, delegate, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException, IOException {
++      final Array array = resultSet.getArray(columnIndexInResultSet);
+       vector.startNewValue(currentIndex);
+       int count = 0;
+       try (ResultSet rs = array.getResultSet()) {
+@@ -59,19 +123,7 @@ public void consume(ResultSet resultSet) throws SQLException, IOException {
+         }
+       }
+       vector.endValue(currentIndex, count);
++      currentIndex++;
+     }
+-    currentIndex++;
+-  }
+-
+-  @Override
+-  public void close() throws Exception {
+-    this.vector.close();
+-    this.delegate.close();
+-  }
+-
+-  @Override
+-  public void resetValueVector(ListVector vector) {
+-    this.vector = vector;
+-    this.currentIndex = 0;
+   }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BigIntConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BigIntConsumer.java
+index 561499ab9e8e..56e279284f52 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BigIntConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BigIntConsumer.java
+@@ -26,12 +26,23 @@
+  * Consumer which consume bigint type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.BigIntVector}.
+  */
+-public class BigIntConsumer implements JdbcConsumer<BigIntVector> {
++public abstract class BigIntConsumer implements JdbcConsumer<BigIntVector> {
+ 
+-  private BigIntVector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link BigIntVector}.
++   */
++  public static BigIntConsumer createConsumer(BigIntVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableBigIntConsumer(vector, index);
++    } else {
++      return new NonNullableBigIntConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected BigIntVector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a BigIntConsumer.
+@@ -41,15 +52,6 @@ public BigIntConsumer(BigIntVector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    long value = resultSet.getLong(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -60,4 +62,46 @@ public void resetValueVector(BigIntVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for big int.
++   */
++  static class NullableBigIntConsumer extends BigIntConsumer {
++
++    /**
++     * Instantiate a BigIntConsumer.
++     */
++    public NullableBigIntConsumer(BigIntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      long value = resultSet.getLong(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for big int.
++   */
++  static class NonNullableBigIntConsumer extends BigIntConsumer {
++
++    /**
++     * Instantiate a BigIntConsumer.
++     */
++    public NonNullableBigIntConsumer(BigIntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      long value = resultSet.getLong(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BinaryConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BinaryConsumer.java
+index af530bc44c12..949b31755dee 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BinaryConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BinaryConsumer.java
+@@ -32,14 +32,25 @@
+  * Consumer which consume binary type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.VarBinaryVector}.
+  */
+-public class BinaryConsumer implements JdbcConsumer<VarBinaryVector> {
++public abstract class BinaryConsumer implements JdbcConsumer<VarBinaryVector> {
++
++  /**
++   * Creates a consumer for {@link VarBinaryVector}.
++   */
++  public static BinaryConsumer createConsumer(VarBinaryVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableBinaryConsumer(vector, index);
++    } else {
++      return new NonNullableBinaryConsumer(vector, index);
++    }
++  }
+ 
+   private static final int BUFFER_SIZE = 1024;
+ 
+-  private VarBinaryVector vector;
+-  private final int columnIndexInResultSet;
++  protected VarBinaryVector vector;
++  protected final int columnIndexInResultSet;
+ 
+-  private int currentIndex;
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a BinaryConsumer.
+@@ -70,7 +81,7 @@ public void consume(InputStream is) throws IOException {
+           vector.reallocDataBuffer();
+         }
+         PlatformDependent.copyMemory(bytes, 0,
+-            dataBuffer.memoryAddress() + startIndex + totalBytes, read);
++                dataBuffer.memoryAddress() + startIndex + totalBytes, read);
+         totalBytes += read;
+       }
+       offsetBuffer.setInt((currentIndex + 1) * 4, startIndex + totalBytes);
+@@ -79,15 +90,6 @@ public void consume(InputStream is) throws IOException {
+     }
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException, IOException {
+-    InputStream is = resultSet.getBinaryStream(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      consume(is);
+-    }
+-    currentIndex++;
+-  }
+-
+   public void moveWriterPosition() {
+     currentIndex++;
+   }
+@@ -103,4 +105,47 @@ public void resetValueVector(VarBinaryVector vector) {
+     this.vector.allocateNewSafe();
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Consumer for nullable binary data.
++   */
++  static class NullableBinaryConsumer extends BinaryConsumer {
++    
++    /**
++     * Instantiate a BinaryConsumer.
++     */
++    public NullableBinaryConsumer(VarBinaryVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException, IOException {
++      InputStream is = resultSet.getBinaryStream(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        consume(is);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Consumer for non-nullable binary data.
++   */
++  static class NonNullableBinaryConsumer extends BinaryConsumer {
++
++    /**
++     * Instantiate a BinaryConsumer.
++     */
++    public NonNullableBinaryConsumer(VarBinaryVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException, IOException {
++      InputStream is = resultSet.getBinaryStream(columnIndexInResultSet);
++      consume(is);
++      currentIndex++;
++    }
++  }
+ }
++
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BitConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BitConsumer.java
+index 20d181f8a027..61a1e7965097 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BitConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BitConsumer.java
+@@ -26,12 +26,23 @@
+  * Consumer which consume bit type values from {@link ResultSet}.
+  * Write the data to {@link BitVector}.
+  */
+-public class BitConsumer implements JdbcConsumer<BitVector> {
++public abstract class BitConsumer implements JdbcConsumer<BitVector> {
+ 
+-  private BitVector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link BitVector}.
++   */
++  public static BitConsumer createConsumer(BitVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableBitConsumer(vector, index);
++    } else {
++      return new NonNullableBitConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected BitVector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a BitConsumer.
+@@ -41,15 +52,6 @@ public BitConsumer(BitVector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    boolean value = resultSet.getBoolean(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value ? 1 : 0);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -60,4 +62,46 @@ public void resetValueVector(BitVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for {@link BitVector}.
++   */
++  static class NullableBitConsumer extends BitConsumer {
++
++    /**
++     * Instantiate a BitConsumer.
++     */
++    public NullableBitConsumer(BitVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      boolean value = resultSet.getBoolean(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value ? 1 : 0);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for {@link BitVector}.
++   */
++  static class NonNullableBitConsumer extends BitConsumer {
++
++    /**
++     * Instantiate a BitConsumer.
++     */
++    public NonNullableBitConsumer(BitVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      boolean value = resultSet.getBoolean(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value ? 1 : 0);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BlobConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BlobConsumer.java
+index a8398bfab3cc..e4d9f1cd77e7 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BlobConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/BlobConsumer.java
+@@ -34,12 +34,23 @@ public class BlobConsumer implements JdbcConsumer<VarBinaryVector> {
+ 
+   private BinaryConsumer delegate;
+ 
++  private final boolean nullable;
++
++  /**
++   * Creates a consumer for {@link VarBinaryVector}.
++   */
++  public static BlobConsumer createConsumer(
++          BinaryConsumer delegate, int index, boolean nullable) {
++    return new BlobConsumer(delegate, index, nullable);
++  }
++
+   /**
+    * Instantiate a BlobConsumer.
+    */
+-  public BlobConsumer(BinaryConsumer delegate, int index) {
++  public BlobConsumer(BinaryConsumer delegate, int index, boolean nullable) {
+     this.columnIndexInResultSet = index;
+     this.delegate = delegate;
++    this.nullable = nullable;
+   }
+ 
+   @Override
+@@ -58,6 +69,6 @@ public void close() throws Exception {
+ 
+   @Override
+   public void resetValueVector(VarBinaryVector vector) {
+-    delegate = new BinaryConsumer(vector, columnIndexInResultSet);
++    delegate = BinaryConsumer.createConsumer(vector, columnIndexInResultSet, nullable);
+   }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ClobConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ClobConsumer.java
+index 3f2dd670acd8..eae59bada2dd 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ClobConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/ClobConsumer.java
+@@ -32,14 +32,25 @@
+  * Consumer which consume clob type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.VarCharVector}.
+  */
+-public class ClobConsumer implements JdbcConsumer<VarCharVector> {
++public abstract class ClobConsumer implements JdbcConsumer<VarCharVector> {
++
++  /**
++   * Creates a consumer for {@link VarCharVector}.
++   */
++  public static ClobConsumer createConsumer(VarCharVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableClobConsumer(vector, index);
++    } else {
++      return new NonNullableClobConsumer(vector, index);
++    }
++  }
+ 
+   private static final int BUFFER_SIZE = 256;
+ 
+-  private VarCharVector vector;
+-  private final int columnIndexInResultSet;
++  protected VarCharVector vector;
++  protected final int columnIndexInResultSet;
+ 
+-  private int currentIndex;
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a ClobConsumer.
+@@ -53,9 +64,80 @@ public ClobConsumer(VarCharVector vector, int index) {
+   }
+ 
+   @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    Clob clob = resultSet.getClob(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
++  public void close() throws Exception {
++    vector.close();
++  }
++
++  @Override
++  public void resetValueVector(VarCharVector vector) {
++    this.vector = vector;
++    this.vector.allocateNewSafe();
++    this.currentIndex = 0;
++  }
++
++  /**
++   * Nullable consumer for clob data.
++   */
++  static class NullableClobConsumer extends ClobConsumer {
++    
++    /**
++     * Instantiate a ClobConsumer.
++     */
++    public NullableClobConsumer(VarCharVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Clob clob = resultSet.getClob(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        if (clob != null) {
++          long length = clob.length();
++
++          int read = 1;
++          int readSize = length < BUFFER_SIZE ? (int) length : BUFFER_SIZE;
++          int totalBytes = 0;
++
++          ArrowBuf dataBuffer = vector.getDataBuffer();
++          ArrowBuf offsetBuffer = vector.getOffsetBuffer();
++          int startIndex = offsetBuffer.getInt(currentIndex * 4);
++          while (read <= length) {
++            String str = clob.getSubString(read, readSize);
++            byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
++
++            while ((dataBuffer.writerIndex() + bytes.length) > dataBuffer.capacity()) {
++              vector.reallocDataBuffer();
++            }
++            PlatformDependent.copyMemory(bytes, 0,
++                dataBuffer.memoryAddress() + startIndex + totalBytes, bytes.length);
++
++            totalBytes += bytes.length;
++            read += readSize;
++          }
++          offsetBuffer.setInt((currentIndex + 1) * 4, startIndex + totalBytes);
++          BitVectorHelper.setValidityBitToOne(vector.getValidityBuffer(), currentIndex);
++          vector.setLastSet(currentIndex);
++        }
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for clob data.
++   */
++  static class NonNullableClobConsumer extends ClobConsumer {
++
++    /**
++     * Instantiate a ClobConsumer.
++     */
++    public NonNullableClobConsumer(VarCharVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Clob clob = resultSet.getClob(columnIndexInResultSet);
+       if (clob != null) {
+         long length = clob.length();
+ 
+@@ -83,19 +165,8 @@ public void consume(ResultSet resultSet) throws SQLException {
+         BitVectorHelper.setValidityBitToOne(vector.getValidityBuffer(), currentIndex);
+         vector.setLastSet(currentIndex);
+       }
++    
++      currentIndex++;
+     }
+-    currentIndex++;
+-  }
+-
+-  @Override
+-  public void close() throws Exception {
+-    vector.close();
+-  }
+-
+-  @Override
+-  public void resetValueVector(VarCharVector vector) {
+-    this.vector = vector;
+-    this.vector.allocateNewSafe();
+-    this.currentIndex = 0;
+   }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/CompositeJdbcConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/CompositeJdbcConsumer.java
+index 5affaa1fe209..f6f7e2086963 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/CompositeJdbcConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/CompositeJdbcConsumer.java
+@@ -23,6 +23,7 @@
+ 
+ import org.apache.arrow.util.AutoCloseables;
+ import org.apache.arrow.vector.ValueVector;
++import org.apache.arrow.vector.VectorSchemaRoot;
+ 
+ /**
+  * Composite consumer which hold all consumers.
+@@ -41,8 +42,8 @@ public CompositeJdbcConsumer(JdbcConsumer[] consumers) {
+ 
+   @Override
+   public void consume(ResultSet rs) throws SQLException, IOException {
+-    for (JdbcConsumer consumer : consumers) {
+-      consumer.consume(rs);
++    for (int i = 0; i < consumers.length; i++) {
++      consumers[i].consume(rs);
+     }
+   }
+ 
+@@ -62,4 +63,14 @@ public void close() {
+   public void resetValueVector(ValueVector vector) {
+ 
+   }
++
++  /**
++   * Reset inner consumers through vectors in the vector schema root.
++   */
++  public void resetVectorSchemaRoot(VectorSchemaRoot root) {
++    assert root.getFieldVectors().size() == consumers.length;
++    for (int i = 0; i < consumers.length; i++) {
++      consumers[i].resetValueVector(root.getVector(i));
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DateConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DateConsumer.java
+index 856dd8da2e76..b338be7b3a14 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DateConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DateConsumer.java
+@@ -28,13 +28,25 @@
+  * Consumer which consume date type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.DateMilliVector}.
+  */
+-public class DateConsumer implements JdbcConsumer<DateMilliVector> {
++public abstract class DateConsumer implements JdbcConsumer<DateMilliVector> {
+ 
+-  private DateMilliVector vector;
+-  private final int columnIndexInResultSet;
+-  private final Calendar calendar;
++  /**
++   * Creates a consumer for {@link DateMilliVector}.
++   */
++  public static DateConsumer createConsumer(
++          DateMilliVector vector, int index, boolean nullable, Calendar calendar) {
++    if (nullable) {
++      return new NullableDateConsumer(vector, index, calendar);
++    } else {
++      return new NonNullableDateConsumer(vector, index, calendar);
++    }
++  }
++
++  protected DateMilliVector vector;
++  protected final int columnIndexInResultSet;
++  protected final Calendar calendar;
+ 
+-  private int currentIndex;
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a DateConsumer.
+@@ -52,16 +64,6 @@ public DateConsumer(DateMilliVector vector, int index, Calendar calendar) {
+     this.calendar = calendar;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    Date date = calendar == null ? resultSet.getDate(columnIndexInResultSet) :
+-        resultSet.getDate(columnIndexInResultSet, calendar);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, date.getTime());
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -72,4 +74,64 @@ public void resetValueVector(DateMilliVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for date.
++   */
++  static class NullableDateConsumer extends DateConsumer {
++
++    /**
++     * Instantiate a DateConsumer.
++     */
++    public NullableDateConsumer(DateMilliVector vector, int index) {
++      super(vector, index);
++    }
++
++    /**
++     * Instantiate a DateConsumer.
++     */
++    public NullableDateConsumer(DateMilliVector vector, int index, Calendar calendar) {
++      super(vector, index, calendar);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Date date = calendar == null ? resultSet.getDate(columnIndexInResultSet) :
++          resultSet.getDate(columnIndexInResultSet, calendar);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, date.getTime());
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for date.
++   */
++  static class NonNullableDateConsumer extends DateConsumer {
++
++    /**
++     * Instantiate a DateConsumer.
++     */
++    public NonNullableDateConsumer(DateMilliVector vector, int index) {
++      super(vector, index);
++    }
++
++    /**
++     * Instantiate a DateConsumer.
++     */
++    public NonNullableDateConsumer(DateMilliVector vector, int index, Calendar calendar) {
++      super(vector, index, calendar);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Date date = calendar == null ? resultSet.getDate(columnIndexInResultSet) :
++          resultSet.getDate(columnIndexInResultSet, calendar);
++      vector.setSafe(currentIndex, date.getTime());
++      currentIndex++;
++    }
++  }
+ }
++
++
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DecimalConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DecimalConsumer.java
+index b93560c0a6de..67ffa3b87ad0 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DecimalConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DecimalConsumer.java
+@@ -27,12 +27,23 @@
+  * Consumer which consume decimal type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.DecimalVector}.
+  */
+-public class DecimalConsumer implements JdbcConsumer<DecimalVector> {
++public abstract class DecimalConsumer implements JdbcConsumer<DecimalVector> {
+ 
+-  private DecimalVector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link DecimalVector}.
++   */
++  public static DecimalConsumer createConsumer(DecimalVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableDecimalConsumer(vector, index);
++    } else {
++      return new NonNullableDecimalConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected DecimalVector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a DecimalConsumer.
+@@ -42,15 +53,6 @@ public DecimalConsumer(DecimalVector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    BigDecimal value = resultSet.getBigDecimal(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -61,4 +63,46 @@ public void resetValueVector(DecimalVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Consumer for nullable decimal.
++   */
++  static class NullableDecimalConsumer extends DecimalConsumer {
++
++    /**
++     * Instantiate a DecimalConsumer.
++     */
++    public NullableDecimalConsumer(DecimalVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      BigDecimal value = resultSet.getBigDecimal(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Consumer for non-nullable decimal.
++   */
++  static class NonNullableDecimalConsumer extends DecimalConsumer {
++
++    /**
++     * Instantiate a DecimalConsumer.
++     */
++    public NonNullableDecimalConsumer(DecimalVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      BigDecimal value = resultSet.getBigDecimal(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DoubleConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DoubleConsumer.java
+index 80118a2d4c0a..c872eca79a2e 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DoubleConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/DoubleConsumer.java
+@@ -26,12 +26,23 @@
+  * Consumer which consume double type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.Float8Vector}.
+  */
+-public class DoubleConsumer implements JdbcConsumer<Float8Vector> {
++public abstract class DoubleConsumer implements JdbcConsumer<Float8Vector> {
+ 
+-  private Float8Vector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link Float8Vector}.
++   */
++  public static DoubleConsumer createConsumer(Float8Vector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableDoubleConsumer(vector, index);
++    } else {
++      return new NonNullableDoubleConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected Float8Vector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a DoubleConsumer.
+@@ -41,15 +52,6 @@ public DoubleConsumer(Float8Vector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    double value = resultSet.getDouble(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -60,4 +62,46 @@ public void resetValueVector(Float8Vector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable double consumer.
++   */
++  static class NullableDoubleConsumer extends DoubleConsumer {
++
++    /**
++     * Instantiate a DoubleConsumer.
++     */
++    public NullableDoubleConsumer(Float8Vector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      double value = resultSet.getDouble(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable double consumer.
++   */
++  static class NonNullableDoubleConsumer extends DoubleConsumer {
++
++    /**
++     * Instantiate a DoubleConsumer.
++     */
++    public NonNullableDoubleConsumer(Float8Vector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      double value = resultSet.getDouble(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/FloatConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/FloatConsumer.java
+index 0625c6464dd9..ad1f082ac709 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/FloatConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/FloatConsumer.java
+@@ -26,12 +26,23 @@
+  * Consumer which consume float type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.Float4Vector}.
+  */
+-public class FloatConsumer implements JdbcConsumer<Float4Vector> {
++public abstract class FloatConsumer implements JdbcConsumer<Float4Vector> {
+ 
+-  private Float4Vector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link Float4Vector}.
++   */
++  public static FloatConsumer createConsumer(Float4Vector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableFloatConsumer(vector, index);
++    } else {
++      return new NonNullableFloatConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected Float4Vector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a FloatConsumer.
+@@ -41,15 +52,6 @@ public FloatConsumer(Float4Vector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    float value = resultSet.getFloat(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -60,4 +62,46 @@ public void resetValueVector(Float4Vector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable float consumer.
++   */
++  static class NullableFloatConsumer extends FloatConsumer {
++
++    /**
++     * Instantiate a FloatConsumer.
++     */
++    public NullableFloatConsumer(Float4Vector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      float value = resultSet.getFloat(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable float consumer.
++   */
++  static class NonNullableFloatConsumer extends FloatConsumer {
++
++    /**
++     * Instantiate a FloatConsumer.
++     */
++    public NonNullableFloatConsumer(Float4Vector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      float value = resultSet.getFloat(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/IntConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/IntConsumer.java
+index 42bddc3c6aa3..950a432f7273 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/IntConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/IntConsumer.java
+@@ -26,12 +26,23 @@
+  * Consumer which consume int type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.IntVector}.
+  */
+-public class IntConsumer implements JdbcConsumer<IntVector> {
++public abstract class IntConsumer implements JdbcConsumer<IntVector> {
+ 
+-  private IntVector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link IntVector}.
++   */
++  public static IntConsumer createConsumer(IntVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableIntConsumer(vector, index);
++    } else {
++      return new NonNullableIntConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected IntVector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a IntConsumer.
+@@ -41,15 +52,6 @@ public IntConsumer(IntVector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    int value = resultSet.getInt(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -60,4 +62,46 @@ public void resetValueVector(IntVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for int.
++   */
++  static class NullableIntConsumer extends IntConsumer {
++
++    /**
++     * Instantiate a IntConsumer.
++     */
++    public NullableIntConsumer(IntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      int value = resultSet.getInt(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for int.
++   */
++  static class NonNullableIntConsumer extends IntConsumer {
++
++    /**
++     * Instantiate a IntConsumer.
++     */
++    public NonNullableIntConsumer(IntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      int value = resultSet.getInt(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/JdbcConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/JdbcConsumer.java
+index cd2a552b2030..480dfe3a1c57 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/JdbcConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/JdbcConsumer.java
+@@ -43,5 +43,4 @@
+    * Reset the vector within consumer for partial read purpose.
+    */
+   void resetValueVector(T vector);
+-
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/SmallIntConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/SmallIntConsumer.java
+index 8a27a4d682eb..bf627df7c1b6 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/SmallIntConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/SmallIntConsumer.java
+@@ -26,12 +26,23 @@
+  * Consumer which consume smallInt type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.SmallIntVector}.
+  */
+-public class SmallIntConsumer implements JdbcConsumer<SmallIntVector> {
++public abstract class SmallIntConsumer implements JdbcConsumer<SmallIntVector> {
+ 
+-  private SmallIntVector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link SmallIntVector}.
++   */
++  public static SmallIntConsumer createConsumer(SmallIntVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableSmallIntConsumer(vector, index);
++    } else {
++      return new NonNullableSmallIntConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected SmallIntVector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a SmallIntConsumer.
+@@ -41,15 +52,6 @@ public SmallIntConsumer(SmallIntVector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    short value = resultSet.getShort(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -60,4 +62,46 @@ public void resetValueVector(SmallIntVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for small int.
++   */
++  static class NullableSmallIntConsumer extends SmallIntConsumer {
++
++    /**
++     * Instantiate a SmallIntConsumer.
++     */
++    public NullableSmallIntConsumer(SmallIntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      short value = resultSet.getShort(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for small int.
++   */
++  static class NonNullableSmallIntConsumer extends SmallIntConsumer {
++
++    /**
++     * Instantiate a SmallIntConsumer.
++     */
++    public NonNullableSmallIntConsumer(SmallIntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      short value = resultSet.getShort(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimeConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimeConsumer.java
+index be9caaacc7b0..3774543a8549 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimeConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimeConsumer.java
+@@ -28,13 +28,25 @@
+  * Consumer which consume time type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.TimeMilliVector}.
+  */
+-public class TimeConsumer implements JdbcConsumer<TimeMilliVector> {
++public abstract class TimeConsumer implements JdbcConsumer<TimeMilliVector> {
+ 
+-  private TimeMilliVector vector;
+-  private final int columnIndexInResultSet;
+-  private final Calendar calendar;
++  /**
++   * Creates a consumer for {@link TimeMilliVector}.
++   */
++  public static TimeConsumer createConsumer(
++          TimeMilliVector vector, int index, boolean nullable, Calendar calendar) {
++    if (nullable) {
++      return new NullableTimeConsumer(vector, index, calendar);
++    } else {
++      return new NonNullableTimeConsumer(vector, index, calendar);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected TimeMilliVector vector;
++  protected final int columnIndexInResultSet;
++  protected final Calendar calendar;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a TimeConsumer.
+@@ -52,16 +64,6 @@ public TimeConsumer(TimeMilliVector vector, int index, Calendar calendar) {
+     this.calendar = calendar;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    Time time = calendar == null ? resultSet.getTime(columnIndexInResultSet) :
+-        resultSet.getTime(columnIndexInResultSet, calendar);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, (int) time.getTime());
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -72,4 +74,62 @@ public void resetValueVector(TimeMilliVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for {@link TimeMilliVector}.
++   */
++  static class NullableTimeConsumer extends TimeConsumer {
++
++    /**
++     * Instantiate a TimeConsumer.
++     */
++    public NullableTimeConsumer(TimeMilliVector vector, int index) {
++      super(vector, index);
++    }
++
++    /**
++     * Instantiate a TimeConsumer.
++     */
++    public NullableTimeConsumer(TimeMilliVector vector, int index, Calendar calendar) {
++      super(vector, index, calendar);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Time time = calendar == null ? resultSet.getTime(columnIndexInResultSet) :
++          resultSet.getTime(columnIndexInResultSet, calendar);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, (int) time.getTime());
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for {@link TimeMilliVector}.
++   */
++  static class NonNullableTimeConsumer extends TimeConsumer {
++
++    /**
++     * Instantiate a TimeConsumer.
++     */
++    public NonNullableTimeConsumer(TimeMilliVector vector, int index) {
++      super(vector, index);
++    }
++
++    /**
++     * Instantiate a TimeConsumer.
++     */
++    public NonNullableTimeConsumer(TimeMilliVector vector, int index, Calendar calendar) {
++      super(vector, index, calendar);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Time time = calendar == null ? resultSet.getTime(columnIndexInResultSet) :
++          resultSet.getTime(columnIndexInResultSet, calendar);
++      vector.setSafe(currentIndex, (int) time.getTime());
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimestampConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimestampConsumer.java
+index 94b84c1e4813..c9741702a9e9 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimestampConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TimestampConsumer.java
+@@ -28,13 +28,25 @@
+  * Consumer which consume timestamp type values from {@link ResultSet}.
+  * Write the data to {@link TimeStampMilliTZVector}.
+  */
+-public class TimestampConsumer implements JdbcConsumer<TimeStampMilliTZVector> {
++public abstract class TimestampConsumer implements JdbcConsumer<TimeStampMilliTZVector> {
+ 
+-  private TimeStampMilliTZVector vector;
+-  private final int columnIndexInResultSet;
+-  private final Calendar calendar;
++  /**
++   * Creates a consumer for {@link TimeStampMilliTZVector}.
++   */
++  public static TimestampConsumer createConsumer(
++          TimeStampMilliTZVector vector, int index, boolean nullable, Calendar calendar) {
++    if (nullable) {
++      return new NullableTimestampConsumer(vector, index, calendar);
++    } else {
++      return new NonNullableTimestampConsumer(vector, index, calendar);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected TimeStampMilliTZVector vector;
++  protected final int columnIndexInResultSet;
++  protected final Calendar calendar;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a TimestampConsumer.
+@@ -52,16 +64,6 @@ public TimestampConsumer(TimeStampMilliTZVector vector, int index, Calendar cale
+     this.calendar = calendar;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    Timestamp timestamp = calendar == null ? resultSet.getTimestamp(columnIndexInResultSet) :
+-        resultSet.getTimestamp(columnIndexInResultSet, calendar);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, timestamp.getTime());
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -72,4 +74,62 @@ public void resetValueVector(TimeStampMilliTZVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for timestamp.
++   */
++  static class NullableTimestampConsumer extends TimestampConsumer {
++
++    /**
++     * Instantiate a TimestampConsumer.
++     */
++    public NullableTimestampConsumer(TimeStampMilliTZVector vector, int index) {
++      super(vector, index);
++    }
++
++    /**
++     * Instantiate a TimestampConsumer.
++     */
++    public NullableTimestampConsumer(TimeStampMilliTZVector vector, int index, Calendar calendar) {
++      super(vector, index, calendar);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Timestamp timestamp = calendar == null ? resultSet.getTimestamp(columnIndexInResultSet) :
++          resultSet.getTimestamp(columnIndexInResultSet, calendar);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, timestamp.getTime());
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for timestamp.
++   */
++  static class NonNullableTimestampConsumer extends TimestampConsumer {
++
++    /**
++     * Instantiate a TimestampConsumer.
++     */
++    public NonNullableTimestampConsumer(TimeStampMilliTZVector vector, int index) {
++      super(vector, index);
++    }
++
++    /**
++     * Instantiate a TimestampConsumer.
++     */
++    public NonNullableTimestampConsumer(TimeStampMilliTZVector vector, int index, Calendar calendar) {
++      super(vector, index, calendar);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      Timestamp timestamp = calendar == null ? resultSet.getTimestamp(columnIndexInResultSet) :
++          resultSet.getTimestamp(columnIndexInResultSet, calendar);
++      vector.setSafe(currentIndex, timestamp.getTime());
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TinyIntConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TinyIntConsumer.java
+index 8089d5e2657f..03d515a633dd 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TinyIntConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/TinyIntConsumer.java
+@@ -26,12 +26,23 @@
+  * Consumer which consume tinyInt type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.TinyIntVector}.
+  */
+-public class TinyIntConsumer implements JdbcConsumer<TinyIntVector> {
++public abstract class TinyIntConsumer implements JdbcConsumer<TinyIntVector> {
+ 
+-  private TinyIntVector vector;
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link TinyIntVector}.
++   */
++  public static TinyIntConsumer createConsumer(TinyIntVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableTinyIntConsumer(vector, index);
++    } else {
++      return new NonNullableTinyIntConsumer(vector, index);
++    }
++  }
+ 
+-  private int currentIndex;
++  protected TinyIntVector vector;
++  protected final int columnIndexInResultSet;
++
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a TinyIntConsumer.
+@@ -41,15 +52,6 @@ public TinyIntConsumer(TinyIntVector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    byte value = resultSet.getByte(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      vector.setSafe(currentIndex, value);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -60,4 +62,46 @@ public void resetValueVector(TinyIntVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for tiny int.
++   */
++  static class NullableTinyIntConsumer extends TinyIntConsumer {
++
++    /**
++     * Instantiate a TinyIntConsumer.
++     */
++    public NullableTinyIntConsumer(TinyIntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      byte value = resultSet.getByte(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        vector.setSafe(currentIndex, value);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for tiny int.
++   */
++  static class NonNullableTinyIntConsumer extends TinyIntConsumer {
++
++    /**
++     * Instantiate a TinyIntConsumer.
++     */
++    public NonNullableTinyIntConsumer(TinyIntVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      byte value = resultSet.getByte(columnIndexInResultSet);
++      vector.setSafe(currentIndex, value);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/VarCharConsumer.java b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/VarCharConsumer.java
+index 8387700751cf..f71c7c6c946d 100644
+--- a/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/VarCharConsumer.java
++++ b/java/adapter/jdbc/src/main/java/org/apache/arrow/adapter/jdbc/consumer/VarCharConsumer.java
+@@ -27,12 +27,23 @@
+  * Consumer which consume varchar type values from {@link ResultSet}.
+  * Write the data to {@link org.apache.arrow.vector.VarCharVector}.
+  */
+-public class VarCharConsumer implements JdbcConsumer<VarCharVector> {
++public abstract class VarCharConsumer implements JdbcConsumer<VarCharVector> {
+ 
+-  private final int columnIndexInResultSet;
++  /**
++   * Creates a consumer for {@link VarCharVector}.
++   */
++  public static VarCharConsumer createConsumer(VarCharVector vector, int index, boolean nullable) {
++    if (nullable) {
++      return new NullableVarCharConsumer(vector, index);
++    } else {
++      return new NonNullableVarCharConsumer(vector, index);
++    }
++  }
+ 
+-  private VarCharVector vector;
+-  private int currentIndex;
++  protected final int columnIndexInResultSet;
++
++  protected VarCharVector vector;
++  protected int currentIndex;
+ 
+   /**
+    * Instantiate a VarCharConsumer.
+@@ -42,17 +53,6 @@ public VarCharConsumer(VarCharVector vector, int index) {
+     this.columnIndexInResultSet = index;
+   }
+ 
+-  @Override
+-  public void consume(ResultSet resultSet) throws SQLException {
+-    String value = resultSet.getString(columnIndexInResultSet);
+-    if (!resultSet.wasNull()) {
+-      byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+-
+-      vector.setSafe(currentIndex, bytes);
+-    }
+-    currentIndex++;
+-  }
+-
+   @Override
+   public void close() throws Exception {
+     this.vector.close();
+@@ -63,4 +63,48 @@ public void resetValueVector(VarCharVector vector) {
+     this.vector = vector;
+     this.currentIndex = 0;
+   }
++
++  /**
++   * Nullable consumer for var char.
++   */
++  static class NullableVarCharConsumer extends VarCharConsumer {
++
++    /**
++     * Instantiate a VarCharConsumer.
++     */
++    public NullableVarCharConsumer(VarCharVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      String value = resultSet.getString(columnIndexInResultSet);
++      if (!resultSet.wasNull()) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        vector.setSafe(currentIndex, bytes);
++      }
++      currentIndex++;
++    }
++  }
++
++  /**
++   * Non-nullable consumer for var char.
++   */
++  static class NonNullableVarCharConsumer extends VarCharConsumer {
++
++    /**
++     * Instantiate a VarCharConsumer.
++     */
++    public NonNullableVarCharConsumer(VarCharVector vector, int index) {
++      super(vector, index);
++    }
++
++    @Override
++    public void consume(ResultSet resultSet) throws SQLException {
++      String value = resultSet.getString(columnIndexInResultSet);
++      byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++      vector.setSafe(currentIndex, bytes);
++      currentIndex++;
++    }
++  }
+ }
+diff --git a/java/performance/src/test/java/org/apache/arrow/adapter/JdbcAdapterBenchmarks.java b/java/performance/src/test/java/org/apache/arrow/adapter/JdbcAdapterBenchmarks.java
+deleted file mode 100644
+index ef3df3fb67b7..000000000000
+--- a/java/performance/src/test/java/org/apache/arrow/adapter/JdbcAdapterBenchmarks.java
++++ /dev/null
+@@ -1,144 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.arrow.adapter;
+-
+-import java.sql.Connection;
+-import java.sql.DriverManager;
+-import java.sql.PreparedStatement;
+-import java.sql.ResultSet;
+-import java.sql.Statement;
+-import java.util.concurrent.TimeUnit;
+-
+-import org.apache.arrow.adapter.jdbc.ArrowVectorIterator;
+-import org.apache.arrow.adapter.jdbc.JdbcToArrow;
+-import org.apache.arrow.adapter.jdbc.JdbcToArrowConfig;
+-import org.apache.arrow.adapter.jdbc.JdbcToArrowConfigBuilder;
+-import org.apache.arrow.memory.BaseAllocator;
+-import org.apache.arrow.memory.RootAllocator;
+-import org.apache.arrow.vector.IntVector;
+-import org.apache.arrow.vector.VectorSchemaRoot;
+-import org.junit.Test;
+-import org.openjdk.jmh.annotations.Benchmark;
+-import org.openjdk.jmh.annotations.BenchmarkMode;
+-import org.openjdk.jmh.annotations.Mode;
+-import org.openjdk.jmh.annotations.OutputTimeUnit;
+-import org.openjdk.jmh.annotations.Scope;
+-import org.openjdk.jmh.annotations.Setup;
+-import org.openjdk.jmh.annotations.State;
+-import org.openjdk.jmh.annotations.TearDown;
+-import org.openjdk.jmh.runner.Runner;
+-import org.openjdk.jmh.runner.RunnerException;
+-import org.openjdk.jmh.runner.options.Options;
+-import org.openjdk.jmh.runner.options.OptionsBuilder;
+-
+-/**
+- * Benchmarks for avro adapter.
+- */
+-@State(Scope.Benchmark)
+-public class JdbcAdapterBenchmarks {
+-
+-  private final int valueCount = 3000;
+-  private JdbcToArrowConfig config;
+-
+-  private Connection conn = null;
+-  private ResultSet resultSet = null;
+-
+-  private static final String CREATE_STATEMENT =
+-      "CREATE TABLE test_table (f0 INT, f1 LONG, f2 VARCHAR, f3 BOOLEAN);";
+-  private static final String INSERT_STATEMENT =
+-      "INSERT INTO test_table (f0, f1, f2, f3) VALUES (?, ?, ?, ?);";
+-  private static final String QUERY = "SELECT f0, f1, f2, f3 FROM test_table;";
+-  private static final String DROP_STATEMENT = "DROP TABLE test_table;";
+-
+-  /**
+-   * Setup benchmarks.
+-   */
+-  @Setup
+-  public void prepare() throws Exception {
+-    BaseAllocator allocator = new RootAllocator(Integer.MAX_VALUE);
+-    config = new JdbcToArrowConfigBuilder().setAllocator(allocator).setTargetBatchSize(1024).build();
+-
+-    String url = "jdbc:h2:mem:JdbcAdapterBenchmarks";
+-    String driver = "org.h2.Driver";
+-    Class.forName(driver);
+-    conn = DriverManager.getConnection(url);
+-    try (Statement stmt = conn.createStatement()) {
+-      stmt.executeUpdate(CREATE_STATEMENT);
+-    }
+-
+-    for (int i = 0; i < valueCount; i++) {
+-      // Insert data
+-      try (PreparedStatement stmt = conn.prepareStatement(INSERT_STATEMENT)) {
+-
+-        stmt.setInt(1, i);
+-        stmt.setLong(2, i);
+-        stmt.setString(3, "test" + i);
+-        stmt.setBoolean(4, i % 2 == 0);
+-        stmt.executeUpdate();
+-      }
+-    }
+-
+-    resultSet = conn.createStatement().executeQuery(QUERY);
+-
+-  }
+-
+-  /**
+-   * Tear down benchmarks.
+-   */
+-  @TearDown
+-  public void tearDown() throws Exception {
+-    try (Statement stmt = conn.createStatement()) {
+-      stmt.executeUpdate(DROP_STATEMENT);
+-    } finally {
+-      if (conn != null) {
+-        conn.close();
+-        conn = null;
+-      }
+-    }
+-  }
+-
+-  /**
+-   * Test {@link JdbcToArrow#sqlToArrowVectorIterator(ResultSet, JdbcToArrowConfig)}
+-   * @return useless. To avoid DCE by JIT.
+-   */
+-  @Benchmark
+-  @BenchmarkMode(Mode.AverageTime)
+-  @OutputTimeUnit(TimeUnit.NANOSECONDS)
+-  public int testJdbcToArrow() throws Exception {
+-    int valueCount = 0;
+-    try (ArrowVectorIterator iter = JdbcToArrow.sqlToArrowVectorIterator(resultSet, config)) {
+-      while (iter.hasNext()) {
+-        VectorSchemaRoot root = iter.next();
+-        IntVector intVector = (IntVector) root.getFieldVectors().get(0);
+-        valueCount += intVector.getValueCount();
+-        root.close();
+-      }
+-    }
+-    return valueCount;
+-  }
+-
+-  @Test
+-  public void evaluate() throws RunnerException {
+-    Options opt = new OptionsBuilder()
+-        .include(JdbcAdapterBenchmarks.class.getSimpleName())
+-        .forks(1)
+-        .build();
+-
+-    new Runner(opt).run();
+-  }
+-}
+diff --git a/java/performance/src/test/java/org/apache/arrow/adapter/jdbc/JdbcAdapterBenchmarks.java b/java/performance/src/test/java/org/apache/arrow/adapter/jdbc/JdbcAdapterBenchmarks.java
+new file mode 100644
+index 000000000000..731c5c0c1610
+--- /dev/null
++++ b/java/performance/src/test/java/org/apache/arrow/adapter/jdbc/JdbcAdapterBenchmarks.java
+@@ -0,0 +1,361 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.arrow.adapter.jdbc;
++
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.Statement;
++import java.util.concurrent.TimeUnit;
++
++import org.apache.arrow.adapter.jdbc.consumer.BigIntConsumer;
++import org.apache.arrow.adapter.jdbc.consumer.BitConsumer;
++import org.apache.arrow.adapter.jdbc.consumer.IntConsumer;
++import org.apache.arrow.adapter.jdbc.consumer.JdbcConsumer;
++import org.apache.arrow.adapter.jdbc.consumer.VarCharConsumer;
++import org.apache.arrow.memory.BaseAllocator;
++import org.apache.arrow.memory.RootAllocator;
++import org.apache.arrow.vector.BigIntVector;
++import org.apache.arrow.vector.BitVector;
++import org.apache.arrow.vector.IntVector;
++import org.apache.arrow.vector.VarCharVector;
++import org.apache.arrow.vector.VectorSchemaRoot;
++import org.junit.Test;
++import org.openjdk.jmh.annotations.Benchmark;
++import org.openjdk.jmh.annotations.BenchmarkMode;
++import org.openjdk.jmh.annotations.Level;
++import org.openjdk.jmh.annotations.Mode;
++import org.openjdk.jmh.annotations.OutputTimeUnit;
++import org.openjdk.jmh.annotations.Scope;
++import org.openjdk.jmh.annotations.Setup;
++import org.openjdk.jmh.annotations.State;
++import org.openjdk.jmh.annotations.TearDown;
++import org.openjdk.jmh.runner.Runner;
++import org.openjdk.jmh.runner.RunnerException;
++import org.openjdk.jmh.runner.options.Options;
++import org.openjdk.jmh.runner.options.OptionsBuilder;
++
++/**
++ * Benchmarks for Jdbc adapter.
++ */
++public class JdbcAdapterBenchmarks {
++
++  private static final int VALUE_COUNT = 3000;
++
++  private static final String CREATE_STATEMENT =
++          "CREATE TABLE test_table (f0 INT, f1 LONG, f2 VARCHAR, f3 BOOLEAN);";
++  private static final String INSERT_STATEMENT =
++          "INSERT INTO test_table (f0, f1, f2, f3) VALUES (?, ?, ?, ?);";
++  private static final String QUERY = "SELECT f0, f1, f2, f3 FROM test_table;";
++  private static final String DROP_STATEMENT = "DROP TABLE test_table;";
++
++  private static final String URL = "jdbc:h2:mem:JdbcAdapterBenchmarks";
++  private static final String DRIVER = "org.h2.Driver";
++
++  /**
++   * State object for the jdbc e2e benchmark.
++   */
++  @State(Scope.Benchmark)
++  public static class JdbcState {
++
++    private Connection conn = null;
++
++    private ResultSet resultSet = null;
++
++    private BaseAllocator allocator;
++
++    private Statement statement;
++
++    private JdbcToArrowConfig config;
++
++    @Setup(Level.Trial)
++    public void prepareState() throws Exception {
++      allocator = new RootAllocator(Integer.MAX_VALUE);
++      config = new JdbcToArrowConfigBuilder().setAllocator(allocator).setTargetBatchSize(1024).build();
++      Class.forName(DRIVER);
++      conn = DriverManager.getConnection(URL);
++
++      try (Statement stmt = conn.createStatement()) {
++        stmt.executeUpdate(CREATE_STATEMENT);
++      }
++
++      for (int i = 0; i < VALUE_COUNT; i++) {
++        // Insert data
++        try (PreparedStatement stmt = conn.prepareStatement(INSERT_STATEMENT)) {
++
++          stmt.setInt(1, i);
++          stmt.setLong(2, i);
++          stmt.setString(3, "test" + i);
++          stmt.setBoolean(4, i % 2 == 0);
++          stmt.executeUpdate();
++        }
++      }
++    }
++
++    @Setup(Level.Invocation)
++    public void prepareInvoke() throws Exception {
++      statement = conn.createStatement();
++      resultSet = statement.executeQuery(QUERY);
++    }
++
++    @TearDown(Level.Invocation)
++    public void tearDownInvoke() throws Exception {
++      resultSet.close();
++      statement.close();
++    }
++
++    @TearDown(Level.Trial)
++    public void tearDownState() throws Exception {
++      try (Statement stmt = conn.createStatement()) {
++        stmt.executeUpdate(DROP_STATEMENT);
++      }
++      allocator.close();
++    }
++  }
++
++  /**
++   * State object for the consume benchmark.
++   */
++  @State(Scope.Benchmark)
++  public static class ConsumeState {
++
++    private static final boolean NULLABLE = true;
++
++    private Connection conn = null;
++
++    private ResultSet resultSet = null;
++
++    private BaseAllocator allocator;
++
++    private Statement statement;
++
++    private IntVector intVector;
++
++    private BigIntVector longVector;
++
++    private VarCharVector varCharVector;
++
++    private BitVector bitVector;
++
++    private JdbcConsumer<IntVector> intConsumer;
++
++    private JdbcConsumer<BigIntVector> longConsumer;
++
++    private JdbcConsumer<VarCharVector> varCharConsumer;
++
++    private JdbcConsumer<BitVector> bitConsumer;
++
++    private JdbcToArrowConfig config;
++
++    @Setup(Level.Trial)
++    public void prepare() throws Exception {
++      allocator = new RootAllocator(Integer.MAX_VALUE);
++      config = new JdbcToArrowConfigBuilder().setAllocator(allocator).setTargetBatchSize(1024).build();
++
++      Class.forName(DRIVER);
++      conn = DriverManager.getConnection(URL);
++      try (Statement stmt = conn.createStatement()) {
++        stmt.executeUpdate(CREATE_STATEMENT);
++      }
++
++      for (int i = 0; i < VALUE_COUNT; i++) {
++        // Insert data
++        try (PreparedStatement stmt = conn.prepareStatement(INSERT_STATEMENT)) {
++
++          stmt.setInt(1, i);
++          stmt.setLong(2, i);
++          stmt.setString(3, "test" + i);
++          stmt.setBoolean(4, i % 2 == 0);
++          stmt.executeUpdate();
++        }
++      }
++
++      statement = conn.createStatement();
++      resultSet = statement.executeQuery(QUERY);
++      resultSet.next();
++
++      intVector = new IntVector("", allocator);
++      intVector.allocateNew(VALUE_COUNT);
++      intConsumer = IntConsumer.createConsumer(intVector, 1, NULLABLE);
++
++      longVector = new BigIntVector("", allocator);
++      longVector.allocateNew(VALUE_COUNT);
++      longConsumer = BigIntConsumer.createConsumer(longVector, 2, NULLABLE);
++
++      varCharVector = new VarCharVector("", allocator);
++      varCharVector.allocateNew(VALUE_COUNT);
++      varCharConsumer = VarCharConsumer.createConsumer(varCharVector, 3, NULLABLE);
++
++      bitVector = new BitVector("", allocator);
++      bitVector.allocateNew(VALUE_COUNT);
++      bitConsumer = BitConsumer.createConsumer(bitVector, 4, NULLABLE);
++    }
++
++    @TearDown(Level.Trial)
++    public void tearDown() throws Exception {
++      try (Statement stmt = conn.createStatement()) {
++        stmt.executeUpdate(DROP_STATEMENT);
++      }
++
++      resultSet.close();
++      statement.close();
++      conn.close();
++
++      intVector.close();
++      intConsumer.close();
++
++      longVector.close();
++      longConsumer.close();
++
++      varCharVector.close();
++      varCharConsumer.close();
++
++      bitVector.close();
++      bitConsumer.close();
++
++      allocator.close();
++    }
++  }
++
++  /**
++   * State object for the jdbc row consume benchmark.
++   */
++  @State(Scope.Benchmark)
++  public static class RowConsumeState {
++
++    private Connection conn = null;
++
++    private ResultSet resultSet = null;
++
++    private BaseAllocator allocator;
++
++    private Statement statement;
++
++    private JdbcToArrowConfig config;
++
++    private ArrowVectorIterator iter;
++
++    private VectorSchemaRoot root;
++
++    @Setup(Level.Trial)
++    public void prepareState() throws Exception {
++      allocator = new RootAllocator(Integer.MAX_VALUE);
++      config = new JdbcToArrowConfigBuilder().setAllocator(allocator).setTargetBatchSize(1024).build();
++      Class.forName(DRIVER);
++      conn = DriverManager.getConnection(URL);
++
++      try (Statement stmt = conn.createStatement()) {
++        stmt.executeUpdate(CREATE_STATEMENT);
++      }
++
++      for (int i = 0; i < VALUE_COUNT; i++) {
++        // Insert data
++        try (PreparedStatement stmt = conn.prepareStatement(INSERT_STATEMENT)) {
++
++          stmt.setInt(1, i);
++          stmt.setLong(2, i);
++          stmt.setString(3, "test" + i);
++          stmt.setBoolean(4, i % 2 == 0);
++          stmt.executeUpdate();
++        }
++      }
++    }
++
++    @Setup(Level.Invocation)
++    public void prepareInvoke() throws Exception {
++      statement = conn.createStatement();
++      resultSet = statement.executeQuery(QUERY);
++
++      iter = JdbcToArrow.sqlToArrowVectorIterator(resultSet, config);
++      root = iter.next();
++      iter.compositeConsumer.resetVectorSchemaRoot(root);
++    }
++
++    @TearDown(Level.Invocation)
++    public void tearDownInvoke() throws Exception {
++      resultSet.close();
++      statement.close();
++      iter.close();
++    }
++
++    @TearDown(Level.Trial)
++    public void tearDownState() throws Exception {
++      try (Statement stmt = conn.createStatement()) {
++        stmt.executeUpdate(DROP_STATEMENT);
++      }
++      allocator.close();
++    }
++  }
++
++  /**
++   * Test {@link JdbcToArrow#sqlToArrowVectorIterator(ResultSet, JdbcToArrowConfig)}
++   * @return useless. To avoid DCE by JIT.
++   */
++  @Benchmark
++  @BenchmarkMode(Mode.AverageTime)
++  @OutputTimeUnit(TimeUnit.MICROSECONDS)
++  public int testJdbcToArrow(JdbcState state) throws Exception {
++    int valueCount = 0;
++    try (ArrowVectorIterator iter = JdbcToArrow.sqlToArrowVectorIterator(state.resultSet, state.config)) {
++      while (iter.hasNext()) {
++        VectorSchemaRoot root = iter.next();
++        IntVector intVector = (IntVector) root.getFieldVectors().get(0);
++        valueCount += intVector.getValueCount();
++        root.close();
++      }
++    }
++    return valueCount;
++  }
++
++  @Benchmark
++  @BenchmarkMode(Mode.AverageTime)
++  @OutputTimeUnit(TimeUnit.MICROSECONDS)
++  public void consumeBenchmark(ConsumeState state) throws Exception {
++    state.intConsumer.resetValueVector(state.intVector);
++    state.longConsumer.resetValueVector(state.longVector);
++    state.varCharConsumer.resetValueVector(state.varCharVector);
++    state.bitConsumer.resetValueVector(state.bitVector);
++    for (int i = 0; i < VALUE_COUNT; i++) {
++      state.intConsumer.consume(state.resultSet);
++      state.longConsumer.consume(state.resultSet);
++      state.varCharConsumer.consume(state.resultSet);
++      state.bitConsumer.consume(state.resultSet);
++    }
++  }
++
++  @Benchmark
++  @BenchmarkMode(Mode.AverageTime)
++  @OutputTimeUnit(TimeUnit.MICROSECONDS)
++  public void consumeRowsBenchmark(RowConsumeState state) throws Exception {
++    for (int i = 0; i < VALUE_COUNT; i++) {
++      state.iter.compositeConsumer.consume(state.resultSet);
++    }
++  }
++
++  @Test
++  public void evaluate() throws RunnerException {
++    Options opt = new OptionsBuilder()
++        .include(JdbcAdapterBenchmarks.class.getSimpleName())
++        .forks(1)
++        .build();
++
++    new Runner(opt).run();
++  }
++}
++

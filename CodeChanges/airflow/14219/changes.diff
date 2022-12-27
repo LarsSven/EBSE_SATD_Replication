@@ -1,0 +1,664 @@
+diff --git a/airflow/api_connexion/endpoints/auth_endpoint.py b/airflow/api_connexion/endpoints/auth_endpoint.py
+new file mode 100644
+index 0000000000000..64088cee863f8
+--- /dev/null
++++ b/airflow/api_connexion/endpoints/auth_endpoint.py
+@@ -0,0 +1,37 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++from flask import current_app, jsonify
++from flask_jwt_extended import set_access_cookies, unset_jwt_cookies
++
++from airflow.api_connexion.schemas.user_schema import user_collection_item_schema
++
++
++def login():
++    """User login"""
++    ab_security_manager = current_app.appbuilder.sm
++    access_token = ab_security_manager.create_access_token()
++    resp = jsonify(user_collection_item_schema.dump(ab_security_manager.current_user))
++    set_access_cookies(resp, access_token)
++    return resp
++
++
++def logout():
++    """Sign out"""
++    resp = jsonify({'logged_out': True})
++    unset_jwt_cookies(resp)
++    return resp, 200
+diff --git a/airflow/api_connexion/openapi/v1.yaml b/airflow/api_connexion/openapi/v1.yaml
+index 7885e8d912c5a..d82bdf4f125e6 100644
+--- a/airflow/api_connexion/openapi/v1.yaml
++++ b/airflow/api_connexion/openapi/v1.yaml
+@@ -1490,6 +1490,48 @@ paths:
+         '404':
+           $ref: '#/components/responses/NotFound'
+ 
++  /login:
++    post:
++      summary: Webserver login
++      description: |
++        Verify user and set jwt token in cookies
++      x-openapi-router-controller: airflow.api_connexion.endpoints.auth_endpoint
++      operationId: login
++      tags: [WebserverAuth]
++
++      responses:
++        '200':
++          description: Success.
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/User'
++        '400':
++          $ref: '#/components/responses/BadRequest'
++        '401':
++          $ref: '#/components/responses/Unauthenticated'
++
++  /logout:
++    post:
++      summary: Webserver logout
++      description: Logout user by unsetting cookies
++      x-openapi-router-controller: airflow.api_connexion.endpoints.auth_endpoint
++      operationId: logout
++      tags: [WebserverAuth]
++
++      responses:
++        '200':
++          description: Success
++          content:
++            application/json:
++              schema:
++                properties:
++                  logged_out:
++                    type: boolean
++                    description: Indicate user is logged out
++        '400':
++          $ref: '#/components/responses/BadRequest'
++
+ components:
+   # Reusable schemas (data models)
+   schemas:
+@@ -3275,6 +3317,10 @@ components:
+     Kerberos:
+       type: http
+       scheme: negotiate
++    WebserverAuth:
++      type: apiKey
++      in: cookie
++      name: access_token_cookie
+ 
+ # The API will provide support for plugins to support various authorization mechanisms.
+ # Detailed information will be available in the plugin specification.
+@@ -3296,6 +3342,7 @@ tags:
+   - name: Role
+   - name: Permission
+   - name: User
++  - name: WebserverAuth
+ 
+ externalDocs:
+   url: https://airflow.apache.org/docs/apache-airflow/stable/
+diff --git a/airflow/api_connexion/security.py b/airflow/api_connexion/security.py
+index 4faa9ed8f3457..95e1626881a05 100644
+--- a/airflow/api_connexion/security.py
++++ b/airflow/api_connexion/security.py
+@@ -14,13 +14,13 @@
+ # KIND, either express or implied.  See the License for the
+ # specific language governing permissions and limitations
+ # under the License.
+-
+ from functools import wraps
+ from typing import Callable, Optional, Sequence, Tuple, TypeVar, cast
+ 
+ from flask import Response, current_app
+ 
+ from airflow.api_connexion.exceptions import PermissionDenied, Unauthenticated
++from airflow.api_connexion.webserver_auth import auth_current_user
+ 
+ T = TypeVar("T", bound=Callable)  # pylint: disable=invalid-name
+ 
+@@ -28,10 +28,13 @@
+ def check_authentication() -> None:
+     """Checks that the request has valid authorization information."""
+     response = current_app.api_auth.requires_authentication(Response)()
+-    if response.status_code != 200:
+-        # since this handler only checks authentication, not authorization,
+-        # we should always return 401
+-        raise Unauthenticated(headers=response.headers)
++    if response.status_code == 200:
++        return
++    if auth_current_user():
++        return
++    # since this handler only checks authentication, not authorization,
++    # we should always return 401
++    raise Unauthenticated(headers=response.headers)
+ 
+ 
+ def requires_access(permissions: Optional[Sequence[Tuple[str, str]]] = None) -> Callable[[T], T]:
+diff --git a/airflow/api_connexion/webserver_auth.py b/airflow/api_connexion/webserver_auth.py
+new file mode 100644
+index 0000000000000..783efcd1a9760
+--- /dev/null
++++ b/airflow/api_connexion/webserver_auth.py
+@@ -0,0 +1,57 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++import logging
++from typing import Callable, TypeVar
++
++from flask import current_app, request
++from flask_appbuilder.const import AUTH_LDAP
++from flask_jwt_extended import verify_jwt_in_request
++from flask_login import login_user
++
++from airflow.configuration import conf
++
++SECRET = conf.get("webserver", "secret_key")
++T = TypeVar("T", bound=Callable)  # pylint: disable=invalid-name
++
++log = logging.getLogger(__name__)
++
++
++def auth_current_user():
++    """Checks the authentication and return a value"""
++    db_login_disabled = conf.getboolean("api", "disable_db_login")
++    auth_header = request.headers.get("Authorization", None)
++    if auth_header and not db_login_disabled:
++        if auth_header.startswith("Basic"):
++            user = None
++            auth = request.authorization
++            if auth is None or not (auth.username and auth.password):
++                return None
++            ab_security_manager = current_app.appbuilder.sm
++            if ab_security_manager.auth_type == AUTH_LDAP:
++                user = ab_security_manager.auth_user_ldap(auth.username, auth.password)
++            if user is None:
++                user = ab_security_manager.auth_user_db(auth.username, auth.password)
++            if user is not None:
++                login_user(user, remember=False)
++                return user
++    try:
++        verify_jwt_in_request()
++        return True
++    except Exception as err:  # pylint: disable=broad-except
++        log.debug("Can't verify jwt: %s", str(err))
++    return None
+diff --git a/airflow/config_templates/config.yml b/airflow/config_templates/config.yml
+index 16f6f107f25f7..86be046422170 100644
+--- a/airflow/config_templates/config.yml
++++ b/airflow/config_templates/config.yml
+@@ -728,6 +728,27 @@
+       type: string
+       example: ~
+       default: "airflow.api.auth.backend.deny_all"
++    - name: jwt_access_token_expires
++      description: How long an access token should live before it expires(in minutes).
++      version_added: 2.0.2
++      type: integer
++      example: ~
++      default: "60"
++    - name: jwt_cookie_secure
++      description: |
++        If the secure flag should be set on your JWT cookies. This will only
++        allow the cookies to be sent over https. Defaults to False,
++        but in production this should likely be set to True.
++      version_added: 2.0.2
++      type: boolean
++      example: ~
++      default: "False"
++    - name: disable_db_login
++      description: Disable use of username and password to login to the REST API
++      version_added: 2.0.2
++      type: boolean
++      example: ~
++      default: "False"
+     - name: maximum_page_limit
+       description: |
+         Used to set the maximum page limit for API requests
+diff --git a/airflow/config_templates/default_airflow.cfg b/airflow/config_templates/default_airflow.cfg
+index bdbc045b14562..b01c7215bd224 100644
+--- a/airflow/config_templates/default_airflow.cfg
++++ b/airflow/config_templates/default_airflow.cfg
+@@ -392,6 +392,17 @@ enable_experimental_api = False
+ # ("airflow.api.auth.backend.default" allows all requests for historic reasons)
+ auth_backend = airflow.api.auth.backend.deny_all
+ 
++# How long an access token should live before it expires(in minutes).
++jwt_access_token_expires = 60
++
++# If the secure flag should be set on your JWT cookies. This will only
++# allow the cookies to be sent over https. Defaults to False,
++# but in production this should likely be set to True.
++jwt_cookie_secure = False
++
++# Disable use of username and password to login to the REST API
++disable_db_login = False
++
+ # Used to set the maximum page limit for API requests
+ maximum_page_limit = 100
+ 
+diff --git a/airflow/www/app.py b/airflow/www/app.py
+index 3302f36d82811..ef4dde32f2d09 100644
+--- a/airflow/www/app.py
++++ b/airflow/www/app.py
+@@ -34,7 +34,11 @@
+ from airflow.www.extensions.init_dagbag import init_dagbag
+ from airflow.www.extensions.init_jinja_globals import init_jinja_globals
+ from airflow.www.extensions.init_manifest_files import configure_manifest_files
+-from airflow.www.extensions.init_security import init_api_experimental_auth, init_xframe_protection
++from airflow.www.extensions.init_security import (
++    init_api_experimental_auth,
++    init_jwt_auth,
++    init_xframe_protection,
++)
+ from airflow.www.extensions.init_session import init_permanent_session
+ from airflow.www.extensions.init_views import (
+     init_api_connexion,
+@@ -112,6 +116,8 @@ def create_app(config=None, testing=False):
+ 
+     init_api_experimental_auth(flask_app)
+ 
++    init_jwt_auth(flask_app)
++
+     Cache(app=flask_app, config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
+ 
+     init_flash_views(flask_app)
+diff --git a/airflow/www/extensions/init_security.py b/airflow/www/extensions/init_security.py
+index 544deebeb3af4..48a0a5cb45570 100644
+--- a/airflow/www/extensions/init_security.py
++++ b/airflow/www/extensions/init_security.py
+@@ -15,10 +15,20 @@
+ # specific language governing permissions and limitations
+ # under the License.
+ import logging
++from datetime import datetime, timedelta
+ from importlib import import_module
+ 
++from flask_jwt_extended import (
++    JWTManager,
++    create_access_token,
++    get_jwt_identity,
++    get_raw_jwt,
++    set_access_cookies,
++)
++
+ from airflow.configuration import conf
+ from airflow.exceptions import AirflowConfigException, AirflowException
++from airflow.utils import timezone
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -55,3 +65,34 @@ def init_api_experimental_auth(app):
+     except ImportError as err:
+         log.critical("Cannot import %s for API authentication due to: %s", auth_backend, err)
+         raise AirflowException(err)
++
++
++def init_jwt_auth(app):
++    """Initialize flask jwt extended""" ""
++    exp_mins = conf.getint("api", "jwt_access_token_expires", fallback=60)
++    app.config['JWT_TOKEN_LOCATION'] = ['cookies']
++    app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(minutes=exp_mins)
++    app.config['JWT_CSRF_IN_COOKIES'] = True
++    app.config['JWT_COOKIE_CSRF_PROTECT'] = True
++    app.config['JWT_COOKIE_SECURE'] = conf.get("api", "jwt_cookie_secure", fallback=True)
++    JWTManager(app)
++
++    # In flask_jwt_extension 4.0, this is the recommended way to refresh token
++    # https://flask-jwt-extended.readthedocs.io/en/stable/refreshing_tokens/#implicit-refreshing-with-cookies
++    # It's warned not to store refresh token in cookies unlike in 3.0 where they suggested storing refresh
++    # token in cookies
++    def refresh_token(response):
++        try:
++            exp_timestamp = get_raw_jwt()["exp"]
++            now = datetime.now(timezone.utc)
++            half_exp_time = exp_mins / 2
++            target_timestamp = datetime.timestamp(now + timedelta(minutes=half_exp_time))
++            if target_timestamp > exp_timestamp:
++                access_token = create_access_token(identity=get_jwt_identity())
++                set_access_cookies(response, access_token)
++            return response
++        except (RuntimeError, KeyError):
++            # Case where there is not a valid JWT. Just return the original respone
++            return response
++
++    app.after_request(refresh_token)
+diff --git a/airflow/www/security.py b/airflow/www/security.py
+index 499465700602e..9f72d3ef6850b 100644
+--- a/airflow/www/security.py
++++ b/airflow/www/security.py
+@@ -23,10 +23,12 @@
+ from flask_appbuilder.security.sqla import models as sqla_models
+ from flask_appbuilder.security.sqla.manager import SecurityManager
+ from flask_appbuilder.security.sqla.models import PermissionView, Role, User
++from flask_jwt_extended import create_access_token
+ from sqlalchemy import or_
+ from sqlalchemy.orm import joinedload
+ 
+ from airflow import models
++from airflow.api_connexion import security as webserver_security
+ from airflow.exceptions import AirflowException
+ from airflow.models import DagModel
+ from airflow.security import permissions
+@@ -659,3 +661,11 @@ def check_authorization(
+                 return False
+ 
+         return True
++
++    def create_access_token(self):
++        """Creates access token for api auth use"""
++        user = self.current_user
++        if user:
++            return create_access_token(user.id)
++        webserver_security.check_authentication()
++        return create_access_token(self.current_user.id)
+diff --git a/docs/spelling_wordlist.txt b/docs/spelling_wordlist.txt
+index bd32afdd30370..63dfdbca9905b 100644
+--- a/docs/spelling_wordlist.txt
++++ b/docs/spelling_wordlist.txt
+@@ -910,6 +910,7 @@ json
+ jthomas
+ jupyter
+ jupytercmd
++jwt
+ kaxil
+ kaxilnaik
+ keepalive
+diff --git a/tests/api_connexion/endpoints/test_auth_endpoint.py b/tests/api_connexion/endpoints/test_auth_endpoint.py
+new file mode 100644
+index 0000000000000..09554fee47aeb
+--- /dev/null
++++ b/tests/api_connexion/endpoints/test_auth_endpoint.py
+@@ -0,0 +1,113 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++from base64 import b64encode
++
++import pytest
++
++from tests.test_utils.api_connexion_utils import create_user, delete_user
++from tests.test_utils.config import conf_vars
++
++TEST_USERNAME = "test"
++
++
++@pytest.fixture(scope="module")
++def configured_app(minimal_app_for_api):
++    app = minimal_app_for_api
++    create_user(
++        app,  # type: ignore
++        username="test",
++        role_name="Test",
++    )
++
++    yield app
++
++    delete_user(app, username="test")  # type: ignore
++
++
++class TestBase:
++    @pytest.fixture(autouse=True)
++    def setup_attrs(self, configured_app) -> None:
++        self.app = configured_app
++        self.client = self.app.test_client()  # type:ignore
++
++
++class TestLoginEndpoint(TestBase):
++    def test_user_can_login_with_basic_auth(self):
++        token = "Basic " + b64encode(b"test:test").decode()
++        self.client.post("api/v1/login", headers={"Authorization": token})
++        cookie = next(
++            (cookie for cookie in self.client.cookie_jar if cookie.name == "access_token_cookie"), None
++        )
++        assert cookie is not None
++        assert isinstance(cookie.value, str)
++
++    def test_no_authorization_header_raises(self):
++        response = self.client.post("api/v1/login")
++        assert response.status_code == 401
++
++    def test_malformed_authorization_header_fails(self):
++        token = "Basic " + b64encode(b"test").decode()
++        response = self.client.post("api/v1/login", headers={"Authorization": token})
++        assert response.status_code == 401
++
++    def test_wrong_password_or_username_fails(self):
++        token = "Basic " + b64encode(b"test:tes").decode()
++        response = self.client.post("api/v1/login", headers={"Authorization": token})
++        assert response.status_code == 401
++
++    def test_remote_auth_user_can_get_token(self):
++        self.client.post("api/v1/login", environ_overrides={'REMOTE_USER': "test"})
++        cookie = next(
++            (cookie for cookie in self.client.cookie_jar if cookie.name == "access_token_cookie"), None
++        )
++        assert cookie is not None
++        assert isinstance(cookie.value, str)
++
++    @conf_vars({("api", "disable_db_login"): "True"})
++    def test_user_cannot_login_through_db_when_db_login_is_disabled(self):
++        token = "Basic " + b64encode(b"test:test").decode()
++        with self.app.test_client() as test_client:
++            test_client.post("api/v1/login", headers={"Authorization": token})
++            cookie = next(
++                (cookie for cookie in test_client.cookie_jar if cookie.name == "access_token_cookie"), None
++            )
++        assert cookie is None
++
++    @conf_vars({("api", "disable_db_login"): "True"})
++    def test_cookie_is_set_for_remote_user_when_db_login_is_disabled(self):
++        self.client.post("api/v1/login", environ_overrides={'REMOTE_USER': "test"})
++        cookie = next(
++            (cookie for cookie in self.client.cookie_jar if cookie.name == "access_token_cookie"), None
++        )
++        assert cookie is not None
++        assert isinstance(cookie.value, str)
++
++
++class TestLogout(TestBase):
++    def test_logout_unsets_cookie(self):
++        self.client.post("api/v1/login", environ_overrides={'REMOTE_USER': "test"})
++        cookie = next(
++            (cookie for cookie in self.client.cookie_jar if cookie.name == "access_token_cookie"), None
++        )
++        assert cookie is not None
++        assert isinstance(cookie.value, str)
++        self.client.post("api/v1/logout", environ_overrides={'REMOTE_USER': "test"})
++        cookie = next(
++            (cookie for cookie in self.client.cookie_jar if cookie.name == "access_token_cookie"), None
++        )
++        assert cookie is None
+diff --git a/tests/api_connexion/test_webserver_auth.py b/tests/api_connexion/test_webserver_auth.py
+new file mode 100644
+index 0000000000000..ce6fa5ed83d19
+--- /dev/null
++++ b/tests/api_connexion/test_webserver_auth.py
+@@ -0,0 +1,143 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++import unittest
++from base64 import b64encode
++from datetime import datetime, timedelta
++
++import jwt
++from flask_jwt_extended import create_access_token
++from parameterized import parameterized
++
++from airflow.security import permissions
++from airflow.www.app import create_app
++from tests.test_utils.api_connexion_utils import assert_401, create_user, delete_user
++from tests.test_utils.config import conf_vars
++from tests.test_utils.db import clear_db_pools
++
++
++class TestWebserverAuth(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls) -> None:
++        super().setUpClass()
++        with conf_vars({("api", "auth_backend"): "tests.test_utils.remote_user_api_auth_backend"}):
++            cls.app = create_app(testing=True)
++        cls.appbuilder = cls.app.appbuilder  # pylint: disable=no-member
++        create_user(
++            cls.app,  # type: ignore
++            username="test",
++            role_name="test",
++            permissions=[(permissions.ACTION_CAN_READ, permissions.RESOURCE_POOL)],
++        )
++        cls.tester = cls.appbuilder.sm.find_user(username="test")
++
++    @classmethod
++    def tearDownClass(cls) -> None:
++        delete_user(cls.app, username="test")  # type: ignore
++
++    def setUp(self) -> None:
++        self.client = self.app.test_client()
++        clear_db_pools()
++
++    def test_basic_auth_can_get_token(self):
++        # For most users that would use username and password especially in local
++        # deployment, we check that on a successful login, a token is generated
++        token = "Basic " + b64encode(b"test:test").decode()
++        with self.app.test_client() as test_client:
++            test_client.post("api/v1/login", headers={"Authorization": token})
++            cookie = next(
++                (cookie for cookie in test_client.cookie_jar if cookie.name == "access_token_cookie"), None
++            )
++        assert isinstance(cookie.value, str)
++
++    def test_token_in_cookie_can_view_endpoints(self):
++        with self.app.app_context():
++            token = create_access_token(self.tester.id)
++            self.client.set_cookie("localhost", 'access_token_cookie', token)
++            response = self.client.get("/api/v1/pools")
++        assert response.status_code == 200
++        assert response.json == {
++            "pools": [
++                {
++                    "name": "default_pool",
++                    "slots": 128,
++                    "occupied_slots": 0,
++                    "running_slots": 0,
++                    "queued_slots": 0,
++                    "open_slots": 128,
++                },
++            ],
++            "total_entries": 1,
++        }
++
++    def test_raises_for_the_none_algorithm(self):
++        payload = {
++            'exp': datetime.utcnow() + timedelta(minutes=10),
++            'iat': datetime.utcnow(),
++            'sub': self.tester.id,
++        }
++        forgedtoken = jwt.encode(payload, key=None, algorithm=None).decode()
++        self.client.set_cookie("localhost", 'access_token_cookie', forgedtoken)
++        with self.app.test_client() as test_client:
++            response = test_client.get("/api/v1/pools")
++        assert response.status_code == 401
++
++    @parameterized.expand(
++        [
++            ("basic",),
++            ("basic ",),
++            ("bearer",),
++            ("test:test",),
++            (b64encode(b"test:test").decode(),),
++            ("bearer ",),
++            ("basic: ",),
++            ("basic 123",),
++        ]
++    )
++    def test_malformed_headers(self, token):
++        with self.app.test_client() as test_client:
++            response = test_client.get("/api/v1/pools", headers={"Authorization": token})
++            assert response.status_code == 401
++            assert response.headers["Content-Type"] == "application/problem+json"
++            assert_401(response)
++
++    @parameterized.expand(
++        [
++            ("bearer " + b64encode(b"test").decode(),),
++            ("basic " + b64encode(b"test:").decode(),),
++            ("bearer " + b64encode(b"test:123").decode(),),
++            ("basic " + b64encode(b"test test").decode(),),
++        ]
++    )
++    def test_invalid_auth_header(self, token):
++        with self.app.test_client() as test_client:
++            response = test_client.get("/api/v1/pools", headers={"Authorization": token})
++            assert response.status_code == 401
++            assert response.headers["Content-Type"] == "application/problem+json"
++            assert_401(response)
++
++    @parameterized.expand(
++        [("access_token_cookies"), ("access_token_cook"), ("access_token"), ("csrf_access_token")]
++    )
++    def test_invalid_cookie_name_fails(self, name):
++        with self.app.app_context():
++            token = create_access_token(self.tester.id)
++            self.client.set_cookie("localhost", name, token)
++            response = self.client.get("/api/v1/pools")
++        assert response.status_code == 401
++        assert response.headers["Content-Type"] == "application/problem+json"
++        assert_401(response)

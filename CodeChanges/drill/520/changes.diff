@@ -1,0 +1,778 @@
+diff --git a/common/src/main/java/org/apache/drill/common/config/DrillProperties.java b/common/src/main/java/org/apache/drill/common/config/DrillProperties.java
+index ba63349084d..c7e6e298f7d 100644
+--- a/common/src/main/java/org/apache/drill/common/config/DrillProperties.java
++++ b/common/src/main/java/org/apache/drill/common/config/DrillProperties.java
+@@ -63,6 +63,8 @@ public final class DrillProperties extends Properties {
+   // Subject's credentials set
+   public static final String KERBEROS_FROM_SUBJECT = "from_subject";
+ 
++  public static final String QUOTING_IDENTIFIERS = "quoting_identifiers";
++
+   // Although all properties from the application are sent to the server (from the client), the following
+   // sets of properties are used by the client and server respectively. These are reserved words.
+ 
+@@ -77,7 +79,8 @@ public final class DrillProperties extends Properties {
+   public static final ImmutableSet<String> ACCEPTED_BY_SERVER = ImmutableSet.of(
+       USER /** deprecated */, PASSWORD /** deprecated */,
+       SCHEMA,
+-      IMPERSONATION_TARGET
++      IMPERSONATION_TARGET,
++      QUOTING_IDENTIFIERS
+   );
+ 
+   private DrillProperties() {
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/client/DrillClient.java b/exec/java-exec/src/main/java/org/apache/drill/exec/client/DrillClient.java
+index 0ff6a5bc9a8..9fbbfddafd4 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/client/DrillClient.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/client/DrillClient.java
+@@ -527,7 +527,7 @@ public DrillRpcFuture<GetServerMetaResp> getServerMeta() {
+   /**
+    * Returns the list of methods supported by the server based on its advertised information.
+    *
+-   * @return a immutable set of capabilities
++   * @return an immutable set of capabilities
+    */
+   public Set<ServerMethod> getSupportedMethods() {
+     return client != null ? ServerMethod.getSupportedMethods(client.getSupportedMethods(), client.getServerInfos()) : null;
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/physical/PlannerSettings.java b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/physical/PlannerSettings.java
+index b3dc7d63177..da5bc41f0ac 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/physical/PlannerSettings.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/physical/PlannerSettings.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -17,13 +17,14 @@
+  */
+ package org.apache.drill.exec.planner.physical;
+ 
++import org.apache.calcite.avatica.util.Quoting;
++import org.apache.drill.common.exceptions.UserException;
+ import org.apache.drill.exec.ExecConstants;
+ import org.apache.drill.exec.expr.fn.FunctionImplementationRegistry;
+-import org.apache.drill.exec.ops.QueryContext;
+ import org.apache.drill.exec.server.options.OptionManager;
+ import org.apache.drill.exec.server.options.OptionValidator;
+-import org.apache.drill.exec.server.options.TypeValidators;
+ import org.apache.drill.exec.server.options.TypeValidators.BooleanValidator;
++import org.apache.drill.exec.server.options.TypeValidators.EnumeratedStringValidator;
+ import org.apache.drill.exec.server.options.TypeValidators.LongValidator;
+ import org.apache.drill.exec.server.options.TypeValidators.DoubleValidator;
+ import org.apache.drill.exec.server.options.TypeValidators.PositiveLongValidator;
+@@ -105,6 +106,9 @@ public class PlannerSettings implements Context{
+   public static final PositiveLongValidator PARQUET_ROWGROUP_FILTER_PUSHDOWN_PLANNING_THRESHOLD = new PositiveLongValidator(PARQUET_ROWGROUP_FILTER_PUSHDOWN_PLANNING_THRESHOLD_KEY,
+       Long.MAX_VALUE, 10000);
+ 
++  public static final String QUOTING_IDENTIFIERS_KEY = "planner.parser.quoting_identifiers";
++  public static final EnumeratedStringValidator QUOTING_IDENTIFIERS = new EnumeratedStringValidator(
++      QUOTING_IDENTIFIERS_KEY, Quoting.BACK_TICK.string, Quoting.DOUBLE_QUOTE.string, Quoting.BRACKET.string);
+ 
+   public OptionManager options = null;
+   public FunctionImplementationRegistry functionImplementationRegistry = null;
+@@ -262,6 +266,22 @@ public long getParquetRowGroupFilterPushDownThreshold() {
+     return options.getOption(PARQUET_ROWGROUP_FILTER_PUSHDOWN_PLANNING_THRESHOLD);
+   }
+ 
++  /**
++   * @return Quoting enum for current quoting identifiers character
++   */
++  public Quoting getQuotingIdentifiers() {
++    String quotingIdentifiersCharacter = options.getOption(QUOTING_IDENTIFIERS);
++    for (Quoting value : Quoting.values()) {
++      if (value.string.equals(quotingIdentifiersCharacter)) {
++        return value;
++      }
++    }
++    // this is never reached
++    throw UserException.validationError()
++        .message("Unknown quoting identifier character '%s'", quotingIdentifiersCharacter)
++        .build(logger);
++  }
++
+   @Override
+   public <T> T unwrap(Class<T> clazz) {
+     if(clazz == PlannerSettings.class){
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/DrillParserConfig.java b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/DrillParserConfig.java
+index 7e7b1404bdd..d8441aeaa97 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/DrillParserConfig.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/DrillParserConfig.java
+@@ -27,9 +27,11 @@
+ public class DrillParserConfig implements SqlParser.Config {
+ 
+   private final long identifierMaxLength;
++  private final Quoting quotingIdentifiers;
+ 
+   public DrillParserConfig(PlannerSettings settings) {
+     identifierMaxLength = settings.getIdentifierMaxLength();
++    quotingIdentifiers = settings.getQuotingIdentifiers();
+   }
+ 
+   @Override
+@@ -49,7 +51,7 @@ public Casing unquotedCasing() {
+ 
+   @Override
+   public Quoting quoting() {
+-    return Quoting.BACK_TICK;
++    return quotingIdentifiers;
+   }
+ 
+   @Override
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/rpc/user/UserSession.java b/exec/java-exec/src/main/java/org/apache/drill/exec/rpc/user/UserSession.java
+index 6d74c1ddff8..fc647c8c1da 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/rpc/user/UserSession.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/rpc/user/UserSession.java
+@@ -34,14 +34,17 @@
+ import org.apache.calcite.tools.ValidationException;
+ import org.apache.drill.common.config.DrillConfig;
+ import org.apache.drill.common.config.DrillProperties;
++import org.apache.drill.exec.planner.physical.PlannerSettings;
+ import org.apache.drill.exec.planner.sql.SchemaUtilites;
+ import org.apache.drill.exec.planner.sql.handlers.SqlHandlerUtil;
+ import org.apache.drill.exec.proto.UserBitShared.UserCredentials;
+ import org.apache.drill.exec.proto.UserProtos.UserProperties;
+ import org.apache.drill.exec.server.options.OptionManager;
++import org.apache.drill.exec.server.options.OptionValue;
+ import org.apache.drill.exec.server.options.SessionOptionManager;
+ 
+ import com.google.common.collect.Maps;
++import org.apache.drill.exec.server.options.SystemOptionManager;
+ import org.apache.drill.exec.store.AbstractSchema;
+ import org.apache.drill.exec.store.StorageStrategy;
+ import org.apache.drill.exec.store.dfs.DrillFileSystem;
+@@ -52,11 +55,6 @@
+ public class UserSession implements AutoCloseable {
+   private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(UserSession.class);
+ 
+-  public static final String SCHEMA = "schema";
+-  public static final String USER = "user";
+-  public static final String PASSWORD = "password";
+-  public static final String IMPERSONATION_TARGET = "impersonation_target";
+-
+   private boolean supportComplexTypes = false;
+   private UserCredentials credentials;
+   private DrillProperties properties;
+@@ -125,6 +123,15 @@ public Builder setSupportComplexTypes(boolean supportComplexTypes) {
+     }
+ 
+     public UserSession build() {
++      if (userSession.properties.containsKey(DrillProperties.QUOTING_IDENTIFIERS)) {
++        if (userSession.sessionOptions != null) {
++          userSession.setSessionOption(PlannerSettings.QUOTING_IDENTIFIERS_KEY,
++              userSession.properties.getProperty(DrillProperties.QUOTING_IDENTIFIERS));
++        } else {
++          logger.warn("User property {} can't be installed as a server option without the session option manager",
++              DrillProperties.QUOTING_IDENTIFIERS);
++        }
++      }
+       UserSession session = userSession;
+       userSession = null;
+       return session;
+@@ -232,8 +239,17 @@ public SchemaPlus getDefaultSchema(SchemaPlus rootSchema) {
+     return SchemaUtilites.findSchema(rootSchema, defaultSchemaPath);
+   }
+ 
+-  public boolean setSessionOption(String name, String value) {
+-    return true;
++  /**
++   * Set the option of a session level.
++   * Note: Option's kind is automatically detected if such option exists.
++   *
++   * @param name option name
++   * @param value option value
++   */
++  public void setSessionOption(String name, String value) {
++    OptionValue.Kind optionKind = SystemOptionManager.getValidator(name).getKind();
++    OptionValue optionValue = OptionValue.createOption(optionKind, OptionValue.OptionType.SESSION, name, value);
++    sessionOptions.setOption(optionValue);
+   }
+ 
+   /**
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValidator.java b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValidator.java
+index 82f4ab9ccae..5ab964434cf 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValidator.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValidator.java
+@@ -1,4 +1,4 @@
+-/*******************************************************************************
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -14,10 +14,11 @@
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+- ******************************************************************************/
++ */
+ package org.apache.drill.exec.server.options;
+ 
+ import org.apache.drill.common.exceptions.UserException;
++import org.apache.drill.exec.server.options.OptionValue.Kind;
+ 
+ /**
+  * Validates the values provided to Drill options.
+@@ -98,4 +99,11 @@ public boolean isAdminOption() {
+    */
+   public abstract void validate(OptionValue value, OptionManager manager);
+ 
++  /**
++   * Gets the kind of this option value for this validator.
++   *
++   * @return kind of this option value
++   */
++  public abstract Kind getKind();
++
+ }
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValue.java b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValue.java
+index 96fdf0c2c8b..1f572f9c081 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValue.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/OptionValue.java
+@@ -200,6 +200,6 @@ public int compareTo(OptionValue o) {
+ 
+   @Override
+   public String toString() {
+-    return "OptionValue [type=" + type + ", name=" + name + ", value=" + getValue() + "]";
++    return "OptionValue [ type=" + type + ", name=" + name + ", value=" + getValue() + " ]";
+   }
+ }
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/SystemOptionManager.java b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/SystemOptionManager.java
+index fa73e06cd3f..09c52592930 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/SystemOptionManager.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/SystemOptionManager.java
+@@ -91,6 +91,7 @@ public class SystemOptionManager extends BaseOptionManager implements AutoClosea
+       PlannerSettings.UNIONALL_DISTRIBUTE,
+       PlannerSettings.PARQUET_ROWGROUP_FILTER_PUSHDOWN_PLANNING,
+       PlannerSettings.PARQUET_ROWGROUP_FILTER_PUSHDOWN_PLANNING_THRESHOLD,
++      PlannerSettings.QUOTING_IDENTIFIERS,
+       ExecConstants.CAST_TO_NULLABLE_NUMERIC_OPTION,
+       ExecConstants.OUTPUT_FORMAT_VALIDATOR,
+       ExecConstants.PARQUET_BLOCK_SIZE_VALIDATOR,
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/TypeValidators.java b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/TypeValidators.java
+index b4074abde95..de960f30500 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/TypeValidators.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/server/options/TypeValidators.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -17,9 +17,9 @@
+  */
+ package org.apache.drill.exec.server.options;
+ 
+-import java.util.HashSet;
+ import java.util.Set;
+ 
++import com.google.common.collect.Sets;
+ import org.apache.drill.common.exceptions.UserException;
+ import org.apache.drill.exec.server.options.OptionValue.Kind;
+ import org.apache.drill.exec.server.options.OptionValue.OptionType;
+@@ -204,10 +204,11 @@ public void validate(final OptionValue v, final OptionManager manager) {
+    * Validator that checks if the given value is included in a list of acceptable values. Case insensitive.
+    */
+   public static class EnumeratedStringValidator extends StringValidator {
+-    private final Set<String> valuesSet = new HashSet<>();
++    private final Set<String> valuesSet = Sets.newLinkedHashSet();
+ 
+     public EnumeratedStringValidator(String name, String def, String... values) {
+       super(name, def);
++      valuesSet.add(def.toLowerCase());
+       for (String value : values) {
+         valuesSet.add(value.toLowerCase());
+       }
+@@ -258,5 +259,10 @@ public void validate(final OptionValue v, final OptionManager manager) {
+             .build(logger);
+       }
+     }
++
++    @Override
++    public Kind getKind() {
++      return kind;
++    }
+   }
+ }
+diff --git a/exec/java-exec/src/test/java/org/apache/drill/BaseTestQuery.java b/exec/java-exec/src/test/java/org/apache/drill/BaseTestQuery.java
+index 19ed5e919e1..4401b9f6bf9 100644
+--- a/exec/java-exec/src/test/java/org/apache/drill/BaseTestQuery.java
++++ b/exec/java-exec/src/test/java/org/apache/drill/BaseTestQuery.java
+@@ -32,6 +32,7 @@
+ 
+ import org.apache.drill.DrillTestWrapper.TestServices;
+ import org.apache.drill.common.config.DrillConfig;
++import org.apache.drill.common.config.DrillProperties;
+ import org.apache.drill.common.exceptions.UserException;
+ import org.apache.drill.common.scanner.ClassPathScanner;
+ import org.apache.drill.common.scanner.persistence.ScanResult;
+@@ -51,7 +52,6 @@
+ import org.apache.drill.exec.rpc.user.AwaitableUserResultsListener;
+ import org.apache.drill.exec.rpc.user.QueryDataBatch;
+ import org.apache.drill.exec.rpc.user.UserResultsListener;
+-import org.apache.drill.exec.rpc.user.UserSession;
+ import org.apache.drill.exec.server.Drillbit;
+ import org.apache.drill.exec.server.DrillbitContext;
+ import org.apache.drill.exec.server.RemoteServiceSet;
+@@ -237,9 +237,9 @@ public static void updateClient(String user) throws Exception {
+    */
+   public static void updateClient(final String user, final String password) throws Exception {
+     final Properties props = new Properties();
+-    props.setProperty(UserSession.USER, user);
++    props.setProperty(DrillProperties.USER, user);
+     if (password != null) {
+-      props.setProperty(UserSession.PASSWORD, password);
++      props.setProperty(DrillProperties.PASSWORD, password);
+     }
+     updateClient(props);
+   }
+diff --git a/exec/java-exec/src/test/java/org/apache/drill/exec/impersonation/TestInboundImpersonation.java b/exec/java-exec/src/test/java/org/apache/drill/exec/impersonation/TestInboundImpersonation.java
+index df33f2b5bfd..199747074a5 100644
+--- a/exec/java-exec/src/test/java/org/apache/drill/exec/impersonation/TestInboundImpersonation.java
++++ b/exec/java-exec/src/test/java/org/apache/drill/exec/impersonation/TestInboundImpersonation.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -25,7 +25,6 @@
+ import org.apache.drill.exec.dotdrill.DotDrillType;
+ import org.apache.drill.exec.proto.UserBitShared;
+ import org.apache.drill.exec.rpc.RpcException;
+-import org.apache.drill.exec.rpc.user.UserSession;
+ import org.apache.drill.exec.rpc.user.security.testing.UserAuthenticatorTestImpl;
+ import org.apache.drill.exec.store.dfs.WorkspaceConfig;
+ import org.apache.drill.test.UserExceptionMatcher;
+@@ -128,9 +127,9 @@ public void selectChainedView() throws Exception {
+     // Connect as PROXY_NAME and query for IMPERSONATION_TARGET
+     // data belongs to OWNER, however a view is shared with IMPERSONATION_TARGET
+     final Properties connectionProps = new Properties();
+-    connectionProps.setProperty(UserSession.USER, PROXY_NAME);
+-    connectionProps.setProperty(UserSession.PASSWORD, PROXY_PASSWORD);
+-    connectionProps.setProperty(UserSession.IMPERSONATION_TARGET, TARGET_NAME);
++    connectionProps.setProperty(DrillProperties.USER, PROXY_NAME);
++    connectionProps.setProperty(DrillProperties.PASSWORD, PROXY_PASSWORD);
++    connectionProps.setProperty(DrillProperties.IMPERSONATION_TARGET, TARGET_NAME);
+     updateClient(connectionProps);
+ 
+     testBuilder()
+@@ -146,9 +145,9 @@ public void selectChainedView() throws Exception {
+   public void unauthorizedTarget() throws Exception {
+     final String unauthorizedTarget = org2Users[0];
+     final Properties connectionProps = new Properties();
+-    connectionProps.setProperty(UserSession.USER, PROXY_NAME);
+-    connectionProps.setProperty(UserSession.PASSWORD, PROXY_PASSWORD);
+-    connectionProps.setProperty(UserSession.IMPERSONATION_TARGET, unauthorizedTarget);
++    connectionProps.setProperty(DrillProperties.USER, PROXY_NAME);
++    connectionProps.setProperty(DrillProperties.PASSWORD, PROXY_PASSWORD);
++    connectionProps.setProperty(DrillProperties.IMPERSONATION_TARGET, unauthorizedTarget);
+     updateClient(connectionProps); // throws up
+   }
+ 
+diff --git a/exec/java-exec/src/test/java/org/apache/drill/exec/planner/sql/TestDrillSQLWorker.java b/exec/java-exec/src/test/java/org/apache/drill/exec/planner/sql/TestDrillSQLWorker.java
+index 3d85e2ea531..3a6a7ded044 100644
+--- a/exec/java-exec/src/test/java/org/apache/drill/exec/planner/sql/TestDrillSQLWorker.java
++++ b/exec/java-exec/src/test/java/org/apache/drill/exec/planner/sql/TestDrillSQLWorker.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -19,10 +19,13 @@
+ 
+ import static org.junit.Assert.assertEquals;
+ 
++import org.apache.calcite.avatica.util.Quoting;
+ import org.apache.calcite.sql.parser.SqlParserPos;
++import org.apache.drill.BaseTestQuery;
++import org.apache.drill.exec.planner.physical.PlannerSettings;
+ import org.junit.Test;
+ 
+-public class TestDrillSQLWorker {
++public class TestDrillSQLWorker extends BaseTestQuery {
+ 
+   private void validateFormattedIs(String sql, SqlParserPos pos, String expected) {
+     String formatted = SqlConverter.formatSQLParsingError(sql, pos);
+@@ -48,4 +51,42 @@ public void testErrorFormating() {
+     validateFormattedIs(sql, new SqlParserPos(0, 10), sql);
+     validateFormattedIs(sql, new SqlParserPos(100, 10), sql);
+   }
++
++  @Test
++  public void testDoubleQuotesForQuotingIdentifiers() throws Exception {
++    try {
++      test("ALTER SESSION SET `%s` = '%s'", PlannerSettings.QUOTING_IDENTIFIERS_KEY,
++          Quoting.DOUBLE_QUOTE.string);
++      testBuilder()
++          .sqlQuery("select \"employee_id\", \"full_name\" from cp.\"employee.json\" limit 1")
++          .ordered()
++          .baselineColumns("employee_id", "full_name")
++          .baselineValues(1L, "Sheri Nowmer")
++          .go();
++
++      // Other quoting characters are not acceptable while particular one is chosen,
++      // since calcite doesn't support parsing sql statements with several quoting identifiers characters
++      errorMsgTestHelper("select `employee_id`, `full_name` from cp.`employee.json` limit 1", "Encountered: \"`\"");
++      // Mix of different quotes in the one SQL statement is not acceptable
++      errorMsgTestHelper("select \"employee_id\", \"full_name\" from cp.`employee.json` limit 1", "Encountered: \"`\"");
++    } finally {
++      test("ALTER SESSION RESET %s", PlannerSettings.QUOTING_IDENTIFIERS_KEY);
++    }
++  }
++
++  @Test
++  public void testBracketsForQuotingIdentifiers() throws Exception {
++    try {
++      test("ALTER SESSION SET `%s` = '%s'", PlannerSettings.QUOTING_IDENTIFIERS_KEY,
++          Quoting.BRACKET.string);
++      testBuilder()
++          .sqlQuery("select [employee_id], [full_name] from cp.[employee.json] limit 1")
++          .ordered()
++          .baselineColumns("employee_id", "full_name")
++          .baselineValues(1L, "Sheri Nowmer")
++          .go();
++    } finally {
++      test("ALTER SESSION RESET %s", PlannerSettings.QUOTING_IDENTIFIERS_KEY);
++    }
++  }
+ }
+diff --git a/exec/jdbc-all/pom.xml b/exec/jdbc-all/pom.xml
+index a3957159bc6..1b015e98e1b 100644
+--- a/exec/jdbc-all/pom.xml
++++ b/exec/jdbc-all/pom.xml
+@@ -279,7 +279,6 @@
+               <exclude>com.googlecode.json-simple:*</exclude>
+               <exclude>dom4j:*</exclude>
+               <exclude>org.hibernate:*</exclude>
+-              <exclude>javax.validation:*</exclude>
+               <exclude>antlr:*</exclude>
+               <exclude>org.ow2.asm:*</exclude>
+               <exclude>com.univocity:*</exclude>
+@@ -391,7 +390,13 @@
+                <exclude>**/*.SF</exclude>
+                <exclude>**/*.RSA</exclude>
+                <exclude>**/*.DSA</exclude>
+-               <exclude>javax/**</exclude>
++               <exclude>javax/*</exclude>
++               <exclude>javax/activation/**</exclude>
++               <exclude>javax/annotation-api/**</exclude>
++               <exclude>javax/inject/**</exclude>
++               <exclude>javax/servlet-api/**</exclude>
++               <exclude>javax/json/**</exclude>
++               <exclude>javax/ws/**</exclude>
+                <exclude>rest/**</exclude>
+                <exclude>*.tokens</exclude>
+                <exclude>codegen/**</exclude>
+diff --git a/exec/jdbc/pom.xml b/exec/jdbc/pom.xml
+index 9e4e4118fe9..cb0c517e8ca 100644
+--- a/exec/jdbc/pom.xml
++++ b/exec/jdbc/pom.xml
+@@ -95,6 +95,11 @@
+       <groupId>xalan</groupId>
+       <artifactId>xalan</artifactId>
+     </dependency>
++    <dependency>
++      <groupId>javax.validation</groupId>
++      <artifactId>validation-api</artifactId>
++      <version>1.1.0.Final</version>
++    </dependency>
+   </dependencies>
+ 
+   <build>
+diff --git a/exec/jdbc/src/main/java/org/apache/drill/jdbc/DrillDatabaseMetaData.java b/exec/jdbc/src/main/java/org/apache/drill/jdbc/DrillDatabaseMetaData.java
+index 64908d017b7..81027c6e195 100644
+--- a/exec/jdbc/src/main/java/org/apache/drill/jdbc/DrillDatabaseMetaData.java
++++ b/exec/jdbc/src/main/java/org/apache/drill/jdbc/DrillDatabaseMetaData.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF); under one or more
+  * contributor license agreements.  See the NOTICE file distributed with this
+  * work for additional information regarding copyright ownership.  The ASF
+@@ -19,6 +19,7 @@
+ import java.sql.DatabaseMetaData;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
++import org.apache.calcite.avatica.util.Quoting;
+ 
+ 
+ /**
+@@ -80,13 +81,16 @@ public interface DrillDatabaseMetaData extends DatabaseMetaData {
+   //  storesLowerCaseQuotedIdentifiers()
+   //  storesMixedCaseQuotedIdentifiers()
+ 
+-
+-  // TODO(DRILL-3510):  Update when Drill accepts standard SQL's double quote.
+   /**
+    * <strong>Drill</strong>:
+-   * Reports that the SQL identifier quoting character is the back-quote
+-   * character ("{@code `}"; Unicode U+0060; "GRAVE ACCENT").
+-   * @return "{@code `}"
++   * Reports current SQL identifier quoting character.
++   *  <li>{@link Quoting#BACK_TICK} - default back-quote character ("{@code `}"; Unicode U+0060; "GRAVE ACCENT") </li>
++   *  <li>{@link Quoting#DOUBLE_QUOTE} - double quote character ("{@code "}"; Unicode U+0022; 'QUOTATION MARK')</li>
++   *  <li>{@link Quoting#BRACKET} - brackets characters ("{@code [}"; Unicode U+005B; 'LEFT SQUARE BRACKET' and
++   *  "{@code ]}"; Unicode U+005D; 'RIGHT SQUARE BRACKET')</li>
++   *
++   * @return current SQL identifier quoting character. Note: 'LEFT SQUARE BRACKET' is returned,
++   *         when {@link Quoting#BRACKET} is set.
+    */
+   @Override
+   String getIdentifierQuoteString() throws SQLException;
+diff --git a/exec/jdbc/src/main/java/org/apache/drill/jdbc/impl/DrillDatabaseMetaDataImpl.java b/exec/jdbc/src/main/java/org/apache/drill/jdbc/impl/DrillDatabaseMetaDataImpl.java
+index 14ffe5f9f6d..b0763852317 100644
+--- a/exec/jdbc/src/main/java/org/apache/drill/jdbc/impl/DrillDatabaseMetaDataImpl.java
++++ b/exec/jdbc/src/main/java/org/apache/drill/jdbc/impl/DrillDatabaseMetaDataImpl.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -28,6 +28,7 @@
+ import java.util.concurrent.ExecutionException;
+ 
+ import org.apache.calcite.avatica.AvaticaDatabaseMetaData;
++import org.apache.calcite.avatica.util.Quoting;
+ import org.apache.drill.common.Version;
+ import org.apache.drill.common.exceptions.DrillRuntimeException;
+ import org.apache.drill.common.types.TypeProtos.MinorType;
+@@ -397,12 +398,11 @@ public boolean storesMixedCaseQuotedIdentifiers() throws SQLException {
+     return getServerMeta().getQuotedIdentifierCasing() == IdentifierCasing.IC_STORES_MIXED;
+   }
+ 
+-  // TODO(DRILL-3510):  Update when Drill accepts standard SQL's double quote.
+   @Override
+   public String getIdentifierQuoteString() throws SQLException {
+     throwIfClosed();
+     if (!getServerMetaSupported()) {
+-      return "`";
++      return Quoting.BACK_TICK.string;
+     }
+     return getServerMeta().getIdentifierQuoteString();
+   }
+diff --git a/exec/jdbc/src/test/java/org/apache/drill/jdbc/ConnectionFactory.java b/exec/jdbc/src/test/java/org/apache/drill/jdbc/ConnectionFactory.java
+index 09366dee7df..07e021ebd98 100644
+--- a/exec/jdbc/src/test/java/org/apache/drill/jdbc/ConnectionFactory.java
++++ b/exec/jdbc/src/test/java/org/apache/drill/jdbc/ConnectionFactory.java
+@@ -18,6 +18,7 @@
+ package org.apache.drill.jdbc;
+ 
+ import java.sql.Connection;
++import java.sql.SQLException;
+ 
+ /**
+  * A factory used to get open {@link Connection} instances.
+@@ -31,5 +32,5 @@ public interface ConnectionFactory {
+    * @param info the connection parameters
+    * @throws Exception if factory fails to get a connection.
+    */
+-  Connection getConnection(ConnectionInfo info) throws Exception;
++  Connection getConnection(ConnectionInfo info) throws SQLException;
+ }
+diff --git a/exec/jdbc/src/test/java/org/apache/drill/jdbc/ConnectionInfoTest.java b/exec/jdbc/src/test/java/org/apache/drill/jdbc/ConnectionInfoTest.java
+new file mode 100644
+index 00000000000..ac6d309aac5
+--- /dev/null
++++ b/exec/jdbc/src/test/java/org/apache/drill/jdbc/ConnectionInfoTest.java
+@@ -0,0 +1,70 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.drill.jdbc;
++
++import org.apache.calcite.avatica.util.Quoting;
++import org.junit.Test;
++
++import java.sql.Connection;
++import java.sql.DatabaseMetaData;
++import java.sql.SQLException;
++
++import static org.hamcrest.CoreMatchers.containsString;
++import static org.hamcrest.CoreMatchers.equalTo;
++import static org.junit.Assert.assertThat;
++
++/**
++ * Test for Drill's Properties in the JDBC URL connection string
++ */
++public class ConnectionInfoTest extends JdbcTestBase {
++  private static Connection connection;
++  private static DatabaseMetaData dbmd;
++
++  @Test
++  public void testQuotingIdentifiersProperty() throws SQLException {
++    try {
++      // Test DoubleQuotes for the DrillProperty#QUOTING_IDENTIFIERS in connection URL
++      connection = connect("jdbc:drill:zk=local;quoting_identifiers='\"'");
++      dbmd = connection.getMetaData();
++      assertThat(dbmd.getIdentifierQuoteString(), equalTo(Quoting.DOUBLE_QUOTE.string));
++      reset();
++
++      // Test Brackets for the DrillProperty#QUOTING_IDENTIFIERS in connection URL
++      connection = connect("jdbc:drill:zk=local;quoting_identifiers=[");
++      dbmd = connection.getMetaData();
++      assertThat(dbmd.getIdentifierQuoteString(), equalTo(Quoting.BRACKET.string));
++    } finally {
++      reset();
++    }
++  }
++
++  @Test(expected = SQLException.class)
++  public void testIncorrectCharacterForQuotingIdentifiers() throws SQLException {
++    try {
++      connection = connect("jdbc:drill:zk=local;quoting_identifiers=&");
++    }
++    catch (SQLException e) {
++      // Check exception text message
++      assertThat(e.getMessage(), containsString("Option planner.parser.quoting_identifiers " +
++          "must be one of: [`, \", []"));
++      throw e;
++    } finally {
++      reset();
++    }
++  }
++}
+diff --git a/exec/jdbc/src/test/java/org/apache/drill/jdbc/DatabaseMetaDataTest.java b/exec/jdbc/src/test/java/org/apache/drill/jdbc/DatabaseMetaDataTest.java
+index 0ec5c8ba3e6..ec04ab1666c 100644
+--- a/exec/jdbc/src/test/java/org/apache/drill/jdbc/DatabaseMetaDataTest.java
++++ b/exec/jdbc/src/test/java/org/apache/drill/jdbc/DatabaseMetaDataTest.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -28,6 +28,7 @@
+ import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.assertTrue;
+ 
++import org.apache.calcite.avatica.util.Quoting;
+ import java.sql.Connection;
+ import java.sql.DatabaseMetaData;
+ import java.sql.SQLException;
+@@ -103,10 +104,12 @@ public void testNullsAreSortedMethodsSaySortedHigh() throws SQLException {
+   //  storesMixedCaseQuotedIdentifiers()
+ 
+ 
+-  // TODO(DRILL-3510):  Update when Drill accepts standard SQL's double quote.
++  // TODO(DRILL-5402): Update when server meta information will be updated during one session.
+   @Test
+-  public void testGetIdentifierQuoteStringSaysBackquote() throws SQLException {
+-    assertThat( dbmd.getIdentifierQuoteString(), equalTo( "`" ) );
++  public void testGetIdentifierQuoteString() throws SQLException {
++    // If connection string hasn't "quoting_identifiers" property, this method will return current system
++    // "planner.parser.quoting_identifiers" option (back tick by default)
++    assertThat(dbmd.getIdentifierQuoteString(), equalTo(Quoting.BACK_TICK.string));
+   }
+ 
+ 
+diff --git a/exec/jdbc/src/test/java/org/apache/drill/jdbc/JdbcTestBase.java b/exec/jdbc/src/test/java/org/apache/drill/jdbc/JdbcTestBase.java
+index b9e83927d3d..52777c1c389 100644
+--- a/exec/jdbc/src/test/java/org/apache/drill/jdbc/JdbcTestBase.java
++++ b/exec/jdbc/src/test/java/org/apache/drill/jdbc/JdbcTestBase.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -60,8 +60,7 @@ protected void failed(Throwable e, Description description) {
+   public static void setUpTestCase() {
+     factory = new SingleConnectionCachingFactory(new ConnectionFactory() {
+       @Override
+-      public Connection getConnection(ConnectionInfo info) throws Exception {
+-        Class.forName("org.apache.drill.jdbc.Driver");
++      public Connection getConnection(ConnectionInfo info) throws SQLException {
+         return DriverManager.getConnection(info.getUrl(), info.getParamsAsProperties());
+       }
+     });
+@@ -73,7 +72,7 @@ public Connection getConnection(ConnectionInfo info) throws Exception {
+    * @param url connection URL
+    * @throws Exception if connection fails
+    */
+-  protected static Connection connect(String url) throws Exception {
++  protected static Connection connect(String url) throws SQLException {
+     return connect(url, JdbcAssert.getDefaultProperties());
+   }
+ 
+@@ -84,7 +83,7 @@ protected static Connection connect(String url) throws Exception {
+    * @param info connection info
+    * @throws Exception if connection fails
+    */
+-  protected static Connection connect(String url, Properties info) throws Exception {
++  protected static Connection connect(String url, Properties info) throws SQLException {
+     final Connection conn = factory.getConnection(new ConnectionInfo(url, info));
+     changeSchemaIfSupplied(conn, info);
+     return conn;
+diff --git a/exec/jdbc/src/test/java/org/apache/drill/jdbc/MultiConnectionCachingFactory.java b/exec/jdbc/src/test/java/org/apache/drill/jdbc/MultiConnectionCachingFactory.java
+index 063b5a57d45..7a99ddf7613 100644
+--- a/exec/jdbc/src/test/java/org/apache/drill/jdbc/MultiConnectionCachingFactory.java
++++ b/exec/jdbc/src/test/java/org/apache/drill/jdbc/MultiConnectionCachingFactory.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -45,7 +45,7 @@ public MultiConnectionCachingFactory(ConnectionFactory delegate) {
+    * {@link java.sql.Connection#close()}. Consumer must call {#close} to close the cached connections.
+    */
+   @Override
+-  public Connection getConnection(ConnectionInfo info) throws Exception {
++  public Connection getConnection(ConnectionInfo info) throws SQLException {
+     Connection conn = cache.get(info);
+     if (conn == null) {
+       conn = delegate.getConnection(info);
+diff --git a/exec/jdbc/src/test/java/org/apache/drill/jdbc/SingleConnectionCachingFactory.java b/exec/jdbc/src/test/java/org/apache/drill/jdbc/SingleConnectionCachingFactory.java
+index 6466137a8fb..f23fac814fc 100644
+--- a/exec/jdbc/src/test/java/org/apache/drill/jdbc/SingleConnectionCachingFactory.java
++++ b/exec/jdbc/src/test/java/org/apache/drill/jdbc/SingleConnectionCachingFactory.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -45,7 +45,7 @@ public SingleConnectionCachingFactory(ConnectionFactory delegate) {
+    * </p>
+    */
+   @Override
+-  public Connection getConnection(ConnectionInfo info) throws Exception {
++  public Connection getConnection(ConnectionInfo info) throws SQLException {
+     if (connection == null) {
+       connection = delegate.getConnection(info);
+     } else {
+diff --git a/exec/jdbc/src/test/java/org/apache/drill/jdbc/test/JdbcAssert.java b/exec/jdbc/src/test/java/org/apache/drill/jdbc/test/JdbcAssert.java
+index caa09b81c20..da66ac113a1 100644
+--- a/exec/jdbc/src/test/java/org/apache/drill/jdbc/test/JdbcAssert.java
++++ b/exec/jdbc/src/test/java/org/apache/drill/jdbc/test/JdbcAssert.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -167,7 +167,7 @@ public ModelAndSchema(final Properties info, final ConnectionFactory factory) {
+       this.info = info;
+       this.adapter = new ConnectionFactoryAdapter() {
+         @Override
+-        public Connection createConnection() throws Exception {
++        public Connection createConnection() throws SQLException {
+           return factory.getConnection(new ConnectionInfo("jdbc:drill:zk=local", ModelAndSchema.this.info));
+         }
+       };

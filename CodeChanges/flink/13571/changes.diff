@@ -1,0 +1,85 @@
+diff --git a/flink-yarn/src/main/java/org/apache/flink/yarn/YarnResourceManagerDriver.java b/flink-yarn/src/main/java/org/apache/flink/yarn/YarnResourceManagerDriver.java
+index 7dc496bcbb3c6..cdf696d43ad84 100644
+--- a/flink-yarn/src/main/java/org/apache/flink/yarn/YarnResourceManagerDriver.java
++++ b/flink-yarn/src/main/java/org/apache/flink/yarn/YarnResourceManagerDriver.java
+@@ -526,7 +526,7 @@ class YarnContainerEventHandler implements AMRMClientAsync.CallbackHandler, NMCl
+ 
+ 		@Override
+ 		public void onContainersCompleted(List<ContainerStatus> statuses) {
+-			getMainThreadExecutor().execute(() -> {
++			runAsyncWithFatalHandler(() -> {
+ 					log.debug("YARN ResourceManager reported the following containers completed: {}.", statuses);
+ 					for (final ContainerStatus containerStatus : statuses) {
+ 
+@@ -539,7 +539,7 @@ public void onContainersCompleted(List<ContainerStatus> statuses) {
+ 
+ 		@Override
+ 		public void onContainersAllocated(List<Container> containers) {
+-			getMainThreadExecutor().execute(() -> {
++			runAsyncWithFatalHandler(() -> {
+ 				log.info("Received {} containers.", containers.size());
+ 
+ 				for (Map.Entry<Resource, List<Container>> entry : groupContainerByResource(containers).entrySet()) {
+@@ -554,6 +554,16 @@ public void onContainersAllocated(List<Container> containers) {
+ 			});
+ 		}
+ 
++		private void runAsyncWithFatalHandler(Runnable runnable) {
++			getMainThreadExecutor().execute(() -> {
++				try {
++					runnable.run();
++				} catch (Throwable t) {
++					onError(t);
++				}
++			});
++		}
++
+ 		@Override
+ 		public void onShutdownRequest() {
+ 			getResourceEventHandler().onError(new ResourceManagerException(ERROR_MESSAGE_ON_SHUTDOWN_REQUEST));
+@@ -592,7 +602,7 @@ public void onContainerStopped(ContainerId containerId) {
+ 
+ 		@Override
+ 		public void onStartContainerError(ContainerId containerId, Throwable throwable) {
+-			getMainThreadExecutor().execute(() -> {
++			runAsyncWithFatalHandler(() -> {
+ 				resourceManagerClient.releaseAssignedContainer(containerId);
+ 				getResourceEventHandler().onWorkerTerminated(new ResourceID(containerId.toString()), throwable.getMessage());
+ 			});
+diff --git a/flink-yarn/src/test/java/org/apache/flink/yarn/YarnResourceManagerDriverTest.java b/flink-yarn/src/test/java/org/apache/flink/yarn/YarnResourceManagerDriverTest.java
+index bb56165229785..5d6feb5fe2b17 100644
+--- a/flink-yarn/src/test/java/org/apache/flink/yarn/YarnResourceManagerDriverTest.java
++++ b/flink-yarn/src/test/java/org/apache/flink/yarn/YarnResourceManagerDriverTest.java
+@@ -111,6 +111,32 @@ protected Context createContext() {
+ 		return new Context();
+ 	}
+ 
++	@Test
++	public void testRunAsyncCausesFatalError() throws Exception {
++		new Context() {{
++			final String exceptionMessage = "runAsyncCausesFatalError";
++			addContainerRequestFutures.add(new CompletableFuture<>());
++
++			testingYarnAMRMClientAsyncBuilder.setAddContainerRequestConsumer((ignored1, ignored2) ->
++					addContainerRequestFutures.get(addContainerRequestFuturesNumCompleted.getAndIncrement()).complete(null));
++			testingYarnAMRMClientAsyncBuilder.setGetMatchingRequestsFunction(ignored -> {
++				throw new RuntimeException(exceptionMessage);
++			});
++
++			final CompletableFuture<Throwable> throwableCompletableFuture = new CompletableFuture<>();
++			resourceEventHandlerBuilder.setOnErrorConsumer(throwableCompletableFuture::complete);
++
++			runTest(() -> {
++				runInMainThread(() -> getDriver().requestResource(testingTaskExecutorProcessSpec));
++				resourceManagerClientCallbackHandler.onContainersAllocated(ImmutableList.of(testingContainer));
++
++				Throwable t = throwableCompletableFuture.get(TIMEOUT_SEC, TimeUnit.SECONDS);
++				assertThat(ExceptionUtils.findThrowable(t, RuntimeException.class).isPresent(), is(true));
++				assertThat(ExceptionUtils.findThrowable(t, RuntimeException.class).get().getMessage(), is(exceptionMessage));
++			});
++		}};
++	}
++
+ 	@Test
+ 	public void testShutdownRequestCausesFatalError() throws Exception {
+ 		new Context() {{

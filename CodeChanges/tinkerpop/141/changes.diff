@@ -1,0 +1,185 @@
+diff --git a/CHANGELOG.asciidoc b/CHANGELOG.asciidoc
+old mode 100644
+new mode 100755
+index 5f3018a3963..e6fce8edb66
+--- a/CHANGELOG.asciidoc
++++ b/CHANGELOG.asciidoc
+@@ -29,6 +29,7 @@ TinkerPop 3.1.1 (NOT OFFICIALLY RELEASED YET)
+ * Added `explain()`-step which yields a `TraversalExplanation` with a pretty `toString()` detailing the compilation process.
+ * Fixed a traversal strategy ordering bug in `AdjacentToIncidentStrategy` and `IncidentToAdjacentStrategy`.
+ * Made a number of changes to improve traversal startup and execution performance.
++* Added support for 'gremlin.tinkergraph.graphLocation' to accept a fully qualified class name that implements Io.Builder interface
+ 
+ [[release-3.1.0-incubating]]
+ TinkerPop 3.1.0 (Release Date: November 16, 2015)
+diff --git a/docs/src/implementations.asciidoc b/docs/src/implementations.asciidoc
+old mode 100644
+new mode 100755
+index b5c2c4d0db3..1a58ef900fd
+--- a/docs/src/implementations.asciidoc
++++ b/docs/src/implementations.asciidoc
+@@ -630,7 +630,9 @@ TinkerGraph has several settings that can be provided on creation via `Configura
+ value is specified here, the the `gremlin.tinkergraph.graphFormat` should also be specified.  If this value is not
+ included (default), then the graph will stay in-memory and not be loaded/persisted to disk.
+ |gremlin.tinkergraph.graphFormat |The format to use to serialize the graph which may be one of the following:
+-`graphml`, `graphson`, or `gryo`. If a value is specified here, the the `gremlin.tinkergraph.graphLocation` should
++`graphml`, `graphson`, `gryo`, or a fully qualified class name that implements Io.Builder interface (which allows for
++external third party graph reader/writer formats to be used for persistence).
++If a value is specified here, then the `gremlin.tinkergraph.graphLocation` should
+ also be specified.  If this value is not included (default), then the graph will stay in-memory and not be
+ loaded/persisted to disk.
+ |=========================================================
+diff --git a/gremlin-core/src/main/java/org/apache/tinkerpop/gremlin/structure/io/IoCore.java b/gremlin-core/src/main/java/org/apache/tinkerpop/gremlin/structure/io/IoCore.java
+old mode 100644
+new mode 100755
+index a22dd2805d5..9d9ad60efd7
+--- a/gremlin-core/src/main/java/org/apache/tinkerpop/gremlin/structure/io/IoCore.java
++++ b/gremlin-core/src/main/java/org/apache/tinkerpop/gremlin/structure/io/IoCore.java
+@@ -52,4 +52,10 @@ public static Io.Builder<GraphSONIo> graphson() {
+     public static Io.Builder<GryoIo> gryo() {
+         return GryoIo.build();
+     }
++
++    public static Io.Builder createIoBuilder(final String graphFormat) throws ClassNotFoundException, IllegalAccessException, InstantiationException {
++        final Class<Io.Builder> ioBuilderClass = (Class<Io.Builder>) Class.forName(graphFormat);
++        final Io.Builder ioBuilder = ioBuilderClass.newInstance();
++        return ioBuilder;
++    }
+ }
+diff --git a/tinkergraph-gremlin/src/main/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraph.java b/tinkergraph-gremlin/src/main/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraph.java
+old mode 100644
+new mode 100755
+index 9fc1d3e8c3a..35e268e95ad
+--- a/tinkergraph-gremlin/src/main/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraph.java
++++ b/tinkergraph-gremlin/src/main/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraph.java
+@@ -282,9 +282,11 @@ private void loadGraph() {
+                     io(IoCore.graphson()).readGraph(graphLocation);
+                 } else if (graphFormat.equals("gryo")) {
+                     io(IoCore.gryo()).readGraph(graphLocation);
++                } else {
++                    io(IoCore.createIoBuilder(graphFormat)).readGraph(graphLocation);
+                 }
+-            } catch (IOException ioe) {
+-                throw new RuntimeException(String.format("Could not load graph at %s with %s", graphLocation, graphFormat));
++            } catch (Exception ex) {
++                throw new RuntimeException(String.format("Could not load graph at %s with %s", graphLocation, graphFormat), ex);
+             }
+         }
+     }
+@@ -307,12 +309,16 @@ private void saveGraph() {
+                 io(IoCore.graphson()).writeGraph(graphLocation);
+             } else if (graphFormat.equals("gryo")) {
+                 io(IoCore.gryo()).writeGraph(graphLocation);
++            } else {
++                io(IoCore.createIoBuilder(graphFormat)).writeGraph(graphLocation);
+             }
+-        } catch (IOException ioe) {
+-            throw new RuntimeException(String.format("Could not save graph at %s with %s", graphLocation, graphFormat));
++        } catch (Exception ex) {
++            throw new RuntimeException(String.format("Could not save graph at %s with %s", graphLocation, graphFormat), ex);
+         }
+     }
+ 
++
++
+     private <T extends Element> Iterator<T> createElementIterator(final Class<T> clazz, final Map<Object, T> elements,
+                                                                   final IdManager idManager,
+                                                                   final Object... ids) {
+diff --git a/tinkergraph-gremlin/src/test/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraphTest.java b/tinkergraph-gremlin/src/test/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraphTest.java
+old mode 100644
+new mode 100755
+index b3dc64eefce..7ff797b8c04
+--- a/tinkergraph-gremlin/src/test/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraphTest.java
++++ b/tinkergraph-gremlin/src/test/java/org/apache/tinkerpop/gremlin/tinkergraph/structure/TinkerGraphTest.java
+@@ -23,19 +23,25 @@
+ import org.apache.tinkerpop.gremlin.TestHelper;
+ import org.apache.tinkerpop.gremlin.process.traversal.P;
+ import org.apache.tinkerpop.gremlin.structure.Edge;
++import org.apache.tinkerpop.gremlin.structure.Graph;
+ import org.apache.tinkerpop.gremlin.structure.Vertex;
++import org.apache.tinkerpop.gremlin.structure.io.Io;
+ import org.apache.tinkerpop.gremlin.structure.io.IoCore;
++import org.apache.tinkerpop.gremlin.structure.io.IoRegistry;
+ import org.apache.tinkerpop.gremlin.structure.io.IoTest;
+ import org.junit.Ignore;
+ import org.junit.Test;
+ 
++import java.io.BufferedOutputStream;
+ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.File;
++import java.io.FileOutputStream;
+ import java.util.Set;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.mock;
+ 
+ /**
+  * @author Marko A. Rodriguez (http://markorodriguez.com)
+@@ -382,4 +388,65 @@ public void shouldPersistToGryo() {
+         IoTest.assertModernGraph(reloadedGraph, true, false);
+         reloadedGraph.close();
+     }
++
++    @Test
++    public void shouldPersistToAnyGraphFormat() {
++        final String graphLocation = TestHelper.makeTestDataPath(TinkerGraphTest.class, "temp").getAbsolutePath() + "shouldPersistToAnyGraphFormat.dat";
++        final File f = new File(graphLocation);
++        if (f.exists() && f.isFile()) f.delete();
++
++        final Configuration conf = new BaseConfiguration();
++        conf.setProperty(TinkerGraph.GREMLIN_TINKERGRAPH_GRAPH_FORMAT, TestIoBuilder.class.getName());
++        conf.setProperty(TinkerGraph.GREMLIN_TINKERGRAPH_GRAPH_LOCATION, graphLocation);
++        final TinkerGraph graph = TinkerGraph.open(conf);
++        TinkerFactory.generateModern(graph);
++
++        //Test write graph
++        graph.close();
++        assertEquals(TestIoBuilder.calledRegistry, 1);
++        assertEquals(TestIoBuilder.calledGraph, 1);
++        assertEquals(TestIoBuilder.calledCreate, 1);
++
++        try (BufferedOutputStream os = new BufferedOutputStream(new FileOutputStream(f))){
++            os.write("dummy string".getBytes());
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
++
++        //Test read graph
++        final TinkerGraph readGraph = TinkerGraph.open(conf);
++        assertEquals(TestIoBuilder.calledRegistry, 1);
++        assertEquals(TestIoBuilder.calledGraph, 1);
++        assertEquals(TestIoBuilder.calledCreate, 1);
++    }
++
++    public static class TestIoBuilder implements Io.Builder{
++
++        static int calledRegistry, calledGraph, calledCreate;
++
++        public TestIoBuilder(){
++            //Looks awkward to reset static vars inside a constructor, but makes sense from testing perspective
++            calledRegistry=0;
++            calledGraph=0;
++            calledCreate=0;
++        }
++
++        @Override
++        public Io.Builder<? extends Io> registry(IoRegistry registry) {
++            calledRegistry++;
++            return this;
++        }
++
++        @Override
++        public Io.Builder<? extends Io> graph(Graph graph) {
++            calledGraph++;
++            return this;
++        }
++
++        @Override
++        public Io create() {
++            calledCreate++;
++            return mock(Io.class);
++        }
++    }
+ }

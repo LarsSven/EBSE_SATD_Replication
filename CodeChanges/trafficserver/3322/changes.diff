@@ -1,0 +1,888 @@
+diff --git a/doc/developer-guide/internal-libraries/MemArena.en.rst b/doc/developer-guide/internal-libraries/MemArena.en.rst
+new file mode 100644
+index 00000000000..76ffdb44f5f
+--- /dev/null
++++ b/doc/developer-guide/internal-libraries/MemArena.en.rst
+@@ -0,0 +1,236 @@
++.. Licensed to the Apache Software Foundation (ASF) under one
++   or more contributor license agreements.  See the NOTICE file
++   distributed with this work for additional information
++   regarding copyright ownership.  The ASF licenses this file
++   to you under the Apache License, Version 2.0 (the
++   "License"); you may not use this file except in compliance
++   with the License.  You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing,
++   software distributed under the License is distributed on an
++   "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++   KIND, either express or implied.  See the License for the
++   specific language governing permissions and limitations
++   under the License.
++   
++.. include:: ../../common.defs
++
++.. highlight:: cpp
++.. default-domain:: cpp
++.. |MemArena| replace:: :class:`MemArena`
++
++.. _MemArena:
++
++MemArena
++*************
++
++|MemArena| provides a memory arena or pool for allocating memory. The intended use is for allocating many small chunks of memory - few, large allocations are best handled independently. The purpose is to amortize the cost of allocation of each chunk across larger allocations in a heap style. In addition the allocated memory is presumed to have similar lifetimes so that all of the memory in the arena can be de-allocatred en masse. This is a memory allocation style used by many cotainers - elements are small and allocated frequently, but all elements are discarded when the container itself is destroyed.
++
++Description
+++++++++++++
++
++|MemArena| manages an internal list of memory blocks, out of which it provides allocated
++blocks of memory. When an instance is destructed all the internal blocks are also freed. The
++expected use of this class is as an embedded memory manager for a container class.
++
++To support coalescence and compaction of memory, the methods :func:`MemArena::freeze` and
++:func:`MemArena::thaw` are provided. These create in effect generations of memory allocation.
++Calling :func:`MemArena::freeze` marks a generation. After this call any further allocations will
++be in new internal memory blocks. The corresponding call to :func:`MemArena::thaw` cause older
++generations of internal memory to be freed. The general logic for the container would be to freeze,
++re-allocate and copy the container elements, then thaw. This would result in compacted memory
++allocation in a single internal block. The uses cases would be either a process static data
++structure after initialization (coalescing for locality performence) or a container that naturally
++re-allocates (such as a hash table during a bucket expansion). A container could also provide its
++own API for its clients to cause a coalesence.
++
++Other than freeze / thaw, this class does not offer any mechanism to release memory beyond its destruction. This is not an issue for either process globals or transient arenas.
++
++Internals
+++++++++++
++
++|MemArena| opperates in *generations* of internal blocks of memory. Each generation marks a series internal block of memory. Allocations always occur from the most recent block within a generation, as it is always the largest and has the most unallocated space. The most recent block (current) is also the head of the linked list of memory blocks. Allocations are given in the form of a :class:`MemSpan`. Once an internal block of memory has exhausted it's avaliable space, a new, larger, internal block will be added to the generation. Say this is the current arena state:
++
++.. uml::
++   :align: center
++
++   component [block] as b1
++   component [block] as b2
++   component [block] as b3
++   component [block] as b4
++   component [block] as b5
++   component [block] as b6
++
++   b1 -> b2 
++   b2 -> b3
++   b3 -> b4
++   b4 -> b5
++   b5 -> b6
++
++   generation -u- b3
++   current -u- b1
++
++A call to :func:`MemArena::thaw` will deallocate any generation that is not the current generation. Thus, currently it is impossible to deallocate ie. just the third generation. Everything after the generation pointer is in previous generations and everything before, and including, the generation pointer is in the current generation. Since blocks are reference counted, thawing is just a single assignment to drop everything after the generation pointer. After a :func:`MemArena::thaw`:
++
++.. uml::
++   :align: center
++
++   component [block] as b3
++   component [block] as b4
++   component [block] as b5
++   component [block] as b6
++
++
++   b3 -> b4
++   b4 -> b5
++   b5 -> b6
++
++   current -u- b3
++   generation -u- b6
++
++A generation can only be updated with an explicit call to :func:`MemArena::freeze`. The next generation is not actually allocated until a call to :func:`MemArena::alloc` happens. On the :func:`MemArena::alloc` following a :func:`MemArena::freeze` the next internal block of memory is the larger of the sum of all current allocations or the number of bytes requested. The reason for this is that the caller could :func:`MemArena::alloc` a size larger than all current allocations at which point if we were to resize earlier, an internal block would be wasted. After a :func:`MemArena::freeze`:
++
++.. uml::
++   :align: center
++
++   component [block] as b3
++   component [block] as b4
++   component [block] as b5
++   component [block] as b6
++
++
++   b3 -> b4
++   b4 -> b5
++   b5 -> b6
++
++   current -u- b3
++
++After the next :func:`MemArena::alloc`:
++
++.. uml::
++   :align: center
++
++   component [block\nnew generation] as b3
++   component [block] as b4
++   component [block] as b5
++   component [block] as b6
++   component [block] as b7
++
++
++   b3 -> b4
++   b4 -> b5
++   b5 -> b6
++   b6 -> b7
++
++   generation -u- b3
++   current -u- b3
++
++A caller can actually :func:`MemArena::alloc` **any** number of bytes. Internally, if the arena is unable to allocate enough memory for the allocation, it will create a new internal block of memory large enough and allocate from that. So if the arena is allocated like:
++
++.. code-block:: cpp
++   
++   ts::MemArena *arena = new ts::MemArena(64);
++
++The caller can actually allocate more than 64 bytes. 
++
++.. code-block:: cpp
++
++   ts::MemSpan span1 = arena->alloc(16);
++   ts::MemSpan span1 = arena->alloc(256);
++
++Now, span1 and span2 are in the same generation and can both be safely used. After:
++
++.. code-block:: cpp
++
++   arena->freeze();
++   ts::MemSpan span3 = arena->alloc(512);
++   arena->thaw();
++
++span3 can still be used but span1 and span2 have been deallocated and usage is undefined. 
++
++Internal blocks are adjusted for optimization. Each :class:`MemArena::Block` is just a header for the underlying memory it manages. The header and memory are allocated together for locality such that each :class:`MemArena::Block` is immediately followed with the memory it manages. If a :class:`MemArena::Block` is larger than a page (defaulted at 4KB), it is aligned to a power of two. The actual memory that a :class:`MemArena::Block` can allocate out is slightly smaller. This is because a portion of the allocated memory is reserved for the header. Another 16 bytes is reserved to track the allocation headers used by malloc; for page alignment. ie, the default block size is 32768 bytes, but it will only be able to allocate out 32720 bytes. 
++
++Reference
+++++++++++
++
++.. class:: MemArena
++
++   .. class:: Block
++      
++      Underlying memory allocated is owned by the :class:`Block`. A linked list. 
++
++      .. member:: size_t size
++      .. member:: size_t allocated
++      .. member:: std::shared_ptr<Block> next
++      .. function:: Block(size_t n)
++      .. function:: char* data()
++
++   .. function:: MemArena()
++
++      Construct an empty arena.
++
++   .. function:: explicit MemArena(size_t n)
++
++      Construct an arena with :arg:`n` bytes. 
++
++   .. function:: MemSpan alloc(size_t n)
++
++      Allocate an :arg:`n` byte chunk of memory in the arena.
++
++   .. function:: MemArena& freeze(size_t n = 0)
++
++      Block all further allocation from any existing internal blocks. If :arg:`n` is zero then on the next allocation request a block twice as large as the current generation, otherwise the next internal block will be large enough to hold :arg:`n` bytes.
++
++   .. function:: MemArena& thaw()
++
++      Unallocate all internal blocks that were allocated before the current generation. 
++    
++   .. function:: MemArena& empty()
++     
++      Empties the entire arena and deallocates all underlying memory. Next block size will be equal to the sum of all allocations before the call to empty.
++
++   .. function:: size_t size() const 
++
++      Get the current generation size. The default size of the arena is 32KB unless otherwise specified. 
++
++   .. function:: size_t remaining() const 
++
++      Amount of space left in the generation. 
++
++   .. function:: size_t allocated_size() const
++
++      Total number of bytes allocated in the arena.
++
++   .. function:: size_t unallocated_size() const
++
++      Total number of bytes unallocated in the arena. Can be used to see the internal fragmentation. 
++
++   .. function:: bool contains (void *ptr) const
++
++      Returns whether or not a pointer is in the arena.
++       
++   .. function:: Block* newInternalBlock(size_t n, bool custom)
++
++      Create a new internal block and returns a pointer to the block. 
++
++   .. member:: size_t arena_size
++
++      Current generation size. 
++  
++   .. member:: size_t total_alloc
++
++      Number of bytes allocated out. 
++
++   .. member:: size_t next_block_size
++
++      Size of next generation.
++
++   .. member:: std::shared_ptr<Block> generation
++
++      Pointer to the current generation.
++
++   .. member:: std::shared_ptr<Block> current
++
++      Pointer to most recent internal block of memory.
+diff --git a/doc/developer-guide/internal-libraries/index.en.rst b/doc/developer-guide/internal-libraries/index.en.rst
+index 80582fdb94a..fd9051d609d 100644
+--- a/doc/developer-guide/internal-libraries/index.en.rst
++++ b/doc/developer-guide/internal-libraries/index.en.rst
+@@ -33,3 +33,4 @@ development team.
+    MemSpan.en
+    scalar.en
+    buffer-writer.en
++   MemArena.en
+diff --git a/lib/ts/Makefile.am b/lib/ts/Makefile.am
+index 57e90361982..f5e152f1118 100644
+--- a/lib/ts/Makefile.am
++++ b/lib/ts/Makefile.am
+@@ -174,6 +174,8 @@ libtsutil_la_SOURCES = \
+   MatcherUtils.cc \
+   MatcherUtils.h \
+   MemSpan.h \
++  MemArena.cc \
++  MemArena.h \
+   MMH.cc \
+   MMH.h \
+   MT_hashtable.h \
+@@ -267,11 +269,12 @@ test_tslib_SOURCES = \
+ 	unit-tests/test_ink_inet.cc \
+ 	unit-tests/test_IpMap.cc \
+ 	unit-tests/test_layout.cc \
++       unit-tests/test_MemSpan.cc \
++       unit-tests/test_MemArena.cc \
+ 	unit-tests/test_MT_hashtable.cc \
+ 	unit-tests/test_Scalar.cc \
+ 	unit-tests/test_string_view.cc \
+-	unit-tests/test_TextView.cc \
+-	unit-tests/test_MemSpan.cc
++	unit-tests/test_TextView.cc 
+ 
+ CompileParseRules_SOURCES = CompileParseRules.cc
+ 
+diff --git a/lib/ts/MemArena.cc b/lib/ts/MemArena.cc
+new file mode 100644
+index 00000000000..eadd44f7cf8
+--- /dev/null
++++ b/lib/ts/MemArena.cc
+@@ -0,0 +1,210 @@
++/** @file
++
++    MemArena memory allocator. Chunks of memory are allocated, frozen into generations and
++     thawed away when unused.
++
++    @section license License
++
++    Licensed to the Apache Software Foundation (ASF) under one
++    or more contributor license agreements.  See the NOTICE file
++    distributed with this work for additional information
++    regarding copyright ownership.  The ASF licenses this file
++    to you under the Apache License, Version 2.0 (the
++    "License"); you may not use this file except in compliance
++    with the License.  You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++    Unless required by applicable law or agreed to in writing, software
++    distributed under the License is distributed on an "AS IS" BASIS,
++    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++    See the License for the specific language governing permissions and
++    limitations under the License.
++ */
++
++#include "MemArena.h"
++#include <ts/ink_memory.h>
++#include <ts/ink_assert.h>
++
++using namespace ts;
++
++inline MemArena::Block::Block(size_t n) : size(n), allocated(0), next(nullptr)
++{
++}
++
++inline char *
++MemArena::Block::data()
++{
++  return reinterpret_cast<char *>(this + 1);
++}
++
++/**
++    Allocates a new internal block of memory. If there are no existing blocks, this becomes the head of the
++     ll. If there are existing allocations, the new block is inserted in the current list.
++     If @custom == true, the new block is pushed into the generation but @current doesn't change.
++        @custom == false, the new block is pushed to the head and becomes the @current internal block.
++  */
++inline MemArena::Block *
++MemArena::newInternalBlock(size_t n, bool custom)
++{
++  // Adjust to the nearest power of two. Works for 64 bit values. Allocate Block header and
++  //  actual underlying memory together for locality. ALLOC_HEADER_SIZE to account for malloc/free headers.
++  static constexpr size_t free_space_per_page = DEFAULT_PAGE_SIZE - sizeof(Block) - ALLOC_HEADER_SIZE;
++
++  void *tmp;
++  if (n <= free_space_per_page) { // will fit within one page, just allocate.
++    tmp = ats_malloc(n + sizeof(Block));
++  } else {
++    size_t t = n;
++    t--;
++    t |= t >> 1;
++    t |= t >> 2;
++    t |= t >> 4;
++    t |= t >> 8;
++    t |= t >> 16;
++    t |= t >> 32;
++    t++;
++    n   = t - sizeof(Block) - ALLOC_HEADER_SIZE; // n is the actual amount of memory the block can allocate out.
++    tmp = ats_malloc(t - ALLOC_HEADER_SIZE);
++  }
++
++  std::shared_ptr<Block> block(new (tmp) Block(n)); // placement new
++
++  if (current) {
++    arena_size += n;
++    generation_size += n;
++
++    if (!custom) {
++      block->next = current;
++      current     = block;
++      return current.get();
++    } else {
++      // Situation where we do not have enough space for a large block of memory. We don't want
++      //  to update @current because it would be wasting memory. Create a new block for the entire
++      //  allocation and just add it to the generation.
++      block->next   = current->next; // here, current always exists.
++      current->next = block;
++    }
++  } else { // empty
++    generation_size = n;
++    arena_size      = n;
++
++    generation = current = block;
++  }
++
++  return block.get();
++}
++
++MemArena::MemArena()
++{
++  newInternalBlock(arena_size, true); // nDefault size
++}
++
++MemArena::MemArena(size_t n)
++{
++  newInternalBlock(n, true);
++}
++
++/**
++    Returns a span of memory of @n bytes. If necessary, alloc will create a new internal block
++     of memory in order to serve the required number of bytes.
++ */
++MemSpan
++MemArena::alloc(size_t n)
++{
++  total_alloc += n;
++
++  // Two cases when we want a new internal block:
++  //   1. A new generation.
++  //   2. Current internal block isn't large enough to alloc
++  //       @n bytes.
++
++  Block *block = nullptr;
++
++  if (!generation) { // allocation after a freeze. new generation.
++    generation_size = 0;
++
++    next_block_size = (next_block_size < n) ? n : next_block_size;
++    block           = newInternalBlock(next_block_size, false);
++
++    // current is updated in newInternalBlock.
++    generation = current;
++  } else if (current->size - current->allocated /* remaining size */ < n) {
++    if (n >= DEFAULT_PAGE_SIZE && n >= (current->size / 2)) {
++      block = newInternalBlock(n, true);
++    } else {
++      block = newInternalBlock(current->size * 2, false);
++    }
++  } else {
++    // All good. Simply allocate.
++    block = current.get();
++  }
++
++  ink_assert(block->data() != nullptr);
++  ink_assert(block->size >= n);
++
++  uint64_t offset = block->allocated;
++  block->allocated += n;
++
++  // Allocate a span of memory within the block.
++  MemSpan ret(block->data() + offset, n);
++  return ret;
++}
++
++MemArena &
++MemArena::freeze(size_t n)
++{
++  generation      = nullptr;
++  next_block_size = n ? n : total_alloc;
++  prev_alloc      = total_alloc;
++
++  return *this;
++}
++
++/**
++    Everything up the current generation is considered frozen and will be
++     thawed away (deallocated).
++ */
++MemArena &
++MemArena::thaw()
++{
++  // A call to thaw a frozen generation before any allocation. Empty the arena.
++  if (!generation) {
++    return empty();
++  }
++
++  arena_size = generation_size;
++  total_alloc -= prev_alloc;
++  prev_alloc = 0;
++
++  generation->next = nullptr;
++  return *this;
++}
++
++/**
++    Check if a pointer is in the arena. Need to search through all the internal blocks.
++ */
++bool
++MemArena::contains(void *ptr) const
++{
++  Block *tmp = current.get();
++  while (tmp) {
++    if (ptr >= tmp->data() && ptr < tmp->data() + tmp->size) {
++      return true;
++    }
++    tmp = tmp->next.get();
++  }
++  return false;
++}
++
++MemArena &
++MemArena::empty()
++{
++  generation = nullptr;
++  current    = nullptr;
++
++  arena_size = generation_size = 0;
++  total_alloc = prev_alloc = 0;
++
++  return *this;
++}
+\ No newline at end of file
+diff --git a/lib/ts/MemArena.h b/lib/ts/MemArena.h
+new file mode 100644
+index 00000000000..1e7876155fb
+--- /dev/null
++++ b/lib/ts/MemArena.h
+@@ -0,0 +1,156 @@
++/** @file
++
++    Memory arena for allocations
++
++    @section license License
++
++    Licensed to the Apache Software Foundation (ASF) under one
++    or more contributor license agreements.  See the NOTICE file
++    distributed with this work for additional information
++    regarding copyright ownership.  The ASF licenses this file
++    to you under the Apache License, Version 2.0 (the
++    "License"); you may not use this file except in compliance
++    with the License.  You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++    Unless required by applicable law or agreed to in writing, software
++    distributed under the License is distributed on an "AS IS" BASIS,
++    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++    See the License for the specific language governing permissions and
++    limitations under the License.
++ */
++
++#ifndef _MEM_ARENA_H_
++#define _MEM_ARENA_H_
++
++#include <mutex>
++#include <memory>
++#include <ts/MemSpan.h>
++
++/// Apache Traffic Server commons.
++namespace ts
++{
++/** MemArena is a memory arena for allocations.
++
++    The intended use is for allocating many small chunks of memory - few, large allocations are best handled independently.
++    The purpose is to amortize the cost of allocation of each chunk across larger allocations in a heap style. In addition the
++    allocated memory is presumed to have similar lifetimes so that all of the memory in the arena can be de-allocatred en masse.
++
++    A generation is essentially a block of memory. The normal workflow is to freeze() the current generation, alloc() a larger and
++    newer generation, copy the contents of the previous generation to the new generation, and then thaw() the previous generation.
++    Note that coalescence must be done by the caller because MemSpan will only give a reference to the underlying memory.
++ */
++class MemArena
++{
++public:
++  /** Simple internal arena block of memory. Maintains the underlying memory.
++   */
++  struct Block {
++    size_t size;
++    size_t allocated;
++    std::shared_ptr<Block> next;
++
++    Block(size_t n);
++    char *data();
++  };
++
++  MemArena();
++  explicit MemArena(size_t n);
++
++  /** MemSpan alloc(size_t n)
++
++      Returns a span of memory within the arena. alloc() is self expanding but DOES NOT self coalesce. This means
++      that no matter the arena size, the caller will always be able to alloc() @a n bytes.
++
++      @param n number of bytes to allocate.
++      @return a MemSpan of the allocated memory.
++   */
++  MemSpan alloc(size_t n);
++
++  /** MemArena& freeze(size_t n = 0)
++
++      Will "freeze" a generation of memory. Any memory previously allocated can still be used. This is an
++      important distinction as freeze does not mean that the memory is immutable, only that subsequent allocations
++      will be in a new generation.
++
++      @param n Number of bytes for new generation.
++        if @a n == 0, the next generation will be large enough to hold all existing allocations.
++      @return @c *this
++   */
++  MemArena &freeze(size_t n = 0);
++
++  /** MemArena& thaw()
++
++      Will "thaw" away any previously frozen generations. Any generation that is not the current generation is considered
++      frozen because there is no way to allocate in any of those memory blocks. thaw() is the only mechanism for deallocating
++      memory in the arena (other than destroying the arena itself). Thawing away previous generations means that all spans
++      of memory allocated in those generations are no longer safe to use.
++
++      @return @c *this
++   */
++  MemArena &thaw();
++
++  /** MemArena& empty
++
++      Empties the entire arena and deallocates all underlying memory. Next block size will be equal to the sum of all
++      allocations before the call to empty.
++   */
++  MemArena &empty();
++
++  /// @returns the current generation @c size.
++  size_t
++  size() const
++  {
++    return arena_size;
++  }
++
++  /// @returns the @c remaining space within the generation.
++  size_t
++  remaining() const
++  {
++    return (current) ? current->size - current->allocated : 0;
++  }
++
++  /// @returns the total number of bytes allocated within the arena.
++  size_t
++  allocated_size() const
++  {
++    return total_alloc;
++  }
++
++  /// @returns the number of bytes that have not been allocated within the arena
++  size_t
++  unallocated_size() const
++  {
++    return size() - allocated_size();
++  }
++
++  /// @return a @c true if @ptr is in memory owned by this arena, @c false if not.
++  bool contains(void *ptr) const;
++
++private:
++  /// creates a new @Block of size @n and places it within the @allocations list.
++  /// @return a pointer to the block to allocate from.
++  Block *newInternalBlock(size_t n, bool custom);
++
++  static constexpr size_t DEFAULT_BLOCK_SIZE = 1 << 15; ///< 32kb
++  static constexpr size_t DEFAULT_PAGE_SIZE  = 1 << 12; ///< 4kb
++  static constexpr size_t ALLOC_HEADER_SIZE  = 16;
++
++  /** generation_size and prev_alloc are used to help quickly figure out the arena
++        info (arena_size and total_alloc) after a thaw().
++   */
++  size_t arena_size      = DEFAULT_BLOCK_SIZE; ///< --all
++  size_t generation_size = 0;                  ///< Size of current generation -- all
++  size_t total_alloc     = 0;                  ///< Total number of bytes allocated in the arena -- allocated
++  size_t prev_alloc      = 0;                  ///< Total allocations before current generation -- allocated
++
++  size_t next_block_size = 0; ///< Next internal block size
++
++  std::shared_ptr<Block> generation = nullptr; ///< Marks current generation
++  std::shared_ptr<Block> current    = nullptr; ///< Head of allocations list. Allocate from this.
++};
++} // ts namespace
++
++#endif /* _MEM_ARENA_H_ */
+diff --git a/lib/ts/MemSpan.h b/lib/ts/MemSpan.h
+index 0a0c6f594f5..e08f3dc9fe6 100644
+--- a/lib/ts/MemSpan.h
++++ b/lib/ts/MemSpan.h
+@@ -27,6 +27,8 @@
+ #pragma once
+ #include <cstring>
+ #include <iosfwd>
++#include <iostream>
++#include <cstddef>
+ 
+ /// Apache Traffic Server commons.
+ namespace ts
+diff --git a/lib/ts/unit-tests/test_MemArena.cc b/lib/ts/unit-tests/test_MemArena.cc
+new file mode 100644
+index 00000000000..98829f36739
+--- /dev/null
++++ b/lib/ts/unit-tests/test_MemArena.cc
+@@ -0,0 +1,210 @@
++/** @file
++
++    MemArena unit tests.
++
++    @section license License
++
++    Licensed to the Apache Software Foundation (ASF) under one
++    or more contributor license agreements.  See the NOTICE file
++    distributed with this work for additional information
++    regarding copyright ownership.  The ASF licenses this file
++    to you under the Apache License, Version 2.0 (the
++    "License"); you may not use this file except in compliance
++    with the License.  You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++    Unless required by applicable law or agreed to in writing, software
++    distributed under the License is distributed on an "AS IS" BASIS,
++    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++    See the License for the specific language governing permissions and
++    limitations under the License.
++*/
++
++#include <catch.hpp>
++
++#include <ts/MemArena.h>
++
++TEST_CASE("MemArena generic", "[libts][MemArena]")
++{
++  ts::MemArena *arena = new ts::MemArena(64);
++  REQUIRE(arena->size() == 64);
++  ts::MemSpan span1 = arena->alloc(32);
++  ts::MemSpan span2 = arena->alloc(32);
++
++  REQUIRE(span1.size() == 32);
++  REQUIRE(span2.size() == 32);
++  REQUIRE(span1 != span2);
++
++  arena->freeze(); // second gen - 128b
++
++  span1 = arena->alloc(64);
++  REQUIRE(span1.size() == 64);
++  REQUIRE(arena->size() == 128);
++
++  arena->freeze(); // third gen - 256 b
++  span1 = arena->alloc(128);
++  REQUIRE(span1.size() == 128);
++  REQUIRE(arena->size() == 256);
++  REQUIRE(arena->allocated_size() == 256);
++  REQUIRE(arena->remaining() == 0);
++  REQUIRE(arena->unallocated_size() == 0);
++
++  arena->thaw();
++  REQUIRE(arena->size() == 128);
++  REQUIRE(span1.size() == 128);
++  REQUIRE(arena->contains((char *)span1.data()));
++  REQUIRE(arena->remaining() == 0);
++
++  // scale down
++  arena->freeze(); // fourth gen - 128 b
++  arena->thaw();
++  REQUIRE(arena->size() == 0);
++  REQUIRE(arena->remaining() == 0);
++
++  arena->alloc(120);
++  REQUIRE(arena->size() == 128);
++  REQUIRE(arena->remaining() == 8);
++
++  delete arena;
++}
++
++TEST_CASE("MemArena freeze and thaw", "[libts][MemArena]")
++{
++  ts::MemArena *arena = new ts::MemArena(64);
++  arena->freeze();
++  REQUIRE(arena->size() == 64);
++  arena->alloc(64);
++  REQUIRE(arena->size() == 128);
++  arena->thaw();
++  REQUIRE(arena->size() == 64);
++  arena->freeze();
++  arena->thaw();
++  REQUIRE(arena->size() == 0);
++  REQUIRE(arena->remaining() == 0);
++
++  arena->alloc(1024);
++  REQUIRE(arena->size() == 1024);
++  arena->freeze();
++  REQUIRE(arena->size() == 1024);
++  arena->thaw();
++  REQUIRE(arena->size() == 0);
++
++  arena->freeze(64); // scale down
++  arena->alloc(64);
++  REQUIRE(arena->size() == 64);
++  REQUIRE(arena->remaining() == 0);
++
++  arena->empty();
++  REQUIRE(arena->size() == 0);
++  REQUIRE(arena->remaining() == 0);
++  REQUIRE(arena->allocated_size() == 0);
++  REQUIRE(arena->unallocated_size() == 0);
++}
++
++TEST_CASE("MemArena helper", "[libts][MemArena]")
++{
++  ts::MemArena *arena = new ts::MemArena(256);
++  REQUIRE(arena->size() == 256);
++  REQUIRE(arena->remaining() == 256);
++  ts::MemSpan s = arena->alloc(56);
++  REQUIRE(arena->size() == 256);
++  REQUIRE(arena->remaining() == 200);
++  void *ptr = s.begin();
++
++  REQUIRE(arena->contains((char *)ptr));
++  REQUIRE(arena->contains((char *)ptr + 100)); // even though span isn't this large, this pointer should still be in arena
++  REQUIRE(!arena->contains((char *)ptr + 300));
++  REQUIRE(!arena->contains((char *)ptr - 1));
++  REQUIRE(arena->contains((char *)ptr + 255));
++  REQUIRE(!arena->contains((char *)ptr + 256));
++
++  arena->freeze(128);
++  REQUIRE(arena->contains((char *)ptr));
++  REQUIRE(arena->contains((char *)ptr + 100));
++  ts::MemSpan s2 = arena->alloc(10);
++  void *ptr2     = s2.begin();
++  REQUIRE(arena->contains((char *)ptr));
++  REQUIRE(arena->contains((char *)ptr2));
++  REQUIRE(arena->unallocated_size() == 384 - 66);
++  REQUIRE(arena->allocated_size() == 56 + 10);
++
++  arena->thaw();
++  REQUIRE(!arena->contains((char *)ptr));
++  REQUIRE(arena->contains((char *)ptr2));
++
++  REQUIRE(arena->remaining() == 128 - 10);
++  REQUIRE(arena->allocated_size() == 10);
++}
++
++TEST_CASE("MemArena large alloc", "[libts][MemArena]")
++{
++  ts::MemArena *arena = new ts::MemArena(); // 32k
++
++  size_t arena_size = arena->size(); // little bit less than 1 << 15
++
++  ts::MemSpan s = arena->alloc(4000);
++  REQUIRE(s.size() == 4000);
++
++  ts::MemSpan s_a[10];
++  s_a[0] = arena->alloc(100);
++  s_a[1] = arena->alloc(200);
++  s_a[2] = arena->alloc(300);
++  s_a[3] = arena->alloc(400);
++  s_a[4] = arena->alloc(500);
++  s_a[5] = arena->alloc(600);
++  s_a[6] = arena->alloc(700);
++  s_a[7] = arena->alloc(800);
++  s_a[8] = arena->alloc(900);
++  s_a[9] = arena->alloc(1000);
++
++  REQUIRE(arena->size() == arena_size); // didnt resize
++
++  // ensure none of the spans have any overlap in memory.
++  for (int i = 0; i < 10; ++i) {
++    s = s_a[i];
++    for (int j = i + 1; j < 10; ++j) {
++      REQUIRE(s_a[i] != s_a[j]);
++    }
++  }
++}
++
++TEST_CASE("MemArena block allocation", "[libts][MemArena]")
++{
++  ts::MemArena *arena = new ts::MemArena(64);
++  ts::MemSpan s       = arena->alloc(32);
++  ts::MemSpan s2      = arena->alloc(16);
++  ts::MemSpan s3      = arena->alloc(16);
++
++  REQUIRE(s.size() == 32);
++  REQUIRE(arena->remaining() == 0);
++  REQUIRE(arena->unallocated_size() == 0);
++  REQUIRE(arena->allocated_size() == 64);
++
++  REQUIRE(arena->contains((char *)s.begin()));
++  REQUIRE(arena->contains((char *)s2.begin()));
++  REQUIRE(arena->contains((char *)s3.begin()));
++
++  REQUIRE((char *)s.begin() + 32 == (char *)s2.begin());
++  REQUIRE((char *)s.begin() + 48 == (char *)s3.begin());
++  REQUIRE((char *)s2.begin() + 16 == (char *)s3.begin());
++
++  REQUIRE(s.end() == s2.begin());
++  REQUIRE(s2.end() == s3.begin());
++  REQUIRE((char *)s.begin() + 64 == s3.end());
++}
++
++TEST_CASE("MemArena full blocks", "[libts][MemArena]")
++{
++  // couple of large allocations - should be exactly sized in the generation.
++  ts::MemArena *arena = new ts::MemArena();
++  size_t init_size    = arena->size();
++
++  arena->alloc(init_size - 64);
++  arena->alloc(32000); // should in its own box - exactly sized.
++  arena->alloc(64000);
++
++  REQUIRE(arena->size() >= 32000 + 64000 + init_size); // may give a bit more but shouldnt be less
++  REQUIRE(arena->allocated_size() == 32000 + 64000 + init_size - 64);
++  REQUIRE(arena->remaining() >= 64);
++}
+\ No newline at end of file

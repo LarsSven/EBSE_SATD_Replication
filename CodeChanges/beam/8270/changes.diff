@@ -1,0 +1,570 @@
+diff --git a/sdks/python/apache_beam/coders/coders.py b/sdks/python/apache_beam/coders/coders.py
+index 7822d71b3eaa..3d47d8569dba 100644
+--- a/sdks/python/apache_beam/coders/coders.py
++++ b/sdks/python/apache_beam/coders/coders.py
+@@ -280,10 +280,17 @@ def from_runner_api(cls, coder_proto, context):
+     Prefer registering a urn with its parameter type and constructor.
+     """
+     parameter_type, constructor = cls._known_urns[coder_proto.spec.spec.urn]
+-    return constructor(
+-        proto_utils.parse_Bytes(coder_proto.spec.spec.payload, parameter_type),
+-        [context.coders.get_by_id(c) for c in coder_proto.component_coder_ids],
+-        context)
++    try:
++      return constructor(
++          proto_utils.parse_Bytes(
++              coder_proto.spec.spec.payload, parameter_type),
++          [context.coders.get_by_id(c)
++           for c in coder_proto.component_coder_ids],
++          context)
++    except Exception:
++      if context.allow_proto_holders:
++        return RunnerAPICoderHolder(coder_proto)
++      raise
+ 
+   def to_runner_api_parameter(self, context):
+     return (
+@@ -1140,3 +1147,25 @@ def from_runner_api_parameter(payload, components, context):
+         read_state=context.iterable_state_read,
+         write_state=context.iterable_state_write,
+         write_state_threshold=int(payload))
++
++
++class RunnerAPICoderHolder(Coder):
++  """A `Coder` that holds a runner API `Coder` proto.
++
++  This is used for coders for which corresponding objects cannot be
++  initialized in Python SDK. For example, coders for remote SDKs that may
++  be available in Python SDK transform graph when expanding a cross-language
++  transform.
++  """
++
++  def __init__(self, proto):
++    self._proto = proto
++
++  def proto(self):
++    return self._proto
++
++  def to_runner_api(self, context):
++    return self._proto
++
++  def to_type_hint(self):
++    return typehints.Any
+diff --git a/sdks/python/apache_beam/coders/coders_test_common.py b/sdks/python/apache_beam/coders/coders_test_common.py
+index b9fe39c7440c..4dd1cf104408 100644
+--- a/sdks/python/apache_beam/coders/coders_test_common.py
++++ b/sdks/python/apache_beam/coders/coders_test_common.py
+@@ -70,6 +70,7 @@ def tearDownClass(cls):
+     standard -= set([coders.Coder,
+                      coders.FastCoder,
+                      coders.ProtoCoder,
++                     coders.RunnerAPICoderHolder,
+                      coders.ToStringCoder])
+     assert not standard - cls.seen, standard - cls.seen
+     assert not standard - cls.seen_nested, standard - cls.seen_nested
+diff --git a/sdks/python/apache_beam/pipeline.py b/sdks/python/apache_beam/pipeline.py
+index 8f0fa1051096..8985ec01415b 100644
+--- a/sdks/python/apache_beam/pipeline.py
++++ b/sdks/python/apache_beam/pipeline.py
+@@ -659,11 +659,13 @@ def visit_transform(self, transform_node):
+       return proto
+ 
+   @staticmethod
+-  def from_runner_api(proto, runner, options, return_context=False):
++  def from_runner_api(proto, runner, options, return_context=False,
++                      allow_proto_holders=False):
+     """For internal use only; no backwards-compatibility guarantees."""
+     p = Pipeline(runner=runner, options=options)
+     from apache_beam.runners import pipeline_context
+-    context = pipeline_context.PipelineContext(proto.components)
++    context = pipeline_context.PipelineContext(
++        proto.components, allow_proto_holders=allow_proto_holders)
+     root_transform_id, = proto.root_transform_ids
+     p.transforms_stack = [
+         context.transforms.get_by_id(root_transform_id)]
+diff --git a/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py b/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py
+index 3b6574aa3663..ee8a32227bdd 100644
+--- a/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py
++++ b/sdks/python/apache_beam/runners/dataflow/dataflow_runner.py
+@@ -243,11 +243,41 @@ def visit_transform(self, transform_node):
+               pcoll.element_type, transform_node.full_label)
+           key_type, value_type = pcoll.element_type.tuple_types
+           if transform_node.outputs:
+-            transform_node.outputs[None].element_type = typehints.KV[
++            from apache_beam.runners.portability.fn_api_runner_transforms import \
++              only_element
++            key = (
++                None if None in transform_node.outputs.keys()
++                else only_element(transform_node.outputs.keys()))
++            transform_node.outputs[key].element_type = typehints.KV[
+                 key_type, typehints.Iterable[value_type]]
+ 
+     return GroupByKeyInputVisitor()
+ 
++  @staticmethod
++  def _set_pdone_visitor(pipeline):
++    # Imported here to avoid circular dependencies.
++    from apache_beam.pipeline import PipelineVisitor
++
++    class SetPDoneVisitor(PipelineVisitor):
++
++      def __init__(self, pipeline):
++        self._pipeline = pipeline
++
++      @staticmethod
++      def _maybe_fix_output(transform_node, pipeline):
++        if not transform_node.outputs:
++          pval = pvalue.PDone(pipeline)
++          pval.producer = transform_node
++          transform_node.outputs = {None: pval}
++
++      def enter_composite_transform(self, transform_node):
++        SetPDoneVisitor._maybe_fix_output(transform_node, self._pipeline)
++
++      def visit_transform(self, transform_node):
++        SetPDoneVisitor._maybe_fix_output(transform_node, self._pipeline)
++
++    return SetPDoneVisitor(pipeline)
++
+   @staticmethod
+   def side_input_visitor():
+     # Imported here to avoid circular dependencies.
+@@ -346,6 +376,23 @@ def run_pipeline(self, pipeline, options):
+     self.proto_pipeline, self.proto_context = pipeline.to_runner_api(
+         return_context=True)
+ 
++    if apiclient._use_fnapi(options):
++      # Cross language transform require using a pipeline object constructed
++      # from the full pipeline proto to make sure that expanded version of
++      # external transforms are reflected in the Pipeline job graph.
++      from apache_beam import Pipeline
++      pipeline = Pipeline.from_runner_api(
++          self.proto_pipeline, pipeline.runner, options,
++          allow_proto_holders=True)
++
++      # Pipelines generated from proto do not have output set to PDone set for
++      # leaf elements.
++      pipeline.visit(self._set_pdone_visitor(pipeline))
++
++      # We need to generate a new context that maps to the new pipeline object.
++      self.proto_pipeline, self.proto_context = pipeline.to_runner_api(
++          return_context=True)
++
+     # Add setup_options for all the BeamPlugin imports
+     setup_options = options.view_as(SetupOptions)
+     plugins = BeamPlugin.get_all_plugin_paths()
+@@ -461,18 +508,24 @@ def _get_side_input_encoding(self, input_encoding):
+ 
+   def _get_encoded_output_coder(self, transform_node, window_value=True):
+     """Returns the cloud encoding of the coder for the output of a transform."""
+-    if (len(transform_node.outputs) == 1
+-        and transform_node.outputs[None].element_type is not None):
++    from apache_beam.runners.portability.fn_api_runner_transforms import \
++      only_element
++    if len(transform_node.outputs) == 1:
++      output_tag = only_element(transform_node.outputs.keys())
+       # TODO(robertwb): Handle type hints for multi-output transforms.
+-      element_type = transform_node.outputs[None].element_type
++      element_type = transform_node.outputs[output_tag].element_type
+     else:
+       # TODO(silviuc): Remove this branch (and assert) when typehints are
+       # propagated everywhere. Returning an 'Any' as type hint will trigger
+       # usage of the fallback coder (i.e., cPickler).
+       element_type = typehints.Any
+     if window_value:
++      # All outputs have the same windowing. So getting the coder from an
++      # arbitrary window is fine.
++      output_tag = next(iter(transform_node.outputs.keys()))
+       window_coder = (
+-          transform_node.outputs[None].windowing.windowfn.get_window_coder())
++          transform_node.outputs[
++              output_tag].windowing.windowfn.get_window_coder())
+     else:
+       window_coder = None
+     from apache_beam.runners.dataflow.internal import apiclient
+@@ -490,7 +543,14 @@ def _add_step(self, step_kind, step_label, transform_node, side_tags=()):
+     self.job.proto.steps.append(step.proto)
+     step.add_property(PropertyNames.USER_NAME, step_label)
+     # Cache the node/step association for the main output of the transform node.
+-    self._cache.cache_output(transform_node, None, step)
++
++    # Main output key of external transforms can be ambiguous, so we only tag if
++    # there's only one tag instead of None.
++    from apache_beam.runners.portability.fn_api_runner_transforms import only_element
++    output_tag = (only_element(transform_node.outputs.keys())
++                  if len(transform_node.outputs.keys()) == 1 else None)
++
++    self._cache.cache_output(transform_node, output_tag, step)
+     # If side_tags is not () then this is a multi-output transform node and we
+     # need to cache the (node, tag, step) for each of the tags used to access
+     # the outputs. This is essential because the keys used to search in the
+@@ -647,6 +707,24 @@ def run_GroupByKey(self, transform_node, options):
+         PropertyNames.SERIALIZED_FN,
+         self.serialize_windowing_strategy(windowing))
+ 
++  def run_RunnerAPIPTransformHolder(self, transform_node, options):
++    """Adding Dataflow runner job description for transform holder objects.
++
++    These holder transform objects are generated for some of the transforms that
++    become available after a cross-language transform expansion, usually if the
++    corresponding transform object cannot be generated in Python SDK (for
++    example, a python `ParDo` transform cannot be generated without a serialized
++    Python `DoFn` object).
++    """
++    urn = transform_node.transform.proto().urn
++    assert urn
++    # TODO(chamikara): support other transforms that requires holder objects in
++    #  Python SDk.
++    if common_urns.primitives.PAR_DO.urn == urn:
++      self.run_ParDo(transform_node, options)
++    else:
++      NotImplementedError(urn)
++
+   def run_ParDo(self, transform_node, options):
+     transform = transform_node.transform
+     input_tag = transform_node.inputs[0].tag
+@@ -770,13 +848,11 @@ def run_ParDo(self, transform_node, options):
+ 
+     # Add the restriction encoding if we are a splittable DoFn
+     # and are using the Fn API on the unified worker.
+-    from apache_beam.runners.common import DoFnSignature
+-    signature = DoFnSignature(transform_node.transform.fn)
+-    if (use_fnapi and use_unified_worker and signature.is_splittable_dofn()):
+-      restriction_coder = (
+-          signature.get_restriction_provider().restriction_coder())
++    restriction_coder = transform.get_restriction_coder()
++    if (use_fnapi and use_unified_worker and restriction_coder):
+       step.add_property(PropertyNames.RESTRICTION_ENCODING,
+-                        self._get_cloud_encoding(restriction_coder, use_fnapi))
++                        self._get_cloud_encoding(
++                            restriction_coder, use_fnapi))
+ 
+   @staticmethod
+   def _pardo_fn_data(transform_node, get_label):
+diff --git a/sdks/python/apache_beam/runners/dataflow/internal/apiclient.py b/sdks/python/apache_beam/runners/dataflow/internal/apiclient.py
+index b0b132586ba6..26f12d08b0a2 100644
+--- a/sdks/python/apache_beam/runners/dataflow/internal/apiclient.py
++++ b/sdks/python/apache_beam/runners/dataflow/internal/apiclient.py
+@@ -116,7 +116,7 @@ def get_output(self, tag=None):
+       ValueError: if the tag does not exist within outputs.
+     """
+     outputs = self._get_outputs()
+-    if tag is None:
++    if tag is None or len(outputs) == 1:
+       return outputs[0]
+     else:
+       name = '%s_%s' % (PropertyNames.OUT, tag)
+diff --git a/sdks/python/apache_beam/runners/pipeline_context.py b/sdks/python/apache_beam/runners/pipeline_context.py
+index e6685d9bd7e3..6a186052697f 100644
+--- a/sdks/python/apache_beam/runners/pipeline_context.py
++++ b/sdks/python/apache_beam/runners/pipeline_context.py
+@@ -130,7 +130,7 @@ class PipelineContext(object):
+   def __init__(
+       self, proto=None, default_environment=None, use_fake_coders=False,
+       iterable_state_read=None, iterable_state_write=None,
+-      namespace='ref'):
++      namespace='ref', allow_proto_holders=False):
+     if isinstance(proto, beam_fn_api_pb2.ProcessBundleDescriptor):
+       proto = beam_runner_api_pb2.Components(
+           coders=dict(proto.coders.items()),
+@@ -148,6 +148,7 @@ def __init__(
+     self.use_fake_coders = use_fake_coders
+     self.iterable_state_read = iterable_state_read
+     self.iterable_state_write = iterable_state_write
++    self.allow_proto_holders = allow_proto_holders
+ 
+   # If fake coders are requested, return a pickled version of the element type
+   # rather than an actual coder. The element type is required for some runners,
+diff --git a/sdks/python/apache_beam/transforms/core.py b/sdks/python/apache_beam/transforms/core.py
+index 47ed03502783..711ce3b8a70e 100644
+--- a/sdks/python/apache_beam/transforms/core.py
++++ b/sdks/python/apache_beam/transforms/core.py
+@@ -297,6 +297,31 @@ def get_function_arguments(obj, func):
+   return getfullargspec(f)
+ 
+ 
++class RunnerAPIPTransformHolder(PTransform):
++  """A `PTransform` that holds a runner API `PTransform` proto.
++
++  This is used for transforms, for which corresponding objects
++  cannot be initialized in Python SDK. For example, for `ParDo` transforms for
++  remote SDKs that may be available in Python SDK transform graph when expanding
++  a cross-language transform since a Python `ParDo` object cannot be generated
++  without a serialized Python `DoFn` object.
++  """
++
++  def __init__(self, proto):
++    self._proto = proto
++
++  def proto(self):
++    """Runner API payload for a `PTransform`"""
++    return self._proto
++
++  def to_runner_api(self, context, has_parts=False):
++    return self._proto
++
++  def get_restriction_coder(self):
++    # TODO(BEAM-7172): support external transforms that are SDFs.
++    return None
++
++
+ class _DoFnParam(object):
+   """DoFn parameter."""
+ 
+@@ -1132,6 +1157,16 @@ def from_runner_api_parameter(pardo_payload, context):
+   def runner_api_requires_keyed_input(self):
+     return userstate.is_stateful_dofn(self.fn)
+ 
++  def get_restriction_coder(self):
++    """Returns `restriction coder if `DoFn` of this `ParDo` is a SDF.
++
++    Returns `None` otherwise.
++    """
++    from apache_beam.runners.common import DoFnSignature
++    signature = DoFnSignature(self.fn)
++    return (signature.get_restriction_provider().restriction_coder()
++            if signature.is_splittable_dofn() else None)
++
+ 
+ class _MultiParDo(PTransform):
+ 
+diff --git a/sdks/python/apache_beam/transforms/external_test.py b/sdks/python/apache_beam/transforms/external_test.py
+index a9ec11442be7..5495ccc23bdf 100644
+--- a/sdks/python/apache_beam/transforms/external_test.py
++++ b/sdks/python/apache_beam/transforms/external_test.py
+@@ -1,3 +1,4 @@
++#
+ # Licensed to the Apache Software Foundation (ASF) under one or more
+ # contributor license agreements.  See the NOTICE file distributed with
+ # this work for additional information regarding copyright ownership.
+@@ -24,19 +25,27 @@
+ import unittest
+ 
+ import grpc
++from mock import patch
+ from past.builtins import unicode
+ 
+ import apache_beam as beam
+ from apache_beam import Pipeline
+ from apache_beam.options.pipeline_options import PipelineOptions
+ from apache_beam.options.pipeline_options import SetupOptions
+-from apache_beam.options.pipeline_options import StandardOptions
+ from apache_beam.portability import python_urns
+ from apache_beam.runners.portability import expansion_service
+ from apache_beam.runners.portability.expansion_service_test import FibTransform
+ from apache_beam.testing.util import assert_that
+ from apache_beam.testing.util import equal_to
+ 
++# Protect against environments where apitools library is not available.
++# pylint: disable=wrong-import-order, wrong-import-position
++try:
++  from apache_beam.runners.dataflow.internal import apiclient
++except ImportError:
++  apiclient = None
++# pylint: enable=wrong-import-order, wrong-import-position
++
+ 
+ class ExternalTransformTest(unittest.TestCase):
+ 
+@@ -44,6 +53,29 @@ class ExternalTransformTest(unittest.TestCase):
+   expansion_service_jar = None
+   expansion_service_port = None
+ 
++  class _RunWithExpansion(object):
++
++    def __init__(self, port, expansion_service_jar):
++      self._port = port
++      self._expansion_service_jar = expansion_service_jar
++
++    def __enter__(self):
++      if not ExternalTransformTest.expansion_service_jar:
++        raise unittest.SkipTest('No expansion service jar provided.')
++
++      # Start the java server and wait for it to be ready.
++      self._server = subprocess.Popen(
++          ['java', '-jar', self._expansion_service_jar, str(self._port)])
++
++      port = ExternalTransformTest.expansion_service_port or 8091
++      address = 'localhost:%s' % str(port)
++
++      with grpc.insecure_channel(address) as channel:
++        grpc.channel_ready_future(channel).result()
++
++    def __exit__(self, type, value, traceback):
++      self._server.kill()
++
+   def test_pipeline_generation(self):
+     pipeline = beam.Pipeline()
+     res = (pipeline
+@@ -105,71 +137,86 @@ def test_nested(self):
+       assert_that(p | FibTransform(6), equal_to([8]))
+ 
+   def test_java_expansion_portable_runner(self):
+-    if not ExternalTransformTest.expansion_service_jar:
+-      raise unittest.SkipTest('No expansion service jar provided.')
+-
+-    # Run as cheaply as possible on the portable runner.
+-    # TODO(robertwb): Support this directly in the direct runner.
+-    pipeline_args = self.pipeline_args or (
++    pipeline_options = PipelineOptions(
+         ['--runner=PortableRunner',
+          '--experiments=beam_fn_api',
+-         'environment_type=%s' % python_urns.EMBEDDED_PYTHON,
+-         'job_endpoint=embed'])
+-
+-    pipeline_options = PipelineOptions(pipeline_args)
+-    assert (
+-        pipeline_options.view_as(StandardOptions).runner.lower()
+-        == "portablerunner"), "Only PortableRunner is supported."
++         '--environment_type=%s' % python_urns.EMBEDDED_PYTHON,
++         '--job_endpoint=embed'])
+ 
+     # We use the save_main_session option because one or more DoFn's in this
+     # workflow rely on global context (e.g., a module imported at module level).
+     pipeline_options.view_as(SetupOptions).save_main_session = True
+-    self.run_pipelines(pipeline_options)
+ 
+-  @staticmethod
+-  def run_pipelines(pipeline_options):
+-    # The actual definitions of these transforms is in
+-    # org.apache.beam.runners.core.construction.TestExpansionService.
+-    TEST_COUNT_URN = "pytest:beam:transforms:count"
+-    TEST_FILTER_URN = "pytest:beam:transforms:filter_less_than"
++    ExternalTransformTest.run_pipeline_with_portable_runner(pipeline_options)
++
++  @unittest.skipIf(apiclient is None, 'GCP dependencies are not installed')
++  def test_java_expansion_dataflow(self):
++    # This test does not actually running the pipeline in Dataflow. It just
++    # tests the translation to a Dataflow job request.
++
++    with patch.object(
++        apiclient.DataflowApplicationClient, 'create_job') as mock_create_job:
++      port = ExternalTransformTest.expansion_service_port or 8091
++      with self._RunWithExpansion(port, self.expansion_service_jar):
++        pipeline_options = PipelineOptions(
++            ['--runner=DataflowRunner',
++             '--project=dummyproject',
++             '--experiments=beam_fn_api',
++             '--temp_location=gs://dummybucket/'])
++
++        # We use the save_main_session option because one or more DoFn's in this
++        # workflow rely on global context (e.g., a module imported at module
++        # level).
++        pipeline_options.view_as(SetupOptions).save_main_session = True
++
++        # Run a simple count-filtered-letters pipeline.
++        self.run_pipeline(pipeline_options, port, False)
++
++        mock_args = mock_create_job.call_args_list
++        assert mock_args
++        args, kwargs = mock_args[0]
++        job = args[0]
++        job_str = '%s' % job
++        self.assertIn('pytest:beam:transforms:filter_less_than', job_str)
+ 
+-    assert (
+-        pipeline_options.view_as(StandardOptions).runner.lower()
+-        == "portablerunner"), "Only PortableRunner is supported."
++  @staticmethod
++  def run_pipeline_with_portable_runner(pipeline_options):
+ 
+-    try:
++    port = ExternalTransformTest.expansion_service_port or 8091
+ 
++    with ExternalTransformTest._RunWithExpansion(
++        port, ExternalTransformTest.expansion_service_jar):
+       # Run a simple count-filtered-letters pipeline.
+-      p = beam.Pipeline(options=pipeline_options)
+-      p.runner.init_dockerized_job_server()
+-
+-      # Start the java server and wait for it to be ready.
+-      port = str(ExternalTransformTest.expansion_service_port)
+-      address = 'localhost:%s' % port
+-      server = subprocess.Popen([
+-          'java', '-jar', ExternalTransformTest.expansion_service_jar,
+-          port])
++      ExternalTransformTest.run_pipeline(pipeline_options, port, True)
+ 
+-      with grpc.insecure_channel(address) as channel:
+-        grpc.channel_ready_future(channel).result()
++  @staticmethod
++  def run_pipeline(
++      pipeline_options, expansion_service_port, wait_until_finish=True):
++    # The actual definitions of these transforms is in
++    # org.apache.beam.runners.core.construction.TestExpansionService.
++    TEST_COUNT_URN = "pytest:beam:transforms:count"
++    TEST_FILTER_URN = "pytest:beam:transforms:filter_less_than"
+ 
+-      res = (
+-          p
+-          | beam.Create(list('aaabccxyyzzz'))
+-          | beam.Map(unicode)
+-          # TODO(BEAM-6587): Use strings directly rather than ints.
+-          | beam.Map(lambda x: int(ord(x)))
+-          | beam.ExternalTransform(TEST_FILTER_URN, b'middle', address)
+-          | beam.ExternalTransform(TEST_COUNT_URN, None, address)
+-          # # TODO(BEAM-6587): Remove when above is removed.
+-          | beam.Map(lambda kv: (chr(kv[0]), kv[1]))
+-          | beam.Map(lambda kv: '%s: %s' % kv))
++    # Run a simple count-filtered-letters pipeline.
++    p = beam.Pipeline(options=pipeline_options)
++    address = 'localhost:%s' % str(expansion_service_port)
++    res = (
++        p
++        | beam.Create(list('aaabccxyyzzz'))
++        | beam.Map(unicode)
++        # TODO(BEAM-6587): Use strings directly rather than ints.
++        | beam.Map(lambda x: int(ord(x)))
++        | beam.ExternalTransform(TEST_FILTER_URN, b'middle', address)
++        | beam.ExternalTransform(TEST_COUNT_URN, None, address)
++        # # TODO(BEAM-6587): Remove when above is removed.
++        | beam.Map(lambda kv: (chr(kv[0]), kv[1]))
++        | beam.Map(lambda kv: '%s: %s' % kv))
+ 
+-      assert_that(res, equal_to(['a: 3', 'b: 1', 'c: 2']))
++    assert_that(res, equal_to(['a: 3', 'b: 1', 'c: 2']))
+ 
+-      p.run().wait_until_finish()
+-    finally:
+-      server.kill()
++    result = p.run()
++    if wait_until_finish:
++      result.wait_until_finish()
+ 
+ 
+ if __name__ == '__main__':
+@@ -184,7 +231,7 @@ def run_pipelines(pipeline_options):
+     ExternalTransformTest.expansion_service_port = int(
+         known_args.expansion_service_port)
+     pipeline_options = PipelineOptions(pipeline_args)
+-    ExternalTransformTest.run_pipelines(pipeline_options)
++    ExternalTransformTest.run_pipeline_with_portable_runner(pipeline_options)
+   else:
+     sys.argv = pipeline_args
+     unittest.main()
+diff --git a/sdks/python/apache_beam/transforms/ptransform.py b/sdks/python/apache_beam/transforms/ptransform.py
+index bfa1c5258312..e47271670a4d 100644
+--- a/sdks/python/apache_beam/transforms/ptransform.py
++++ b/sdks/python/apache_beam/transforms/ptransform.py
+@@ -601,9 +601,18 @@ def from_runner_api(cls, proto, context):
+     if proto is None or not proto.urn:
+       return None
+     parameter_type, constructor = cls._known_urns[proto.urn]
+-    return constructor(
+-        proto_utils.parse_Bytes(proto.payload, parameter_type),
+-        context)
++
++    try:
++      return constructor(
++          proto_utils.parse_Bytes(proto.payload, parameter_type),
++          context)
++    except Exception:
++      if context.allow_proto_holders:
++        # For external transforms we cannot build a Python ParDo object so
++        # we build a holder transform instead.
++        from apache_beam.transforms.core import RunnerAPIPTransformHolder
++        return RunnerAPIPTransformHolder(proto)
++      raise
+ 
+   def to_runner_api_parameter(self, unused_context):
+     # The payload here is just to ease debugging.

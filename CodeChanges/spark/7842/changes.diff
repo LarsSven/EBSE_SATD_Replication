@@ -1,0 +1,826 @@
+diff --git a/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/DecisionTreePMMLModelExport.scala b/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/DecisionTreePMMLModelExport.scala
+new file mode 100644
+index 0000000000000..fe063072c2206
+--- /dev/null
++++ b/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/DecisionTreePMMLModelExport.scala
+@@ -0,0 +1,42 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.mllib.pmml.export
++
++import org.dmg.pmml.DataDictionary
++
++import org.apache.spark.mllib.tree.model.DecisionTreeModel
++
++/** PMML Model Export for DecisionTreeModel class */
++private[mllib] class DecisionTreePMMLModelExport(model: DecisionTreeModel) extends PMMLModelExport {
++
++  val ModelName = "decision-tree"
++  populateDecisionTreePMMLModel(model)
++
++  private def populateDecisionTreePMMLModel(model: DecisionTreeModel): Unit = {
++    pmml.getHeader.setDescription("decision tree")
++
++    val (treeModel, dataFields) = PMMLTreeModelUtils.toPMMLTree(model, ModelName)
++
++    val dataDictionary = new DataDictionary()
++    .addDataFields(dataFields: _*)
++    .setNumberOfFields(dataFields.length)
++
++    pmml.addModels(treeModel)
++    pmml.setDataDictionary(dataDictionary)
++  }
++}
+diff --git a/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactory.scala b/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactory.scala
+index 29bd689e1185a..6beca6024d3ec 100644
+--- a/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactory.scala
++++ b/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactory.scala
+@@ -19,12 +19,10 @@ package org.apache.spark.mllib.pmml.export
+ 
+ import org.dmg.pmml.RegressionNormalizationMethodType
+ 
+-import org.apache.spark.mllib.classification.LogisticRegressionModel
+-import org.apache.spark.mllib.classification.SVMModel
++import org.apache.spark.mllib.classification.{LogisticRegressionModel, SVMModel}
+ import org.apache.spark.mllib.clustering.KMeansModel
+-import org.apache.spark.mllib.regression.LassoModel
+-import org.apache.spark.mllib.regression.LinearRegressionModel
+-import org.apache.spark.mllib.regression.RidgeRegressionModel
++import org.apache.spark.mllib.regression.{LassoModel, LinearRegressionModel, RidgeRegressionModel}
++import org.apache.spark.mllib.tree.model.DecisionTreeModel
+ 
+ private[mllib] object PMMLModelExportFactory {
+ 
+@@ -55,6 +53,8 @@ private[mllib] object PMMLModelExportFactory {
+           throw new IllegalArgumentException(
+             "PMML Export not supported for Multinomial Logistic Regression")
+         }
++      case decisionTreeModel: DecisionTreeModel =>
++        new DecisionTreePMMLModelExport(decisionTreeModel)
+       case _ =>
+         throw new IllegalArgumentException(
+           "PMML Export not supported for model: " + model.getClass.getName)
+diff --git a/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/PMMLTreeModelUtils.scala b/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/PMMLTreeModelUtils.scala
+new file mode 100644
+index 0000000000000..008d236a74cca
+--- /dev/null
++++ b/mllib/src/main/scala/org/apache/spark/mllib/pmml/export/PMMLTreeModelUtils.scala
+@@ -0,0 +1,254 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.mllib.pmml.export
++
++import scala.collection.JavaConverters._
++import scala.collection.mutable
++
++import org.dmg.pmml.{Node => PMMLNode, Value => PMMLValue, _}
++
++import org.apache.spark.mllib.tree.configuration.{Algo, FeatureType}
++import org.apache.spark.mllib.tree.configuration.Algo._
++import org.apache.spark.mllib.tree.model.{DecisionTreeModel, Node}
++
++private[mllib] object PMMLTreeModelUtils {
++
++  val FieldNamePrefix = "field_"
++
++  def toPMMLTree(dtModel: DecisionTreeModel, modelName: String): (TreeModel, List[DataField]) = {
++
++    val miningFunctionType = dtModel.algo match {
++      case Algo.Classification => MiningFunctionType.CLASSIFICATION
++      case Algo.Regression => MiningFunctionType.REGRESSION
++    }
++
++    val treeModel = new TreeModel()
++      .setModelName(modelName)
++      .setFunctionName(miningFunctionType)
++      .setSplitCharacteristic(TreeModel.SplitCharacteristic.BINARY_SPLIT)
++
++    var (rootNode, miningFields, dataFields, classes) = buildStub(dtModel.topNode, dtModel.algo)
++
++    // adding predicted classes for classification and target field for regression for completeness
++    dtModel.algo match {
++
++      case Algo.Classification =>
++        miningFields = miningFields :+ new MiningField()
++          .setName(FieldName.create("class"))
++          .setUsageType(FieldUsageType.PREDICTED)
++
++        val dataField = new DataField()
++          .setName(FieldName.create("class"))
++          .setOpType(OpType.CATEGORICAL)
++          .addValues(classes: _*)
++          .setDataType(DataType.DOUBLE)
++
++        dataFields = dataFields :+ dataField
++
++      case Algo.Regression =>
++        val targetField = FieldName.create("target")
++        val dataField = new DataField(targetField, OpType.CONTINUOUS, DataType.DOUBLE)
++        dataFields = dataFields :+ dataField
++
++        miningFields = miningFields :+ new MiningField()
++          .setName(targetField)
++          .setUsageType(FieldUsageType.TARGET)
++
++    }
++
++    val miningSchema = new MiningSchema().addMiningFields(miningFields: _*)
++
++    treeModel.setNode(rootNode).setMiningSchema(miningSchema)
++
++    (treeModel, dataFields)
++  }
++
++  /** Build a pmml tree stub given the root mllib node. */
++  private def buildStub(rootDTNode: Node, algo: Algo):
++    (PMMLNode, List[MiningField], List[DataField], List[PMMLValue]) = {
++
++    val miningFields = mutable.MutableList[MiningField]()
++    val dataFields = mutable.HashMap[String, DataField]()
++    val classes = mutable.MutableList[Double]()
++
++    def buildStubInternal(rootNode: Node, predicate: Predicate): PMMLNode = {
++
++      // get rootPMML node for the MLLib node
++      val rootPMMLNode = new PMMLNode()
++        .setId(rootNode.id.toString)
++        .setScore(rootNode.predict.predict.toString)
++        .setPredicate(predicate)
++
++      var leftPredicate: Predicate = new True()
++      var rightPredicate: Predicate = new True()
++
++      if (rootNode.split.isDefined) {
++        val fieldName = FieldName.create(FieldNamePrefix + rootNode.split.get.feature)
++        val dataField = getDataField(rootNode, fieldName).get
++
++        if (dataFields.get(dataField.getName.getValue).isEmpty) {
++          dataFields.put(dataField.getName.getValue, dataField)
++          miningFields += new MiningField()
++            .setName(dataField.getName)
++            .setUsageType(FieldUsageType.ACTIVE)
++
++        } else if (dataField.getOpType != OpType.CONTINUOUS) {
++          appendCategories(
++            dataFields.get(dataField.getName.getValue).get,
++            dataField.getValues.asScala.toList)
++        }
++
++        leftPredicate = getPredicate(rootNode, Some(dataField.getName), true)
++        rightPredicate = getPredicate(rootNode, Some(dataField.getName), false)
++      }
++      // if left node exist, add the node
++      if (rootNode.leftNode.isDefined) {
++        val leftNode = buildStubInternal(rootNode.leftNode.get, leftPredicate)
++        rootPMMLNode.addNodes(leftNode)
++      }
++      // if right node exist, add the node
++      if (rootNode.rightNode.isDefined) {
++        val rightNode = buildStubInternal(rootNode.rightNode.get, rightPredicate)
++        rootPMMLNode.addNodes(rightNode)
++      }
++
++      // add to the list of classes
++      if (rootNode.isLeaf && (algo == Algo.Classification)) {
++        classes += rootNode.predict.predict
++      }
++
++      rootPMMLNode
++    }
++    val pmmlTreeRootNode = buildStubInternal(rootDTNode, new True())
++    val pmmlValues = classes.toList.distinct.map(doubleVal => new PMMLValue(doubleVal.toString))
++    val result = (pmmlTreeRootNode,
++      sortMiningFields(miningFields.toList),
++      sortedDataFields(dataFields.values.toList),
++      pmmlValues)
++    result
++  }
++
++  private def sortMiningFields(miningFields: List[MiningField]): List[MiningField] = {
++    miningFields
++      .sortBy { case mField => mField.getName.getValue.replace(FieldNamePrefix, "").toInt }
++  }
++
++  private def sortedDataFields(dataFields: List[DataField]): List[DataField] = {
++    dataFields.sortBy { case dField => dField.getName.getValue.replace(FieldNamePrefix, "").toInt }
++  }
++
++  private def appendCategories(dtField: DataField, values: List[PMMLValue]): DataField = {
++    if (dtField.getOpType == OpType.CATEGORICAL) {
++
++      val existingValues = dtField.getValues.asScala
++        .groupBy { case category => category.getValue }
++
++      values.foreach(category => {
++        if (existingValues.get(category.getValue).isEmpty) {
++          dtField.addValues(category)
++        }
++      })
++    }
++
++    dtField
++  }
++
++  /** Get pmml Predicate for a given mlLib tree node. */
++  private def getPredicate(node: Node, fieldName: Option[FieldName], isLeft: Boolean): Predicate = {
++    // compound predicate if classification and categories list length > 0
++
++    if (node.split.isDefined) {
++      require(fieldName.isDefined, "fieldName should not be None, it should be defined.")
++      val field = fieldName.get
++      val split = node.split.get
++      val featureType = split.featureType
++
++      featureType match {
++        case FeatureType.Continuous =>
++          val value = split.threshold.toString
++          if (isLeft) {
++            new SimplePredicate(field, SimplePredicate.Operator.LESS_OR_EQUAL)
++              .setValue(value)
++          }
++          else {
++            new SimplePredicate(field, SimplePredicate.Operator.GREATER_THAN)
++              .setValue(value)
++          }
++
++        case FeatureType.Categorical =>
++          if (split.categories.length > 1) {
++            if (isLeft) {
++              val predicates: List[Predicate] =
++                for (category <- split.categories)
++                  yield
++                  new SimplePredicate(field, SimplePredicate.Operator.EQUAL)
++                    .setValue(category.toString)
++
++              val compoundPredicate = new CompoundPredicate()
++                .setBooleanOperator(CompoundPredicate.BooleanOperator.OR)
++                .addPredicates(predicates: _*)
++
++              compoundPredicate
++            } else {
++              new True()
++            }
++          }
++          else {
++            val value = split.categories(0).toString
++
++            if (isLeft) {
++              new SimplePredicate(field, SimplePredicate.Operator.EQUAL)
++                .setValue(value)
++            }
++            else {
++              new True()
++            }
++          }
++      }
++    }
++    else {
++      new True()
++    }
++
++  }
++
++  /** Get PMML datafield based on the mllib split feature. */
++  private def getDataField(mllibNode: Node, fieldName: FieldName): Option[DataField] = {
++    if (!mllibNode.isLeaf && mllibNode.split.isDefined) {
++      val split = mllibNode.split.get
++      val dataField = new DataField()
++        .setName(fieldName)
++        .setDataType(DataType.fromValue(split.threshold.getClass.getSimpleName.toLowerCase))
++        .setOpType(OpType.fromValue(split.featureType.toString.toLowerCase))
++
++      split.featureType match {
++        case FeatureType.Continuous => dataField.setOpType(OpType.CONTINUOUS)
++        case FeatureType.Categorical =>
++          dataField.setOpType(OpType.CATEGORICAL)
++          val categories = split.categories
++            .map(category => new PMMLValue(category.toString))
++            dataField.addValues(categories: _*)
++      }
++
++      Some(dataField)
++    }
++    else {
++      None
++    }
++  }
++}
+diff --git a/mllib/src/main/scala/org/apache/spark/mllib/tree/model/DecisionTreeModel.scala b/mllib/src/main/scala/org/apache/spark/mllib/tree/model/DecisionTreeModel.scala
+index 27618e122aefd..c30f3e59d592c 100644
+--- a/mllib/src/main/scala/org/apache/spark/mllib/tree/model/DecisionTreeModel.scala
++++ b/mllib/src/main/scala/org/apache/spark/mllib/tree/model/DecisionTreeModel.scala
+@@ -28,6 +28,7 @@ import org.apache.spark.annotation.Since
+ import org.apache.spark.api.java.JavaRDD
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.mllib.linalg.Vector
++import org.apache.spark.mllib.pmml.PMMLExportable
+ import org.apache.spark.mllib.tree.configuration.{Algo, FeatureType}
+ import org.apache.spark.mllib.tree.configuration.Algo._
+ import org.apache.spark.mllib.util.{Loader, Saveable}
+@@ -44,7 +45,7 @@ import org.apache.spark.util.Utils
+ @Since("1.0.0")
+ class DecisionTreeModel @Since("1.0.0") (
+     @Since("1.0.0") val topNode: Node,
+-    @Since("1.0.0") val algo: Algo) extends Serializable with Saveable {
++    @Since("1.0.0") val algo: Algo) extends Serializable with Saveable with PMMLExportable {
+ 
+   /**
+    * Predict values for a single data point using the model trained.
+diff --git a/mllib/src/test/scala/org/apache/spark/mllib/pmml/export/DecisionTreePMMLModelExportSuite.scala b/mllib/src/test/scala/org/apache/spark/mllib/pmml/export/DecisionTreePMMLModelExportSuite.scala
+new file mode 100644
+index 0000000000000..2c311137f950c
+--- /dev/null
++++ b/mllib/src/test/scala/org/apache/spark/mllib/pmml/export/DecisionTreePMMLModelExportSuite.scala
+@@ -0,0 +1,427 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.mllib.pmml.export
++
++import scala.collection.JavaConverters._
++
++import org.dmg.pmml._
++import org.dmg.pmml.CompoundPredicate.BooleanOperator
++import org.scalatest.PrivateMethodTester
++
++import org.apache.spark.SparkFunSuite
++import org.apache.spark.mllib.tree.configuration.{Algo, FeatureType}
++import org.apache.spark.mllib.tree.model.{DecisionTreeModel, Node, Predict, Split}
++import org.apache.spark.mllib.util.MLlibTestSparkContext
++
++class DecisionTreePMMLModelExportSuite extends SparkFunSuite with MLlibTestSparkContext
++with PrivateMethodTester {
++
++  test("PMML export should work as expected for DecisionTree model with regressor") {
++
++    // instantiate a MLLib DecisionTreeModel with Regression and with 3 nodes with continuous
++    // feature type
++    val mlLeftNode = new Node(2, new Predict(0.5, 0.5), 0.2, true, None, None, None, None)
++    val mlRightNode = new Node(3, new Predict(1.0, 0.5), 0.2, true, None, None, None, None)
++    val split = new Split(100, 10.00, FeatureType.Continuous, Nil)
++    val mlTopNode = new Node(1, new Predict(0.0, 0.1), 0.2, false,
++      Some(split), Some(mlLeftNode), Some(mlRightNode), None)
++
++    val decisionTreeModel = new DecisionTreeModel(mlTopNode, Algo.Regression)
++
++    // get the pmml exporter for the DT and verify its the right exporter
++    val pmmlExporterForDT = PMMLModelExportFactory.createPMMLModelExport(decisionTreeModel)
++    assert(pmmlExporterForDT.isInstanceOf[DecisionTreePMMLModelExport])
++
++    // get the pmmlwrapper object for DT and verify the inner model is of type TreeModel
++    // and basic fields are populated as expected
++    val pmmlWrapperForDT = pmmlExporterForDT.getPmml
++    assert(pmmlWrapperForDT.getHeader.getDescription == "decision tree")
++    assert(!pmmlWrapperForDT.getModels.isEmpty)
++    assert(pmmlWrapperForDT.getModels.size() == 1)
++    val pmmlModelForDT = pmmlWrapperForDT.getModels.get(0)
++    assert(pmmlModelForDT.isInstanceOf[TreeModel])
++
++    // validate the inner tree model fields are populated as expected
++    val pmmlTreeModel = pmmlModelForDT.asInstanceOf[TreeModel]
++    assert(pmmlTreeModel.getFunctionName == MiningFunctionType.REGRESSION)
++
++    // validate the root PMML node is populated as expected
++    val pmmlRootNode = pmmlTreeModel.getNode
++    assert(pmmlRootNode != null)
++    assert(pmmlRootNode.getNodes != null && pmmlRootNode.getNodes.size() == 2)
++    assert(pmmlRootNode.getId === "1")
++    // validate the root node predicate is populated as expected
++    val predicate = pmmlRootNode.getPredicate
++    assert(predicate != null)
++    assert(predicate.isInstanceOf[True])
++
++    // validate the left node is populated as expected
++    val pmmlLeftNode = pmmlRootNode.getNodes.get(0)
++    assert(pmmlLeftNode != null)
++    assert(!pmmlLeftNode.hasNodes)
++    assert(pmmlLeftNode.getId === "2")
++    assert(pmmlLeftNode.getScore == "0.5")
++    val predicate1 = pmmlLeftNode.getPredicate
++    assert(predicate1 != null)
++    assert(predicate1.isInstanceOf[SimplePredicate])
++    assert(predicate1.asInstanceOf[SimplePredicate].getField.getValue === "field_100")
++    assert(predicate1.asInstanceOf[SimplePredicate].getValue === "10.0")
++    assert(predicate1.asInstanceOf[SimplePredicate].getOperator == SimplePredicate.Operator
++      .LESS_OR_EQUAL)
++
++    // validate the right node is populated as expected
++    val pmmlRightNode = pmmlRootNode.getNodes.get(1)
++    assert(pmmlRightNode != null)
++    assert(!pmmlRightNode.hasNodes)
++    assert(pmmlRightNode.getId === "3")
++    assert(pmmlRightNode.getScore == "1.0")
++
++    val predicate2 = pmmlRightNode.getPredicate
++    assert(predicate2 != null)
++    assert(predicate2.isInstanceOf[SimplePredicate])
++    assert(predicate2.asInstanceOf[SimplePredicate].getField.getValue === "field_100")
++    assert(predicate2.asInstanceOf[SimplePredicate].getValue === "10.0")
++    assert(predicate2.asInstanceOf[SimplePredicate].getOperator == SimplePredicate.Operator
++      .GREATER_THAN)
++
++    // validate the mining schema is populated as expected
++    assert(pmmlModelForDT.getMiningSchema != null)
++    val miningSchema = pmmlModelForDT.getMiningSchema
++    assert(miningSchema.getMiningFields != null && miningSchema.getMiningFields.size() == 2)
++    val miningFields = miningSchema.getMiningFields
++    assert(miningFields.get(0).getName.getValue == "field_100")
++    assert(miningFields.get(1).getName.getValue == "target")
++
++    // validate the data dictionay is populated as expected
++    val dataDictionary = pmmlWrapperForDT.getDataDictionary
++    assert(dataDictionary != null)
++    val dataFields = dataDictionary.getDataFields
++    assert(dataFields != null && dataFields.size() == 2)
++    assert(dataFields.get(0).getName.getValue == "field_100")
++    assert(dataFields.get(0).getOpType == OpType.CONTINUOUS)
++    assert(dataFields.get(1).getName.getValue == "target")
++    assert(dataFields.get(1).getOpType == OpType.CONTINUOUS)
++  }
++
++  test("PMML export should work as expected for DecisionTree model with classifier") {
++
++    // instantiate MLLIb DecisionTreeModel with Classification algo ,5 nodes, 2 levels
++    val mlLeftNode_L2 = new Node(4, new Predict(1.0, 0.5), 0.2, true, None, None, None, None)
++    val mlRightNode_L2 = new Node(5, new Predict(2.0, 0.5), 0.2, true, None, None, None, None)
++    val splitForL2 = new Split(100, 10.00, FeatureType.Categorical, List(1, 4))
++    val mlLeftNode_L1 = new Node(2, new Predict(3.0, 0.5), 0.2, false,
++      Some(splitForL2), Some(mlLeftNode_L2), Some(mlRightNode_L2), None)
++    val mlRightNode_L1 = new Node(3, new Predict(4.0, 0.5), 0.2, true, None, None, None, None)
++    val split = new Split(200, 10.00, FeatureType.Categorical, List(10, 20))
++    val mlTopNode = new Node(1, new Predict(5.0, 0.1), 0.2, false, Some(split),
++      Some(mlLeftNode_L1), Some(mlRightNode_L1), None)
++    val decisionTreeModel = new DecisionTreeModel(mlTopNode, Algo.Classification)
++
++    // get the pmml exporter for the DT and verify its the right exporter
++    val pmmlExporterForDT = PMMLModelExportFactory.createPMMLModelExport(decisionTreeModel)
++    assert(pmmlExporterForDT.isInstanceOf[DecisionTreePMMLModelExport])
++
++    // get the pmmlwrapper object for DT and verify the inner model is of type TreeModel
++    // and basic fields are populated as expected
++    val pmmlWrapperForDT = pmmlExporterForDT.getPmml
++    assert(pmmlWrapperForDT.getHeader.getDescription == "decision tree")
++    assert(!pmmlWrapperForDT.getModels.isEmpty)
++    assert(pmmlWrapperForDT.getModels.size() == 1)
++
++    // validate the inner tree model fields are populated as expected
++    val pmmlModelForDT = pmmlWrapperForDT.getModels.get(0)
++    assert(pmmlModelForDT.isInstanceOf[TreeModel])
++    val pmmlTreeModel = pmmlModelForDT.asInstanceOf[TreeModel]
++    assert(pmmlTreeModel.getFunctionName == MiningFunctionType.CLASSIFICATION)
++
++    // validate the pmml root node fields are populated as expected
++    val pmmlRootNode = pmmlTreeModel.getNode
++    assert(pmmlRootNode != null)
++    assert(pmmlRootNode.getNodes != null && pmmlRootNode.getNodes.size() == 2)
++    assert(pmmlRootNode.getId === "1")
++
++    // validate the pmml root node predicate is a true predicate since its root node
++
++    val predicate = pmmlRootNode.getPredicate
++    assert(predicate != null)
++    assert(predicate.isInstanceOf[True])
++
++    // validate level 1 left node is populated properly
++    val pmmlLeftNode_L1 = pmmlRootNode.getNodes.get(0)
++    assert(pmmlLeftNode_L1 != null)
++    assert(pmmlLeftNode_L1.hasNodes)
++    assert(pmmlLeftNode_L1.getId === "2")
++    assert(pmmlLeftNode_L1.getScore == "3.0")
++    // left node to the root node should have compound predicate, since its condition is on multiple
++    // categories
++    val predicateL1 = pmmlLeftNode_L1.getPredicate
++    assert(predicateL1 != null)
++    assert(predicateL1.isInstanceOf[CompoundPredicate])
++    val cPredicate1 = predicateL1.asInstanceOf[CompoundPredicate]
++    assert(cPredicate1.getBooleanOperator == BooleanOperator.OR)
++    assert(cPredicate1.getPredicates != null && cPredicate1.getPredicates.size() == 2)
++    val predicatesList1 = cPredicate1.getPredicates
++    assert(predicatesList1.get(0).isInstanceOf[SimplePredicate])
++    assert(predicatesList1.get(0).asInstanceOf[SimplePredicate].getField.getValue === "field_200")
++    assert(predicatesList1.get(0).asInstanceOf[SimplePredicate].getValue === "10.0")
++    assert(predicatesList1.get(0).asInstanceOf[SimplePredicate].getOperator == SimplePredicate
++      .Operator.EQUAL)
++
++    assert(predicatesList1.get(1).isInstanceOf[SimplePredicate])
++    assert(predicatesList1.get(1).asInstanceOf[SimplePredicate].getField.getValue === "field_200")
++    assert(predicatesList1.get(1).asInstanceOf[SimplePredicate].getValue === "20.0")
++    assert(predicatesList1.get(1).asInstanceOf[SimplePredicate].getOperator == SimplePredicate
++      .Operator.EQUAL)
++
++    // validate level 1 right node is populated properly
++    val pmmlRightNode_L1 = pmmlRootNode.getNodes.get(1)
++    assert(pmmlRightNode_L1 != null)
++    assert(!pmmlRightNode_L1.hasNodes)
++    assert(pmmlRightNode_L1.getId === "3")
++    assert(pmmlRightNode_L1.getScore == "4.0")
++    // right node at level 1 should have True Predicate since the left node is the list of
++    // categories predicate
++    val predicateR1 = pmmlRightNode_L1.getPredicate
++    assert(predicateR1 != null)
++    assert(predicateR1.isInstanceOf[True])
++
++    // validate level 2 left node is populated as expected
++    val pmmlLeftNode_L2 = pmmlLeftNode_L1.getNodes.get(0)
++    assert(pmmlLeftNode_L2 != null)
++    assert(!pmmlLeftNode_L2.hasNodes)
++    assert(pmmlLeftNode_L2.getId === "4")
++    assert(pmmlLeftNode_L2.getScore == "1.0")
++    // validate predicate for level 2 split is populated as expected
++    val predicateL2 = pmmlLeftNode_L2.getPredicate
++    assert(predicateL2 != null)
++    assert(predicateL2.isInstanceOf[CompoundPredicate])
++    val cPredicate2 = predicateL2.asInstanceOf[CompoundPredicate]
++
++    assert(cPredicate2.getBooleanOperator == BooleanOperator.OR)
++    assert(cPredicate2.getPredicates != null && cPredicate2.getPredicates.size() == 2)
++    val predicatesList2 = cPredicate2.getPredicates
++    assert(predicatesList2.get(0).isInstanceOf[SimplePredicate])
++    assert(predicatesList2.get(0).asInstanceOf[SimplePredicate].getField.getValue === "field_100")
++    assert(predicatesList2.get(0).asInstanceOf[SimplePredicate].getValue === "1.0")
++    assert(predicatesList2.get(0).asInstanceOf[SimplePredicate].getOperator == SimplePredicate
++      .Operator.EQUAL)
++
++    assert(predicatesList2.get(1).isInstanceOf[SimplePredicate])
++    assert(predicatesList2.get(1).asInstanceOf[SimplePredicate].getField.getValue === "field_100")
++    assert(predicatesList2.get(1).asInstanceOf[SimplePredicate].getValue === "4.0")
++    assert(predicatesList2.get(1).asInstanceOf[SimplePredicate].getOperator == SimplePredicate
++      .Operator.EQUAL)
++
++    // validate level 2 right node is populated as expected
++    val pmmlRightNode_L2 = pmmlLeftNode_L1.getNodes.get(1)
++    assert(pmmlRightNode_L2 != null)
++    assert(!pmmlRightNode_L2.hasNodes)
++    assert(pmmlRightNode_L2.getId === "5")
++    assert(pmmlRightNode_L2.getScore == "2.0")
++    val predicateR2 = pmmlRightNode_L2.getPredicate
++    assert(predicateR2 != null)
++    assert(predicateR2.isInstanceOf[True])
++
++    // validate mining schema is populated as expected
++    assert(pmmlModelForDT.getMiningSchema != null)
++    val miningSchema = pmmlModelForDT.getMiningSchema
++    assert(miningSchema.getMiningFields != null && miningSchema.getMiningFields.size() == 3)
++
++    val miningFields = miningSchema.getMiningFields.asScala.toList
++      .sortBy(miningField => miningField.getName.getValue)
++    assert(miningFields(0).getName.getValue == "class")
++    assert(miningFields(0).getUsageType == FieldUsageType.PREDICTED)
++
++    assert(miningFields(1).getName.getValue == "field_100")
++    assert(miningFields(1).getUsageType == FieldUsageType.ACTIVE)
++
++    assert(miningFields(2).getName.getValue == "field_200")
++    assert(miningFields(2).getUsageType == FieldUsageType.ACTIVE)
++
++
++    // validate data dictionary is populated as expected
++    val dataDictionary = pmmlWrapperForDT.getDataDictionary
++    assert(dataDictionary != null)
++    val dataFields = dataDictionary.getDataFields
++    assert(dataFields != null && dataFields.size() == 3)
++    val sortedDataFields = dataFields.asScala.toList.sortBy(dataField => dataField.getName.getValue)
++
++    assert(sortedDataFields(0).getName.getValue == "class")
++    assert(sortedDataFields(0).getOpType == OpType.CATEGORICAL)
++    assert(sortedDataFields(0).getValues != null && sortedDataFields(0).getValues.size() == 3)
++    val sortedValues1 = sortedDataFields(0).getValues.asScala.toList.sortBy(value => value.getValue)
++    assert(sortedValues1(0).getValue == "1.0")
++    assert(sortedValues1(1).getValue == "2.0")
++    assert(sortedValues1(2).getValue == "4.0")
++
++    assert(sortedDataFields(1).getName.getValue == "field_100")
++    assert(sortedDataFields(1).getOpType == OpType.CATEGORICAL)
++    assert(sortedDataFields(1).getValues != null && sortedDataFields(1).getValues.size() == 2)
++    val sortedValues2 = sortedDataFields(1).getValues.asScala.toList.sortBy(value => value.getValue)
++    assert(sortedValues2(0).getValue == "1.0")
++    assert(sortedValues2(1).getValue == "4.0")
++
++    assert(sortedDataFields(2).getName.getValue == "field_200")
++    assert(sortedDataFields(2).getOpType == OpType.CATEGORICAL)
++    assert(sortedDataFields(2).getValues != null && sortedDataFields(2).getValues.size() == 2)
++    val sortedValues3 = sortedDataFields(2).getValues.asScala.toList.sortBy(value => value.getValue)
++    assert(sortedValues3(0).getValue == "10.0")
++    assert(sortedValues3(1).getValue == "20.0")
++
++  }
++
++  test("TreeModelUtils should return distinct datafields and miningfields for continuous " +
++    "features") {
++
++    // instantiate MLLIb DecisionTreeModel with Classification algo ,5 nodes, 2 levels
++    val mlLeftNode_L3 = new Node(6, new Predict(1.0, 0.5), 0.2, true, None, None, None, None)
++    val mlRightNode_L3 = new Node(7, new Predict(2.0, 0.5), 0.2, true, None, None, None, None)
++    val splitForL3 = new Split(100, 10.00, FeatureType.Continuous, Nil)
++    val mlLeftNode_L2 = new Node(4, new Predict(3.0, 0.5), 0.2, false, Some(splitForL3),
++      Some(mlLeftNode_L3), Some(mlRightNode_L3), None)
++    val mlRightNode_L2 = new Node(5, new Predict(4.0, 0.5), 0.2, true, None, None, None, None)
++
++    val splitForL2 = new Split(100, 4.00, FeatureType.Continuous, Nil)
++    val mlLeftNode_L1 = new Node(2, new Predict(3.0, 0.5), 0.2, false,
++      Some(splitForL2), Some(mlLeftNode_L2), Some(mlRightNode_L3), None)
++    val mlRightNode_L1 = new Node(3, new Predict(4.0, 0.5), 0.2, true, None, None, None, None)
++
++    val split1 = new Split(200, 10.00, FeatureType.Categorical, List(10))
++    val mlTopNode = new Node(1, new Predict(5.0, 0.1), 0.2, false, Some(split1),
++      Some(mlLeftNode_L1), Some(mlRightNode_L1), None)
++    val decisionTreeModel = new DecisionTreeModel(mlTopNode, Algo.Regression)
++
++    // get the pmml exporter for the DT and verify its the right exporter
++    val pmmlExporterForDT = PMMLModelExportFactory.createPMMLModelExport(decisionTreeModel)
++    assert(pmmlExporterForDT.isInstanceOf[DecisionTreePMMLModelExport])
++
++    // get the pmmlwrapper object for DT and verify the inner model is of type TreeModel
++    // and basic fields are populated as expected
++    val pmmlWrapperForDT = pmmlExporterForDT.getPmml
++    // validate the inner tree model fields are populated as expected
++    val pmmlModelForDT = pmmlWrapperForDT.getModels.get(0)
++    assert(pmmlModelForDT.isInstanceOf[TreeModel])
++    // validate mining schema is populated as expected
++    assert(pmmlModelForDT.getMiningSchema != null)
++    val miningSchema = pmmlModelForDT.getMiningSchema
++    assert(miningSchema.getMiningFields != null && miningSchema.getMiningFields.size() == 3)
++
++    val miningFields = miningSchema.getMiningFields.asScala.toList
++    // .sortBy(miningField => miningField.getName.getValue)
++    assert(miningFields(0).getName.getValue == "field_100")
++    assert(miningFields(1).getName.getValue == "field_200")
++    assert(miningFields(2).getName.getValue == "target")
++
++
++    // validate data dictionary is populated as expected
++    val dataDictionary = pmmlWrapperForDT.getDataDictionary
++    assert(dataDictionary != null)
++    val dataFields = dataDictionary.getDataFields
++    assert(dataFields != null && dataFields.size() == 3)
++    val sortedDataFields = dataFields.asScala.toList.sortBy(dataField => dataField.getName.getValue)
++    assert(sortedDataFields(0).getName.getValue == "field_100")
++    assert(sortedDataFields(0).getOpType == OpType.CONTINUOUS)
++    assert(sortedDataFields(0).getValues.isEmpty)
++
++    assert(sortedDataFields(1).getName.getValue == "field_200")
++    assert(sortedDataFields(1).getOpType == OpType.CATEGORICAL)
++    assert(sortedDataFields(1).getValues != null && sortedDataFields(1).getValues.size() == 1)
++    val sortedValues2 = sortedDataFields(1).getValues.asScala.toList.sortBy(value => value.getValue)
++    assert(sortedValues2(0).getValue == "10.0")
++
++    assert(sortedDataFields(2).getName.getValue == "target")
++    assert(sortedDataFields(2).getOpType == OpType.CONTINUOUS)
++    assert(sortedDataFields(2).getValues.isEmpty)
++  }
++
++  test("TreeModelUtils getPredicate should return simple predicate for node with split with " +
++    "continuous feature type") {
++    val split = new Split(100, 10.0, FeatureType.Continuous, Nil)
++    val field = Some(FieldName.create("field_100"))
++    val node = new Node(1, new Predict(0.5, 0.5), 0.2, true, Some(split), None, None, None)
++    val proxy = PrivateMethod[Predicate]('getPredicate)
++    val predicateL = PMMLTreeModelUtils invokePrivate proxy(node, field, true)
++    assert(predicateL != null)
++    assert(predicateL.isInstanceOf[SimplePredicate])
++    assert(predicateL.asInstanceOf[SimplePredicate].getField.getValue == "field_100")
++    assert(predicateL.asInstanceOf[SimplePredicate].getOperator == SimplePredicate.Operator
++      .LESS_OR_EQUAL)
++    assert(predicateL.asInstanceOf[SimplePredicate].getValue == "10.0")
++
++    val predicateR = PMMLTreeModelUtils invokePrivate proxy(node, field, false)
++    assert(predicateR != null)
++    assert(predicateR.isInstanceOf[SimplePredicate])
++    assert(predicateR.asInstanceOf[SimplePredicate].getField.getValue == "field_100")
++    assert(predicateR.asInstanceOf[SimplePredicate].getOperator == SimplePredicate.Operator
++      .GREATER_THAN)
++    assert(predicateR.asInstanceOf[SimplePredicate].getValue == "10.0")
++  }
++
++  test("TreeModelUtils getPredicate should work as expected for node with split with catogorical " +
++    "feature") {
++    val split1 = new Split(100, 10.0, FeatureType.Categorical, List(1))
++    val node1 = new Node(1, new Predict(0.5, 0.5), 0.2, true, Some(split1), None, None, None)
++    val proxy = PrivateMethod[Predicate]('getPredicate)
++    val field = Some(FieldName.create("field_100"))
++
++    val predicateL1 = PMMLTreeModelUtils invokePrivate proxy(node1, field, true)
++    assert(predicateL1 != null)
++    assert(predicateL1.isInstanceOf[SimplePredicate])
++    assert(predicateL1.asInstanceOf[SimplePredicate].getField.getValue == "field_100")
++    assert(predicateL1.asInstanceOf[SimplePredicate].getOperator == SimplePredicate.Operator
++      .EQUAL)
++    assert(predicateL1.asInstanceOf[SimplePredicate].getValue == "1.0")
++
++    val predicateR1 = PMMLTreeModelUtils invokePrivate proxy(node1, field, false)
++    assert(predicateR1 != null)
++    assert(predicateR1.isInstanceOf[True])
++
++    val split2 = new Split(100, 10.0, FeatureType.Categorical, List(1, 2))
++    val node2 = new Node(1, new Predict(0.5, 0.5), 0.2, true, Some(split2), None, None, None)
++    val predicateL2 = PMMLTreeModelUtils invokePrivate proxy(node2, field, true)
++    assert(predicateL2 != null && predicateL2.isInstanceOf[CompoundPredicate])
++    val cPredicate2 = predicateL2.asInstanceOf[CompoundPredicate]
++
++    assert(cPredicate2.getBooleanOperator == BooleanOperator.OR)
++    assert(cPredicate2.getPredicates != null && cPredicate2.getPredicates.size() == 2)
++    val predicatesList2 = cPredicate2.getPredicates
++    assert(predicatesList2.get(0).isInstanceOf[SimplePredicate])
++    assert(predicatesList2.get(0).asInstanceOf[SimplePredicate].getField.getValue === "field_100")
++    assert(predicatesList2.get(0).asInstanceOf[SimplePredicate].getValue === "1.0")
++    assert(predicatesList2.get(0).asInstanceOf[SimplePredicate].getOperator == SimplePredicate
++      .Operator.EQUAL)
++
++    assert(predicatesList2.get(1).isInstanceOf[SimplePredicate])
++    assert(predicatesList2.get(1).asInstanceOf[SimplePredicate].getField.getValue === "field_100")
++    assert(predicatesList2.get(1).asInstanceOf[SimplePredicate].getValue === "2.0")
++    assert(predicatesList2.get(1).asInstanceOf[SimplePredicate].getOperator == SimplePredicate
++      .Operator.EQUAL)
++
++    val predicateR2 = PMMLTreeModelUtils invokePrivate proxy(node2, field, false)
++    assert(predicateR2 != null && predicateR2.isInstanceOf[True])
++  }
++
++  test("TreeModelUtils getPredicate returns True Predicate if split not defined for node") {
++    val treeNode1 = new Node(1, new Predict(0.5, 0.5), 0.2, true, None, None, None, None)
++    val privateMethodProxy = PrivateMethod[Predicate]('getPredicate)
++    val predicate1 = PMMLTreeModelUtils invokePrivate privateMethodProxy(treeNode1, None, true)
++    assert(predicate1 != null)
++    assert(predicate1.isInstanceOf[True])
++  }
++}
++
+diff --git a/mllib/src/test/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactorySuite.scala b/mllib/src/test/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactorySuite.scala
+index af49450961750..565afd3460a1f 100644
+--- a/mllib/src/test/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactorySuite.scala
++++ b/mllib/src/test/scala/org/apache/spark/mllib/pmml/export/PMMLModelExportFactorySuite.scala
+@@ -22,6 +22,8 @@ import org.apache.spark.mllib.classification.{LogisticRegressionModel, SVMModel}
+ import org.apache.spark.mllib.clustering.KMeansModel
+ import org.apache.spark.mllib.linalg.Vectors
+ import org.apache.spark.mllib.regression.{LassoModel, LinearRegressionModel, RidgeRegressionModel}
++import org.apache.spark.mllib.tree.configuration.{Algo, FeatureType}
++import org.apache.spark.mllib.tree.model.{DecisionTreeModel, Node, Predict, Split}
+ import org.apache.spark.mllib.util.LinearDataGenerator
+ 
+ class PMMLModelExportFactorySuite extends SparkFunSuite {
+@@ -91,4 +93,21 @@ class PMMLModelExportFactorySuite extends SparkFunSuite {
+       PMMLModelExportFactory.createPMMLModelExport(invalidModel)
+     }
+   }
++
++  test("PMMLModelExportFactory should create DecisionTreePMMLModelExport " +
++    "when passing in DecisionTreeModel") {
++    // instantiate a MLLib DecisionTreeModel with Regression and with 3 nodes with continuous
++    // feature type
++    val mlLeftNode = new Node(2, new Predict(0.5, 0.5), 0.2, true, None, None, None, None)
++    val mlRightNode = new Node(3, new Predict(1.0, 0.5), 0.2, true, None, None, None, None)
++    val split = new Split(100, 10.00, FeatureType.Continuous, Nil)
++    val mlTopNode = new Node(1, new Predict(0.0, 0.1), 0.2, false,
++      Some(split), Some(mlLeftNode), Some(mlRightNode), None)
++
++    val decisionTreeModel = new DecisionTreeModel(mlTopNode, Algo.Regression)
++
++    // get the pmml exporter for the DT and verify its the right exporter
++    val pmmlExporterForDT = PMMLModelExportFactory.createPMMLModelExport(decisionTreeModel)
++    assert(pmmlExporterForDT.isInstanceOf[DecisionTreePMMLModelExport])
++  }
+ }

@@ -1,0 +1,675 @@
+diff --git a/core/pom.xml b/core/pom.xml
+index 5cf11a7f242..12d0c60a3a5 100644
+--- a/core/pom.xml
++++ b/core/pom.xml
+@@ -67,7 +67,6 @@
+     <dependency>
+       <groupId>com.github.luben</groupId>
+       <artifactId>zstd-jni</artifactId>
+-      <version>1.3.2-2</version>
+     </dependency>
+     <dependency>
+       <groupId>org.jmockit</groupId>
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/dimension/v3/DimensionChunkReaderV3.java b/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/dimension/v3/DimensionChunkReaderV3.java
+index 1cfcbd14702..dea0eac0b71 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/dimension/v3/DimensionChunkReaderV3.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/dimension/v3/DimensionChunkReaderV3.java
+@@ -253,10 +253,9 @@ private ColumnPage decodeDimensionByMeta(DataChunk2 pageMetadata, ByteBuffer pag
+     ColumnPageDecoder decoder = encodingFactory.createDecoder(encodings, encoderMetas,
+         compressorName, vectorInfo != null);
+     if (vectorInfo != null) {
+-      decoder
+-          .decodeAndFillVector(pageData.array(), offset, pageMetadata.data_page_length, vectorInfo,
+-              nullBitSet, isLocalDictEncodedPage, pageMetadata.numberOfRowsInpage,
+-              reusableDataBuffer);
++      decoder.decodeAndFillVector(pageData.array(), offset, pageMetadata.data_page_length,
++          pageMetadata.uncompressedSize, vectorInfo, nullBitSet, isLocalDictEncodedPage,
++          pageMetadata.numberOfRowsInpage, reusableDataBuffer);
+       return null;
+     } else {
+       return decoder
+@@ -331,8 +330,13 @@ private DimensionColumnPage decodeDimensionLegacy(DimensionRawColumnChunk rawCol
+     int[] invertedIndexesReverse = new int[0];
+     int uncompressedSize = 0;
+     if (null != reusableDataBuffer && compressor.supportReusableBuffer()) {
+-      uncompressedSize =
+-          compressor.unCompressedLength(pageData.array(), offset, pageMetadata.data_page_length);
++      if (pageMetadata.isSetUncompressedSize()) {
++        uncompressedSize = pageMetadata.uncompressedSize;
++      } else {
++        dataPage = reusableDataBuffer.getDataBuffer(pageMetadata.data_page_length);
++        uncompressedSize = compressor.unCompressedLength(
++            pageData.array(), offset, pageMetadata.data_page_length, dataPage);
++      }
+       dataPage = reusableDataBuffer.getDataBuffer(uncompressedSize);
+       compressor.rawUncompress(pageData.array(), offset, pageMetadata.data_page_length, dataPage);
+     } else {
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/measure/v3/MeasureChunkReaderV3.java b/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/measure/v3/MeasureChunkReaderV3.java
+index 3a8e5f0bef0..9e2d7d455bd 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/measure/v3/MeasureChunkReaderV3.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/chunk/reader/measure/v3/MeasureChunkReaderV3.java
+@@ -245,8 +245,9 @@ protected ColumnPage decodeMeasure(DataChunk2 pageMetadata, ByteBuffer pageData,
+     ColumnPageDecoder codec =
+         encodingFactory.createDecoder(encodings, encoderMetas, compressorName, vectorInfo != null);
+     if (vectorInfo != null) {
+-      codec.decodeAndFillVector(pageData.array(), offset, pageMetadata.data_page_length, vectorInfo,
+-          nullBitSet, false, pageMetadata.numberOfRowsInpage, reusableDataBuffer);
++      codec.decodeAndFillVector(pageData.array(), offset, pageMetadata.data_page_length,
++          pageMetadata.uncompressedSize, vectorInfo, nullBitSet, false,
++          pageMetadata.numberOfRowsInpage, reusableDataBuffer);
+       return null;
+     } else {
+       return codec
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/compression/Compressor.java b/core/src/main/java/org/apache/carbondata/core/datastore/compression/Compressor.java
+index 24b68f70754..5a5f2f72db0 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/compression/Compressor.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/compression/Compressor.java
+@@ -69,7 +69,7 @@ public interface Compressor {
+    */
+   boolean supportUnsafe();
+ 
+-  int unCompressedLength(byte[] data, int offset, int length);
++  int unCompressedLength(byte[] data, int offset, int length, byte[] reused);
+ 
+   int rawUncompress(byte[] data, int offset, int length, byte[] output);
+ 
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/compression/GzipCompressor.java b/core/src/main/java/org/apache/carbondata/core/datastore/compression/GzipCompressor.java
+index 390029a9e67..33f3f8baed7 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/compression/GzipCompressor.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/compression/GzipCompressor.java
+@@ -157,7 +157,7 @@ public long maxCompressedLength(long inputSize) {
+   }
+ 
+   @Override
+-  public int unCompressedLength(byte[] data, int offset, int length) {
++  public int unCompressedLength(byte[] data, int offset, int length, byte[] reused) {
+     //gzip api doesnt have UncompressedLength
+     throw new RuntimeException("Unsupported operation Exception");
+   }
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/compression/SnappyCompressor.java b/core/src/main/java/org/apache/carbondata/core/datastore/compression/SnappyCompressor.java
+index 99ee9be85f2..af92bea6318 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/compression/SnappyCompressor.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/compression/SnappyCompressor.java
+@@ -193,7 +193,7 @@ public boolean supportUnsafe() {
+   }
+ 
+   @Override
+-  public int unCompressedLength(byte[] data, int offset, int length) {
++  public int unCompressedLength(byte[] data, int offset, int length, byte[] reused) {
+     try {
+       return Snappy.uncompressedLength(data, offset, length);
+     } catch (IOException e) {
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/compression/ZstdCompressor.java b/core/src/main/java/org/apache/carbondata/core/datastore/compression/ZstdCompressor.java
+index 139640f049f..44a56541b68 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/compression/ZstdCompressor.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/compression/ZstdCompressor.java
+@@ -49,7 +49,13 @@ public ByteBuffer compressByte(byte[] unCompInput) {
+ 
+   @Override
+   public byte[] compressByte(byte[] unCompInput, int byteSize) {
+-    return Zstd.compress(unCompInput, COMPRESS_LEVEL);
++    if (byteSize == unCompInput.length) {
++      return Zstd.compress(unCompInput, COMPRESS_LEVEL);
++    } else {
++      byte[] bytes = new byte[byteSize];
++      System.arraycopy(unCompInput, 0, bytes, 0, byteSize);
++      return Zstd.compress(bytes, COMPRESS_LEVEL);
++    }
+   }
+ 
+   @Override
+@@ -76,17 +82,26 @@ public long maxCompressedLength(long inputSize) {
+     return Zstd.compressBound(inputSize);
+   }
+ 
+-  /**
+-   * currently java version of zstd does not support this feature.
+-   * It may support it in upcoming release 1.3.5-3, then we can optimize this accordingly.
+-   */
+   @Override
+-  public int unCompressedLength(byte[] data, int offset, int length) {
+-    throw new RuntimeException("Unsupported operation Exception");
++  public int unCompressedLength(byte[] data, int offset, int length, byte[] reused) {
++    if (offset == 0) {
++      return (int) Zstd.decompressedSize(data);
++    } else {
++      if (reused == null) {
++        reused = new byte[length];
++      }
++      System.arraycopy(data, offset, reused, 0, length);
++      return (int) Zstd.decompressedSize(reused);
++    }
+   }
+ 
+   @Override
+   public int rawUncompress(byte[] data, int offset, int length, byte[] output) {
+-    throw new RuntimeException("Unsupported operation Exception");
++    return (int) Zstd.decompressByteArray(output, 0, output.length, data, offset, length);
++  }
++
++  @Override
++  public boolean supportReusableBuffer() {
++    return true;
+   }
+ }
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/ColumnPage.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/ColumnPage.java
+index fa71681a0b0..783df87ddf3 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/ColumnPage.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/ColumnPage.java
+@@ -35,6 +35,7 @@
+ import org.apache.carbondata.core.localdictionary.generator.LocalDictionaryGenerator;
+ import org.apache.carbondata.core.metadata.datatype.DataType;
+ import org.apache.carbondata.core.metadata.datatype.DataTypes;
++import org.apache.carbondata.core.util.ByteUtil;
+ import org.apache.carbondata.core.util.CarbonProperties;
+ 
+ import static org.apache.carbondata.core.metadata.datatype.DataTypes.BYTE;
+@@ -50,6 +51,9 @@ public abstract class ColumnPage {
+   // number of row in this page
+   protected int pageSize;
+ 
++  // only store the size of byte buffer before compression
++  protected int uncompressedSize;
++
+   protected ColumnPageEncoderMeta columnPageEncoderMeta;
+ 
+   // The index of the rowId whose value is null, will be set to 1
+@@ -743,39 +747,67 @@ public long getPageLengthInBytes() throws IOException {
+   public ByteBuffer compress(Compressor compressor) throws IOException {
+     DataType dataType = columnPageEncoderMeta.getStoreDataType();
+     if (dataType == DataTypes.STRING) {
+-      return compressor.compressByte(getByteBuffer());
++      ByteBuffer byteBuffer = getByteBuffer();
++      uncompressedSize = byteBuffer.position();
++      return compressor.compressByte(byteBuffer);
+     } else if (dataType == DataTypes.BOOLEAN) {
+-      return compressor.compressByte(getBooleanPage());
++      byte[] bytes = getBooleanPage();
++      uncompressedSize = bytes.length;
++      return compressor.compressByte(bytes);
+     } else if (dataType == BYTE) {
+-      return compressor.compressByte(getBytePage());
++      byte[] bytes = getBytePage();
++      uncompressedSize = bytes.length;
++      return compressor.compressByte(bytes);
+     } else if (dataType == SHORT) {
+-      return compressor.compressShort(getShortPage());
++      short[] shorts = getShortPage();
++      uncompressedSize = shorts.length * ByteUtil.SIZEOF_SHORT;
++      return compressor.compressShort(shorts);
+     } else if (dataType == DataTypes.SHORT_INT) {
+-      return compressor.compressByte(getShortIntPage());
++      byte[] bytes = getShortIntPage();
++      uncompressedSize = bytes.length;
++      return compressor.compressByte(bytes);
+     } else if (dataType == INT) {
++      int[] ints = getIntPage();
++      uncompressedSize = ints.length * ByteUtil.SIZEOF_INT;
+       return compressor.compressInt(getIntPage());
+     } else if (dataType == LONG) {
+-      return compressor.compressLong(getLongPage());
++      long[] longs = getLongPage();
++      uncompressedSize = longs.length * ByteUtil.SIZEOF_LONG;
++      return compressor.compressLong(longs);
+     } else if (dataType == DataTypes.FLOAT) {
+-      return compressor.compressFloat(getFloatPage());
++      float[] floats = getFloatPage();
++      uncompressedSize = floats.length * ByteUtil.SIZEOF_FLOAT;
++      return compressor.compressFloat(floats);
+     } else if (dataType == DataTypes.DOUBLE) {
++      double[] doubles = getDoublePage();
++      uncompressedSize = doubles.length * ByteUtil.SIZEOF_DOUBLE;
+       return compressor.compressDouble(getDoublePage());
+     } else if (DataTypes.isDecimal(dataType)) {
+-      return compressor.compressByte(getDecimalPage());
++      byte[] bytes = getDecimalPage();
++      uncompressedSize = bytes.length;
++      return compressor.compressByte(bytes);
+     } else if (dataType == BYTE_ARRAY
+         && columnPageEncoderMeta.getColumnSpec().getColumnType() == ColumnType.COMPLEX_PRIMITIVE) {
+-      return compressor.compressByte(getComplexChildrenLVFlattenedBytePage(
+-          columnPageEncoderMeta.getColumnSpec().getSchemaDataType()));
++      byte[] bytes = getComplexChildrenLVFlattenedBytePage(
++          columnPageEncoderMeta.getColumnSpec().getSchemaDataType());
++      uncompressedSize = bytes.length;
++      return compressor.compressByte(bytes);
+     } else if (dataType == BYTE_ARRAY
+         && (columnPageEncoderMeta.getColumnSpec().getColumnType() == ColumnType.COMPLEX_STRUCT
+         || columnPageEncoderMeta.getColumnSpec().getColumnType() == ColumnType.COMPLEX_ARRAY
+         || columnPageEncoderMeta.getColumnSpec().getColumnType() == ColumnType.PLAIN_LONG_VALUE
+         || columnPageEncoderMeta.getColumnSpec().getColumnType() == ColumnType.PLAIN_VALUE)) {
+-      return compressor.compressByte(getComplexParentFlattenedBytePage());
++      byte[] bytes = getComplexParentFlattenedBytePage();
++      uncompressedSize = bytes.length;
++      return compressor.compressByte(bytes);
+     } else if (dataType == DataTypes.BINARY) {
+-      return ByteBuffer.wrap(getLVFlattenedBytePage());
++      byte[] bytes = getLVFlattenedBytePage();
++      uncompressedSize = bytes.length;
++      return ByteBuffer.wrap(bytes);
+     } else if (dataType == BYTE_ARRAY) {
+-      return compressor.compressByte(getLVFlattenedBytePage());
++      byte[] bytes = getLVFlattenedBytePage();
++      uncompressedSize = bytes.length;
++      return compressor.compressByte(bytes);
+     } else {
+       throw new UnsupportedOperationException("unsupported compress column page: " + dataType);
+     }
+@@ -940,4 +972,12 @@ public ColumnPageEncoderMeta getColumnPageEncoderMeta() {
+   public ByteBuffer getByteBuffer() {
+     throw new UnsupportedOperationException("Operation not supported");
+   }
++
++  public void setUncompressedSize(int uncompressedSize) {
++    this.uncompressedSize = uncompressedSize;
++  }
++
++  public int getUncompressedSize() {
++    return uncompressedSize;
++  }
+ }
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageDecoder.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageDecoder.java
+index 0adf852dc5a..3f457f99610 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageDecoder.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageDecoder.java
+@@ -34,8 +34,9 @@ public interface ColumnPageDecoder {
+   /**
+    *  Apply decoding algorithm on input byte array and fill the vector here.
+    */
+-  void decodeAndFillVector(byte[] input, int offset, int length, ColumnVectorInfo vectorInfo,
+-      BitSet nullBits, boolean isLVEncoded, int pageSize, ReusableDataBuffer reusableDataBuffer);
++  void decodeAndFillVector(byte[] input, int offset, int length, int uncompressedSize,
++      ColumnVectorInfo vectorInfo, BitSet nullBits, boolean isLVEncoded, int pageSize,
++      ReusableDataBuffer reusableDataBuffer);
+ 
+   ColumnPage decode(byte[] input, int offset, int length, boolean isLVEncoded) throws IOException;
+ }
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageEncoder.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageEncoder.java
+index 182d0d48376..9136b63e1b9 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageEncoder.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/ColumnPageEncoder.java
+@@ -105,6 +105,9 @@ private DataChunk2 buildPageMetadata(ColumnPage inputPage, ByteBuffer encodedByt
+     fillEncoding(inputPage, dataChunk);
+     fillMinMaxIndex(inputPage, dataChunk);
+     fillLegacyFields(dataChunk);
++    if (inputPage.getUncompressedSize() > 0) {
++      dataChunk.setUncompressedSize(inputPage.getUncompressedSize());
++    }
+     return dataChunk;
+   }
+ 
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveCodec.java
+index 72c201e1b4f..2ce60ed4ea3 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveCodec.java
+@@ -247,7 +247,9 @@ public ByteBuffer encodeAndCompressPage(ColumnPage input, ColumnPageValueConvert
+     }
+     ColumnPage columnPage = getSortedColumnPageIfRequired(input);
+     columnPage.convertValue(converter);
+-    return encodedPage.compress(compressor);
++    ByteBuffer byteBuffer = encodedPage.compress(compressor);
++    input.setUncompressedSize(encodedPage.getUncompressedSize());
++    return byteBuffer;
+   }
+ 
+   @Override
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaFloatingCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaFloatingCodec.java
+index 235deb86a22..3b49769010d 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaFloatingCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaFloatingCodec.java
+@@ -132,15 +132,19 @@ public ColumnPage decode(byte[] input, int offset, int length) {
+       }
+ 
+       @Override
+-      public void decodeAndFillVector(byte[] input, int offset, int length,
++      public void decodeAndFillVector(byte[] input, int offset, int length, int uncompressedSize,
+           ColumnVectorInfo vectorInfo, BitSet nullBits, boolean isLVEncoded, int pageSize,
+           ReusableDataBuffer reusableDataBuffer) {
+         Compressor compressor =
+             CompressorFactory.getInstance().getCompressor(meta.getCompressorName());
+         byte[] unCompressData;
+         if (null != reusableDataBuffer && compressor.supportReusableBuffer()) {
+-          int uncompressedLength = compressor.unCompressedLength(input, offset, length);
+-          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedLength);
++          if (uncompressedSize <= 0) {
++            unCompressData = reusableDataBuffer.getDataBuffer(length);
++            uncompressedSize =
++                compressor.unCompressedLength(input, offset, length, unCompressData);
++          }
++          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedSize);
+           compressor.rawUncompress(input, offset, length, unCompressData);
+         } else {
+           unCompressData = compressor.unCompressByte(input, offset, length);
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaIntegralCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaIntegralCodec.java
+index 573c22524ce..ad57c2ad035 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaIntegralCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveDeltaIntegralCodec.java
+@@ -144,15 +144,19 @@ public ColumnPage decode(byte[] input, int offset, int length) {
+       }
+ 
+       @Override
+-      public void decodeAndFillVector(byte[] input, int offset, int length,
++      public void decodeAndFillVector(byte[] input, int offset, int length, int uncompressedSize,
+           ColumnVectorInfo vectorInfo, BitSet nullBits, boolean isLVEncoded, int pageSize,
+           ReusableDataBuffer reusableDataBuffer) {
+         Compressor compressor =
+             CompressorFactory.getInstance().getCompressor(meta.getCompressorName());
+         byte[] unCompressData;
+         if (null != reusableDataBuffer && compressor.supportReusableBuffer()) {
+-          int uncompressedLength = compressor.unCompressedLength(input, offset, length);
+-          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedLength);
++          if (uncompressedSize <= 0) {
++            unCompressData = reusableDataBuffer.getDataBuffer(length);
++            uncompressedSize =
++                compressor.unCompressedLength(input, offset, length, unCompressData);
++          }
++          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedSize);
+           compressor.rawUncompress(input, offset, length, unCompressData);
+         } else {
+           unCompressData = compressor.unCompressByte(input, offset, length);
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveFloatingCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveFloatingCodec.java
+index a4b83bf2868..a2c39edbbcd 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveFloatingCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveFloatingCodec.java
+@@ -120,15 +120,19 @@ public ColumnPage decode(byte[] input, int offset, int length) {
+       }
+ 
+       @Override
+-      public void decodeAndFillVector(byte[] input, int offset, int length,
++      public void decodeAndFillVector(byte[] input, int offset, int length, int uncompressedSize,
+           ColumnVectorInfo vectorInfo, BitSet nullBits, boolean isLVEncoded, int pageSize,
+           ReusableDataBuffer reusableDataBuffer) {
+         Compressor compressor =
+             CompressorFactory.getInstance().getCompressor(meta.getCompressorName());
+         byte[] unCompressData;
+         if (null != reusableDataBuffer && compressor.supportReusableBuffer()) {
+-          int uncompressedLength = compressor.unCompressedLength(input, offset, length);
+-          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedLength);
++          if (uncompressedSize <= 0) {
++            unCompressData = reusableDataBuffer.getDataBuffer(length);
++            uncompressedSize =
++                compressor.unCompressedLength(input, offset, length, unCompressData);
++          }
++          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedSize);
+           compressor.rawUncompress(input, offset, length, unCompressData);
+         } else {
+           unCompressData = compressor.unCompressByte(input, offset, length);
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveIntegralCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveIntegralCodec.java
+index 3554cd396e5..5a7da0906c6 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveIntegralCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/adaptive/AdaptiveIntegralCodec.java
+@@ -121,15 +121,19 @@ public ColumnPage decode(byte[] input, int offset, int length) {
+       }
+ 
+       @Override
+-      public void decodeAndFillVector(byte[] input, int offset, int length,
++      public void decodeAndFillVector(byte[] input, int offset, int length, int uncompressedSize,
+           ColumnVectorInfo vectorInfo, BitSet nullBits, boolean isLVEncoded, int pageSize,
+           ReusableDataBuffer reusableDataBuffer) {
+         Compressor compressor =
+             CompressorFactory.getInstance().getCompressor(meta.getCompressorName());
+         byte[] unCompressData;
+         if (null != reusableDataBuffer && compressor.supportReusableBuffer()) {
+-          int uncompressedLength = compressor.unCompressedLength(input, offset, length);
+-          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedLength);
++          if (uncompressedSize <= 0) {
++            unCompressData = reusableDataBuffer.getDataBuffer(length);
++            uncompressedSize =
++                compressor.unCompressedLength(input, offset, length, unCompressData);
++          }
++          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedSize);
+           compressor.rawUncompress(input, offset, length, unCompressData);
+         } else {
+           unCompressData = compressor.unCompressByte(input, offset, length);
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/compress/DirectCompressCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/compress/DirectCompressCodec.java
+index 5fff9c21aa7..e66ad5f23df 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/compress/DirectCompressCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/compress/DirectCompressCodec.java
+@@ -114,20 +114,23 @@ public ColumnPage decode(byte[] input, int offset, int length) {
+       }
+ 
+       @Override
+-      public void decodeAndFillVector(byte[] input, int offset, int length,
++      public void decodeAndFillVector(byte[] input, int offset, int length, int uncompressedSize,
+           ColumnVectorInfo vectorInfo, BitSet nullBits, boolean isLVEncoded, int pageSize,
+           ReusableDataBuffer reusableDataBuffer) {
+         Compressor compressor =
+             CompressorFactory.getInstance().getCompressor(meta.getCompressorName());
+-        int uncompressedLength;
+         byte[] unCompressData;
+         if (null != reusableDataBuffer && compressor.supportReusableBuffer()) {
+-          uncompressedLength = compressor.unCompressedLength(input, offset, length);
+-          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedLength);
++          if (uncompressedSize <= 0) {
++            unCompressData = reusableDataBuffer.getDataBuffer(length);
++            uncompressedSize =
++                compressor.unCompressedLength(input, offset, length, unCompressData);
++          }
++          unCompressData = reusableDataBuffer.getDataBuffer(uncompressedSize);
+           compressor.rawUncompress(input, offset, length, unCompressData);
+         } else {
+           unCompressData = compressor.unCompressByte(input, offset, length);
+-          uncompressedLength = unCompressData.length;
++          uncompressedSize = unCompressData.length;
+         }
+         if (DataTypes.isDecimal(dataType)) {
+           TableSpec.ColumnSpec columnSpec = meta.getColumnSpec();
+@@ -137,7 +140,7 @@ public void decodeAndFillVector(byte[] input, int offset, int length,
+           vectorInfo.decimalConverter = decimalConverter;
+           if (DataTypes.isDecimal(meta.getStoreDataType())) {
+             ColumnPage decimalColumnPage = VarLengthColumnPageBase
+-                .newDecimalColumnPage(meta, unCompressData, uncompressedLength);
++                .newDecimalColumnPage(meta, unCompressData, uncompressedSize);
+             decimalConverter.fillVector(decimalColumnPage.getByteArrayPage(), pageSize, vectorInfo,
+                 nullBits, meta.getStoreDataType());
+           } else {
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/ComplexDimensionIndexCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/ComplexDimensionIndexCodec.java
+index 55f09799e27..0258cded0f7 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/ComplexDimensionIndexCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/ComplexDimensionIndexCodec.java
+@@ -52,6 +52,7 @@ void encodeIndexStorage(ColumnPage inputPage) {
+         byte[] flattened = ByteUtil.flatten(indexStorage.getDataPage());
+         Compressor compressor = CompressorFactory.getInstance().getCompressor(
+             inputPage.getColumnCompressorName());
++        inputPage.setUncompressedSize(flattened.length);
+         ByteBuffer compressed = compressor.compressByte(flattened);
+         super.indexStorage = indexStorage;
+         super.compressedDataPage = compressed;
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/DirectDictDimensionIndexCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/DirectDictDimensionIndexCodec.java
+index 39d233760a4..e8513627876 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/DirectDictDimensionIndexCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/DirectDictDimensionIndexCodec.java
+@@ -57,6 +57,7 @@ void encodeIndexStorage(ColumnPage inputPage) {
+         byte[] flattened = ByteUtil.flatten(indexStorage.getDataPage());
+         Compressor compressor = CompressorFactory.getInstance().getCompressor(
+             inputPage.getColumnCompressorName());
++        inputPage.setUncompressedSize(flattened.length);
+         super.compressedDataPage = compressor.compressByte(flattened);
+         super.indexStorage = indexStorage;
+       }
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/PlainDimensionIndexCodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/PlainDimensionIndexCodec.java
+index 5e5ad616fed..a38e6893057 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/PlainDimensionIndexCodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/dimension/legacy/PlainDimensionIndexCodec.java
+@@ -66,10 +66,12 @@ protected void encodeIndexStorage(ColumnPage input) {
+             new ByteArrayBlockIndexerStorage(byteArray, isDictionary, !isDictionary, isSort) :
+             new ByteArrayBlockIndexerStorageWithoutRowId(byteArray, true);
+           byte[] compressInput = ByteUtil.flatten(indexStorage.getDataPage());
++          input.setUncompressedSize(compressInput.length);
+           super.compressedDataPage = compressor.compressByte(compressInput);
+         } else {
+           ByteBuffer data = input.getByteBuffer();
+           indexStorage = new DummyBlockIndexerStorage();
++          input.setUncompressedSize(data.position());
+           super.compressedDataPage = compressor.compressByte(data);
+         }
+         super.indexStorage = indexStorage;
+diff --git a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/rle/RLECodec.java b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/rle/RLECodec.java
+index cdfb700062d..edd400708b4 100644
+--- a/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/rle/RLECodec.java
++++ b/core/src/main/java/org/apache/carbondata/core/datastore/page/encoding/rle/RLECodec.java
+@@ -317,7 +317,7 @@ public ColumnPage decode(byte[] input, int offset, int length) throws IOExceptio
+     }
+ 
+     @Override
+-    public void decodeAndFillVector(byte[] input, int offset, int length,
++    public void decodeAndFillVector(byte[] input, int offset, int length, int uncompressedSize,
+         ColumnVectorInfo vectorInfo, BitSet nullBits, boolean isLVEncoded, int pageSize,
+         ReusableDataBuffer reusableDataBuffer) {
+       throw new UnsupportedOperationException("Not supposed to be called here");
+diff --git a/format/src/main/thrift/carbondata.thrift b/format/src/main/thrift/carbondata.thrift
+index 7dcd4d320a9..a862a7e0dfe 100644
+--- a/format/src/main/thrift/carbondata.thrift
++++ b/format/src/main/thrift/carbondata.thrift
+@@ -139,6 +139,7 @@ struct DataChunk2{
+     9: optional list<binary> encoder_meta; // Extra information required by encoders
+     10: optional BlockletMinMaxIndex min_max; 
+     11: optional i32 numberOfRowsInpage;
++    12: optional i32 uncompressedSize;
+  }
+ 
+ 
+diff --git a/integration/presto/pom.xml b/integration/presto/pom.xml
+index f677742ea9d..634255186b3 100644
+--- a/integration/presto/pom.xml
++++ b/integration/presto/pom.xml
+@@ -460,6 +460,10 @@
+           <groupId>org.apache.hadoop</groupId>
+           <artifactId>hadoop-client</artifactId>
+         </exclusion>
++        <exclusion>
++          <groupId>com.github.luben</groupId>
++          <artifactId>zstd-jni</artifactId>
++        </exclusion>
+       </exclusions>
+     </dependency>
+     <dependency>
+diff --git a/integration/spark/src/test/scala/org/apache/carbondata/integration/spark/testsuite/dataload/TestLoadDataWithCompression.scala b/integration/spark/src/test/scala/org/apache/carbondata/integration/spark/testsuite/dataload/TestLoadDataWithCompression.scala
+index 20c6100d8b6..21b980be1e1 100644
+--- a/integration/spark/src/test/scala/org/apache/carbondata/integration/spark/testsuite/dataload/TestLoadDataWithCompression.scala
++++ b/integration/spark/src/test/scala/org/apache/carbondata/integration/spark/testsuite/dataload/TestLoadDataWithCompression.scala
+@@ -20,7 +20,7 @@ package org.apache.carbondata.integration.spark.testsuite.dataload
+ import java.io.File
+ import java.nio.ByteBuffer
+ import java.text.SimpleDateFormat
+-import java.util.concurrent.{ExecutorService, Executors, Future}
++import java.util.concurrent.{Executors, ExecutorService, Future}
+ import java.util.Calendar
+ 
+ import scala.util.Random
+@@ -34,6 +34,7 @@ import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
+ import org.apache.carbondata.core.constants.CarbonCommonConstants
+ import org.apache.carbondata.core.datastore.compression.Compressor
+ import org.apache.carbondata.core.datastore.impl.FileFactory
++import org.apache.carbondata.core.datastore.ReusableDataBuffer
+ import org.apache.carbondata.core.util.{ByteUtil, CarbonProperties, CarbonUtil}
+ import org.apache.carbondata.core.util.path.CarbonTablePath
+ import org.apache.carbondata.streaming.parser.CarbonStreamParser
+@@ -150,16 +151,13 @@ class CustomizeCompressor extends Compressor {
+     false
+   }
+ 
+-  override def unCompressedLength(data: Array[Byte],
+-      offset: Int,
+-      length: Int): Int = {
++  override def unCompressedLength(
++      data: Array[Byte], offset: Int, length: Int, reused: Array[Byte]): Int = {
+     throw new RuntimeException("Unsupported operation Exception")
+   }
+ 
+-  override def rawUncompress(data: Array[Byte],
+-      offset: Int,
+-      length: Int,
+-      output: Array[Byte]): Int = {
++  override def rawUncompress(
++      data: Array[Byte], offset: Int, length: Int, output: Array[Byte]): Int = {
+     throw new RuntimeException("Unsupported operation Exception")
+   }
+ 
+diff --git a/pom.xml b/pom.xml
+index 49ad5b54001..58b3a376c83 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -130,7 +130,7 @@
+     <scala.version>2.11.8</scala.version>
+     <hadoop.deps.scope>compile</hadoop.deps.scope>
+     <spark.version>2.3.4</spark.version>
+-    <spark.binary.version>2.3</spark.binary.version>
++    <spark.binary.version>2.4</spark.binary.version>
+     <spark.deps.scope>compile</spark.deps.scope>
+     <scala.deps.scope>compile</scala.deps.scope>
+     <dev.path>${basedir}/dev</dev.path>
+@@ -247,11 +247,22 @@
+           </exclusion>
+         </exclusions>
+       </dependency>
++      <dependency>
++        <groupId>com.github.luben</groupId>
++        <artifactId>zstd-jni</artifactId>
++        <version>1.4.4-3</version>
++      </dependency>
+       <dependency>
+         <groupId>org.apache.spark</groupId>
+         <artifactId>spark-core_${scala.binary.version}</artifactId>
+         <version>${spark.version}</version>
+         <scope>${spark.deps.scope}</scope>
++        <exclusions>
++          <exclusion>
++            <groupId>com.github.luben</groupId>
++            <artifactId>zstd-jni</artifactId>
++          </exclusion>
++        </exclusions>
+       </dependency>
+       <dependency>
+         <groupId>org.apache.spark</groupId>
+diff --git a/tools/cli/src/test/java/org/apache/carbondata/tool/CarbonCliTest.java b/tools/cli/src/test/java/org/apache/carbondata/tool/CarbonCliTest.java
+index c12e82c6efe..881294b2dd8 100644
+--- a/tools/cli/src/test/java/org/apache/carbondata/tool/CarbonCliTest.java
++++ b/tools/cli/src/test/java/org/apache/carbondata/tool/CarbonCliTest.java
+@@ -180,12 +180,12 @@ public void testSummaryOutputIndividual() {
+ 
+     expectedOutput = buildLines(
+         "BLK  BLKLT  Meta Size  Data Size  LocalDict  DictEntries  DictSize  AvgPageSize  Min%  Max%  Min     Max     " ,
+-        "0    0      1.90KB     2.15KB     true       2            18.0B     9.0B         NA    NA    robot0  robot1  " ,
+-        "0    1      1.90KB     2.16KB     true       3            22.0B     9.0B         NA    NA    robot1  robot3  " ,
+-        "1    0      1.90KB     2.16KB     true       3            22.0B     9.0B         NA    NA    robot3  robot5  " ,
+-        "1    1      1.90KB     2.16KB     true       3            22.0B     9.0B         NA    NA    robot5  robot7  " ,
+-        "2    0      1.90KB     2.14KB     true       2            18.0B     9.0B         NA    NA    robot7  robot8  " ,
+-        "2    1      1.18KB     1.33KB     true       2            18.0B     9.0B         NA    NA    robot8  robot9  ");
++        "0    0      1.95KB     2.21KB     true       2            18.0B     9.0B         NA    NA    robot0  robot1  " ,
++        "0    1      1.96KB     2.22KB     true       3            22.0B     9.0B         NA    NA    robot1  robot3  " ,
++        "1    0      1.96KB     2.22KB     true       3            22.0B     9.0B         NA    NA    robot3  robot5  " ,
++        "1    1      1.96KB     2.22KB     true       3            22.0B     9.0B         NA    NA    robot5  robot7  " ,
++        "2    0      1.95KB     2.20KB     true       2            18.0B     9.0B         NA    NA    robot7  robot8  " ,
++        "2    1      1.21KB     1.37KB     true       2            18.0B     9.0B         NA    NA    robot8  robot9  ");
+     Assert.assertTrue(output.contains(expectedOutput));
+   }
+ 
+@@ -239,12 +239,12 @@ public void testSummaryOutputAll() {
+ 
+     expectedOutput = buildLines(
+         "BLK  BLKLT  Meta Size  Data Size  LocalDict  DictEntries  DictSize  AvgPageSize  Min%  Max%   Min  Max      " ,
+-        "0    0      3.36KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  0    2999990  " ,
+-        "0    1      3.36KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  1    2999992  " ,
+-        "1    0      3.36KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  3    2999994  " ,
+-        "1    1      3.36KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  5    2999996  " ,
+-        "2    0      3.36KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  7    2999998  " ,
+-        "2    1      2.04KB     1.49MB     false      0            0.0B      89.62KB      0.0   100.0  9    2999999  ");
++        "0    0      3.47KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  0    2999990  " ,
++        "0    1      3.47KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  1    2999992  " ,
++        "1    0      3.47KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  3    2999994  " ,
++        "1    1      3.47KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  5    2999996  " ,
++        "2    0      3.47KB     2.57MB     false      0            0.0B      93.76KB      0.0   100.0  7    2999998  " ,
++        "2    1      2.10KB     1.49MB     false      0            0.0B      89.62KB      0.0   100.0  9    2999999  ");
+     Assert.assertTrue(output.contains(expectedOutput));
+     Assert.assertTrue(output.contains("## version Details"));
+     Assert.assertTrue(output.contains("written_by  Version"));
+@@ -260,7 +260,7 @@ public void testSummaryPageMeta() {
+     String output = new String(out.toByteArray());
+     String expectedOutput = buildLines(
+         "Blocklet 0:",
+-        "Page 0 (offset 0, length 9): DataChunk2(chunk_meta:ChunkCompressionMeta(compression_codec:DEPRECATED, total_uncompressed_size:96000, total_compressed_size:9, compressor_name:snappy), rowMajor:false, data_page_length:5, rle_page_length:4, presence:PresenceMeta(represents_presence:false, present_bit_stream:00), sort_state:SORT_NATIVE, encoders:[RLE], encoder_meta:[], min_max:BlockletMinMaxIndex(min_values:[72 6F 62 6F 74 30], max_values:[72 6F 62 6F 74 30], min_max_presence:[true]), numberOfRowsInpage:32000)");
++        "Page 0 (offset 0, length 9): DataChunk2(chunk_meta:ChunkCompressionMeta(compression_codec:DEPRECATED, total_uncompressed_size:96000, total_compressed_size:9, compressor_name:snappy), rowMajor:false, data_page_length:5, rle_page_length:4, presence:PresenceMeta(represents_presence:false, present_bit_stream:00), sort_state:SORT_NATIVE, encoders:[RLE], encoder_meta:[], min_max:BlockletMinMaxIndex(min_values:[72 6F 62 6F 74 30], max_values:[72 6F 62 6F 74 30], min_max_presence:[true]), numberOfRowsInpage:32000, uncompressedSize:3)");
+     Assert.assertTrue(output.contains(expectedOutput));
+   }
+ 

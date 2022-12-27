@@ -1,0 +1,284 @@
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SchemaUtilites.java b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SchemaUtilites.java
+index 51c3cb10771..7d42e57e9ad 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SchemaUtilites.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SchemaUtilites.java
+@@ -77,6 +77,29 @@ public static SchemaPlus findSchema(final SchemaPlus defaultSchema, final String
+     return findSchema(defaultSchema, schemaPathAsList);
+   }
+ 
++  /**
++   * Utility function to get the commonPrefix schema between two supplied schemas.
++   *
++   * Eg: if the defaultSchema: dfs and the schemaPath is dfs.tmp.`cicks.json`
++   *     then this function returns dfs if (caseSensitive is not true
++   *     otherwise it returns empty string.
++   *
++   * @param defaultSchema default schema
++   * @param schemaPath current schema path
++   * @param isCaseSensitive true if caseSensitive comparision is required.
++   * @return common prefix schemaPath
++   */
++  public static String getPrefixSchemaPath(final String defaultSchema,
++                                           final String schemaPath,
++                                           final boolean isCaseSensitive) {
++    if (!isCaseSensitive) {
++      return Strings.commonPrefix(defaultSchema.toLowerCase(), schemaPath.toLowerCase());
++    }
++    else {
++      return Strings.commonPrefix(defaultSchema, schemaPath);
++    }
++  }
++
+   /** Utility method to search for schema path starting from the given <i>schema</i> reference */
+   private static SchemaPlus searchSchemaTree(SchemaPlus schema, final List<String> schemaPath) {
+     for (String schemaName : schemaPath) {
+@@ -93,7 +116,7 @@ private static SchemaPlus searchSchemaTree(SchemaPlus schema, final List<String>
+    * @return true if the given <i>schema</i> is root schema. False otherwise.
+    */
+   public static boolean isRootSchema(SchemaPlus schema) {
+-    return schema.getParentSchema() == null;
++    return schema == null || schema.getParentSchema() == null;
+   }
+ 
+   /**
+@@ -149,6 +172,16 @@ public static void throwSchemaNotFoundException(final SchemaPlus defaultSchema,
+         .build(logger);
+   }
+ 
++  /** Utility method to throw {@link UserException} with context information */
++  public static void throwSchemaNotFoundException(final SchemaPlus defaultSchema, final List<String> givenSchemaPath) {
++    throw UserException.validationError()
++            .message("Schema [%s] is not valid with respect to either root schema or current default schema.",
++                    givenSchemaPath)
++            .addContext("Current default schema: ",
++                    isRootSchema(defaultSchema) ? "No default schema selected" : getSchemaPath(defaultSchema))
++            .build(logger);
++  }
++
+   /**
+    * Given reference to default schema in schema tree, search for schema with given <i>schemaPath</i>. Once a schema is
+    * found resolve it into a mutable <i>AbstractDrillSchema</i> instance. A {@link UserException} is throws when:
+diff --git a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SqlConverter.java b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SqlConverter.java
+index 577804141b2..798e3a4479d 100644
+--- a/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SqlConverter.java
++++ b/exec/java-exec/src/main/java/org/apache/drill/exec/planner/sql/SqlConverter.java
+@@ -21,6 +21,7 @@
+ import java.util.List;
+ import java.util.Set;
+ 
++import com.google.common.base.Strings;
+ import org.apache.calcite.adapter.java.JavaTypeFactory;
+ import org.apache.calcite.jdbc.CalciteSchema;
+ import org.apache.calcite.jdbc.CalciteSchemaImpl;
+@@ -53,6 +54,8 @@
+ import org.apache.calcite.sql.validate.SqlValidatorScope;
+ import org.apache.calcite.sql2rel.RelDecorrelator;
+ import org.apache.calcite.sql2rel.SqlToRelConverter;
++import org.apache.calcite.util.Util;
++import org.apache.commons.collections.ListUtils;
+ import org.apache.drill.common.config.DrillConfig;
+ import org.apache.drill.common.exceptions.UserException;
+ import org.apache.drill.common.types.Types;
+@@ -114,7 +117,7 @@ public SqlConverter(QueryContext context) {
+     this.session = context.getSession();
+     this.drillConfig = context.getConfig();
+     this.catalog = new DrillCalciteCatalogReader(
+-        CalciteSchemaImpl.from(rootSchema),
++        this.rootSchema,
+         parserConfig.caseSensitive(),
+         CalciteSchemaImpl.from(defaultSchema).path(null),
+         typeFactory,
+@@ -281,7 +284,7 @@ public Expander() {
+     @Override
+     public RelNode expandView(RelDataType rowType, String queryString, List<String> schemaPath) {
+       final DrillCalciteCatalogReader catalogReader = new DrillCalciteCatalogReader(
+-          CalciteSchemaImpl.from(rootSchema),
++          rootSchema,
+           parserConfig.caseSensitive(),
+           schemaPath,
+           typeFactory,
+@@ -294,7 +297,7 @@ public RelNode expandView(RelDataType rowType, String queryString, List<String>
+     @Override
+     public RelNode expandView(RelDataType rowType, String queryString, SchemaPlus rootSchema, List<String> schemaPath) {
+       final DrillCalciteCatalogReader catalogReader = new DrillCalciteCatalogReader(
+-          CalciteSchemaImpl.from(rootSchema), // new root schema
++          rootSchema, // new root schema
+           parserConfig.caseSensitive(),
+           schemaPath,
+           typeFactory,
+@@ -431,17 +434,20 @@ private class DrillCalciteCatalogReader extends CalciteCatalogReader {
+     private final DrillConfig drillConfig;
+     private final UserSession session;
+     private boolean allowTemporaryTables;
++    private final SchemaPlus rootSchema;
+ 
+-    DrillCalciteCatalogReader(CalciteSchema rootSchema,
++
++    DrillCalciteCatalogReader(SchemaPlus rootSchema,
+                               boolean caseSensitive,
+                               List<String> defaultSchema,
+                               JavaTypeFactory typeFactory,
+                               DrillConfig drillConfig,
+                               UserSession session) {
+-      super(rootSchema, caseSensitive, defaultSchema, typeFactory);
++      super(CalciteSchemaImpl.from(rootSchema), caseSensitive, defaultSchema, typeFactory);
+       this.drillConfig = drillConfig;
+       this.session = session;
+       this.allowTemporaryTables = true;
++      this.rootSchema = rootSchema;
+     }
+ 
+     /**
+@@ -481,7 +487,39 @@ public RelOptTableImpl getTable(final List<String> names) {
+             .message("Temporary tables usage is disallowed. Used temporary table name: %s.", names)
+             .build(logger);
+       }
+-      return super.getTable(names);
++
++      RelOptTableImpl table = super.getTable(names);
++
++      // Check the schema and throw a valid SchemaNotFound exception instead of TableNotFound exception.
++      if (table == null) {
++        isValidSchema(names);
++      }
++
++      return table;
++    }
++
++    /**
++     * check if the schema provided is a valid schema:
++     * <li>schema is not indicated (only one element in the names list)<li/>
++     *
++     * @param names             list of schema and table names, table name is always the last element
++     * @return throws a userexception if the schema is not valid.
++     */
++    private void isValidSchema(final List<String> names) throws UserException {
++      SchemaPlus defaultSchema = session.getDefaultSchema(this.rootSchema);
++      String defaultSchemaCombinedPath = SchemaUtilites.getSchemaPath(defaultSchema);
++      List<String> schemaPath = Util.skipLast(names);
++      String schemaPathCombined = SchemaUtilites.getSchemaPath(schemaPath);
++      String commonPrefix = SchemaUtilites.getPrefixSchemaPath(defaultSchemaCombinedPath,
++              schemaPathCombined,
++              parserConfig.caseSensitive());
++      boolean isPrefixDefaultPath = commonPrefix.length() == defaultSchemaCombinedPath.length();
++      List<String> fullSchemaPath = Strings.isNullOrEmpty(defaultSchemaCombinedPath) ? schemaPath :
++              isPrefixDefaultPath ? schemaPath : ListUtils.union(SchemaUtilites.getSchemaPathAsList(defaultSchema), schemaPath);
++      if (names.size() > 1 && (SchemaUtilites.findSchema(this.rootSchema, fullSchemaPath) == null &&
++              SchemaUtilites.findSchema(this.rootSchema, schemaPath) == null)) {
++        SchemaUtilites.throwSchemaNotFoundException(defaultSchema, schemaPath);
++      }
+     }
+ 
+     /**
+diff --git a/exec/java-exec/src/test/java/org/apache/drill/exec/store/dfs/TestFileSelection.java b/exec/java-exec/src/test/java/org/apache/drill/exec/store/dfs/TestFileSelection.java
+index 82f45ae62f3..d23cd1fba4a 100644
+--- a/exec/java-exec/src/test/java/org/apache/drill/exec/store/dfs/TestFileSelection.java
++++ b/exec/java-exec/src/test/java/org/apache/drill/exec/store/dfs/TestFileSelection.java
+@@ -26,9 +26,7 @@
+ import org.apache.drill.BaseTestQuery;
+ import org.apache.drill.common.util.TestTools;
+ import org.apache.hadoop.fs.FileStatus;
+-import org.junit.Rule;
+ import org.junit.Test;
+-import org.junit.rules.ExpectedException;
+ 
+ public class TestFileSelection extends BaseTestQuery {
+   private static final List<FileStatus> EMPTY_STATUSES = ImmutableList.of();
+@@ -62,5 +60,4 @@ public void testEmptyFolderThrowsTableNotFound() throws Exception {
+       throw ex;
+     }
+   }
+-
+ }
+diff --git a/exec/java-exec/src/test/java/org/apache/drill/exec/store/dfs/TestSchemaNotFoundException.java b/exec/java-exec/src/test/java/org/apache/drill/exec/store/dfs/TestSchemaNotFoundException.java
+new file mode 100644
+index 00000000000..cca2bd07953
+--- /dev/null
++++ b/exec/java-exec/src/test/java/org/apache/drill/exec/store/dfs/TestSchemaNotFoundException.java
+@@ -0,0 +1,86 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.drill.exec.store.dfs;
++
++import org.apache.drill.BaseTestQuery;
++import org.apache.drill.common.util.TestTools;
++import org.junit.Test;
++
++import static org.junit.Assert.assertTrue;
++
++public class TestSchemaNotFoundException extends BaseTestQuery {
++
++    @Test(expected = Exception.class)
++    public void testSchemaNotFoundForWrongStoragePlgn() throws Exception {
++        final String table = String.format("%s/empty", TestTools.getTestResourcesPath());
++        final String query = String.format("select * from dfs1.`%s`", table);
++        try {
++            testNoResult(query);
++        } catch (Exception ex) {
++            final String pattern = String.format("[[dfs1]] is not valid with respect to either root schema or current default schema").toLowerCase();
++            final boolean isSchemaNotFound = ex.getMessage().toLowerCase().contains(pattern);
++            assertTrue(isSchemaNotFound);
++            throw ex;
++        }
++    }
++
++    @Test(expected = Exception.class)
++    public void testSchemaNotFoundForWrongWorkspace() throws Exception {
++        final String table = String.format("%s/empty", TestTools.getTestResourcesPath());
++        final String query = String.format("select * from dfs.tmp1.`%s`", table);
++        try {
++            testNoResult(query);
++        } catch (Exception ex) {
++            final String pattern = String.format("[[dfs, tmp1]] is not valid with respect to either root schema or current default schema").toLowerCase();
++            final boolean isSchemaNotFound = ex.getMessage().toLowerCase().contains(pattern);
++            assertTrue(isSchemaNotFound);
++            throw ex;
++        }
++    }
++
++    @Test(expected = Exception.class)
++    public void testSchemaNotFoundForWrongWorkspaceUsingDefaultWorkspace() throws Exception {
++        final String table = String.format("%s/empty", TestTools.getTestResourcesPath());
++        final String query = String.format("select * from tmp1.`%s`", table);
++        try {
++            testNoResult("use dfs");
++            testNoResult(query);
++        } catch (Exception ex) {
++            final String pattern = String.format("[[tmp1]] is not valid with respect to either root schema or current default schema").toLowerCase();
++            final boolean isSchemaNotFound = ex.getMessage().toLowerCase().contains(pattern);
++            assertTrue(isSchemaNotFound);
++            throw ex;
++        }
++    }
++
++    @Test(expected = Exception.class)
++    public void testTableNotFoundException() throws Exception {
++        final String table = String.format("%s/empty1", TestTools.getTestResourcesPath());
++        final String query = String.format("select * from tmp.`%s`", table);
++        try {
++            testNoResult("use dfs");
++            testNoResult(query);
++        } catch (Exception ex) {
++            final String pattern = String.format("[[dfs, tmp1]] is not valid with respect to either root schema or current default schema").toLowerCase();
++            final boolean isSchemaNotFound = ex.getMessage().toLowerCase().contains(pattern);
++            final boolean isTableNotFound = ex.getMessage().toLowerCase().contains(String.format("%s' not found", table).toLowerCase());
++            assertTrue(!isSchemaNotFound && isTableNotFound);
++            throw ex;
++        }
++    }
++}

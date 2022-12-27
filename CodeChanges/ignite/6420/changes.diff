@@ -1,0 +1,238 @@
+diff --git a/modules/core/src/main/java/org/apache/ignite/cluster/ClusterMetrics.java b/modules/core/src/main/java/org/apache/ignite/cluster/ClusterMetrics.java
+index 74e98b857334..751e62873d3f 100644
+--- a/modules/core/src/main/java/org/apache/ignite/cluster/ClusterMetrics.java
++++ b/modules/core/src/main/java/org/apache/ignite/cluster/ClusterMetrics.java
+@@ -694,4 +694,11 @@ public interface ClusterMetrics {
+      * @return Total number of nodes.
+      */
+     public int getTotalNodes();
++
++    /**
++     * Gets execution duration for current partition map exchange in milliseconds.
++     *
++     * @return Gets execution duration for current partition map exchange in milliseconds. {@code 0} if there is no running PME.
++     */
++    public long getCurrentPmeDuration();
+ }
+diff --git a/modules/core/src/main/java/org/apache/ignite/internal/ClusterLocalNodeMetricsMXBeanImpl.java b/modules/core/src/main/java/org/apache/ignite/internal/ClusterLocalNodeMetricsMXBeanImpl.java
+index eed501ae6544..c3bcf803f70a 100644
+--- a/modules/core/src/main/java/org/apache/ignite/internal/ClusterLocalNodeMetricsMXBeanImpl.java
++++ b/modules/core/src/main/java/org/apache/ignite/internal/ClusterLocalNodeMetricsMXBeanImpl.java
+@@ -334,6 +334,11 @@ public ClusterLocalNodeMetricsMXBeanImpl(GridDiscoveryManager discoMgr) {
+         return node.metrics().getTotalNodes();
+     }
+ 
++    /** {@inheritDoc} */
++    @Override public long getCurrentPmeDuration() {
++        return node.metrics().getCurrentPmeDuration();
++    }
++
+     /** {@inheritDoc} */
+     @Override public int getTotalBaselineNodes() {
+         if (!node.isClient() && !node.isDaemon()) {
+diff --git a/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsMXBeanImpl.java b/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsMXBeanImpl.java
+index 1efb5906f347..316ea71ca749 100644
+--- a/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsMXBeanImpl.java
++++ b/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsMXBeanImpl.java
+@@ -361,6 +361,11 @@ private ClusterMetrics metrics() {
+         return metrics().getTotalNodes();
+     }
+ 
++    /** {@inheritDoc} */
++    @Override public long getCurrentPmeDuration() {
++        return metrics().getCurrentPmeDuration();
++    }
++
+     /** {@inheritDoc} */
+     @Override public int getTotalBaselineNodes() {
+         Collection<BaselineNode> baselineNodes = cluster.ignite().cluster().currentBaselineTopology();
+diff --git a/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsSnapshot.java b/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsSnapshot.java
+index 60f26a35b8b8..47fea3a9926c 100644
+--- a/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsSnapshot.java
++++ b/modules/core/src/main/java/org/apache/ignite/internal/ClusterMetricsSnapshot.java
+@@ -92,7 +92,8 @@ public class ClusterMetricsSnapshot implements ClusterMetrics {
+         8/*received bytes count*/ +
+         4/*outbound messages queue size*/ +
+         4/*total nodes*/ +
+-        8/*total jobs execution time*/;
++        8/*total jobs execution time*/ +
++        8/*current PME time*/;
+ 
+     /** */
+     private long lastUpdateTime = -1;
+@@ -256,6 +257,9 @@ public class ClusterMetricsSnapshot implements ClusterMetrics {
+     /** */
+     private long totalJobsExecTime = -1;
+ 
++    /** */
++    private long currentPmeDuration = -1;
++
+     /**
+      * Create empty snapshot.
+      */
+@@ -329,6 +333,7 @@ public ClusterMetricsSnapshot(ClusterGroup p) {
+         outMesQueueSize = 0;
+         heapTotal = 0;
+         totalNodes = nodes.size();
++        currentPmeDuration = 0;
+ 
+         for (ClusterNode node : nodes) {
+             ClusterMetrics m = node.metrics();
+@@ -405,6 +410,8 @@ public ClusterMetricsSnapshot(ClusterGroup p) {
+             outMesQueueSize += m.getOutboundMessagesQueueSize();
+ 
+             avgLoad += m.getCurrentCpuLoad();
++
++            currentPmeDuration = max(currentPmeDuration, m.getCurrentPmeDuration());
+         }
+ 
+         curJobExecTime /= size;
+@@ -960,6 +967,11 @@ public void setCurrentIdleTime(long curIdleTime) {
+         return totalNodes;
+     }
+ 
++    /** {@inheritDoc} */
++    @Override public long getCurrentPmeDuration() {
++        return currentPmeDuration;
++    }
++
+     /**
+      * Sets available processors.
+      *
+@@ -1194,6 +1206,16 @@ public void setTotalNodes(int totalNodes) {
+         this.totalNodes = totalNodes;
+     }
+ 
++
++    /**
++     * Sets execution duration for current partition map exchange.
++     *
++     * @param currentPmeDuration Execution duration for current partition map exchange.
++     */
++    public void setCurrentPmeDuration(long currentPmeDuration) {
++        this.currentPmeDuration = currentPmeDuration;
++    }
++
+     /**
+      * @param neighborhood Cluster neighborhood.
+      * @return CPU count.
+@@ -1346,6 +1368,7 @@ public static int serialize(byte[] data, int off, ClusterMetrics metrics) {
+         buf.putInt(metrics.getOutboundMessagesQueueSize());
+         buf.putInt(metrics.getTotalNodes());
+         buf.putLong(metrics.getTotalJobsExecutionTime());
++        buf.putLong(metrics.getCurrentPmeDuration());
+ 
+         assert !buf.hasRemaining() : "Invalid metrics size [expected=" + METRICS_SIZE + ", actual="
+             + (buf.position() - off) + ']';
+@@ -1428,6 +1451,11 @@ public static ClusterMetrics deserialize(byte[] data, int off) {
+         else
+             metrics.setTotalJobsExecutionTime(0);
+ 
++        if (buf.remaining() >= 8)
++            metrics.setCurrentPmeDuration(buf.getLong());
++        else
++            metrics.setCurrentPmeDuration(0);
++
+         return metrics;
+     }
+ 
+diff --git a/modules/core/src/main/java/org/apache/ignite/internal/managers/discovery/ClusterMetricsImpl.java b/modules/core/src/main/java/org/apache/ignite/internal/managers/discovery/ClusterMetricsImpl.java
+index 4138e64199da..5d8138a3b3b5 100644
+--- a/modules/core/src/main/java/org/apache/ignite/internal/managers/discovery/ClusterMetricsImpl.java
++++ b/modules/core/src/main/java/org/apache/ignite/internal/managers/discovery/ClusterMetricsImpl.java
+@@ -18,9 +18,12 @@
+ package org.apache.ignite.internal.managers.discovery;
+ 
+ import java.util.Collection;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
+ import org.apache.ignite.cluster.ClusterMetrics;
+ import org.apache.ignite.internal.GridKernalContext;
+ import org.apache.ignite.internal.processors.cache.GridCacheAdapter;
++import org.apache.ignite.internal.processors.cache.distributed.dht.preloader.GridDhtPartitionsExchangeFuture;
+ import org.apache.ignite.internal.processors.jobmetrics.GridJobMetrics;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ 
+@@ -351,6 +354,14 @@ public ClusterMetricsImpl(GridKernalContext ctx, GridLocalMetrics vmMetrics, lon
+         return 1;
+     }
+ 
++    /** {@inheritDoc} */
++    @Override public long getCurrentPmeDuration() {
++        GridDhtPartitionsExchangeFuture future = ctx.cache().context().exchange().lastTopologyFuture();
++        
++        return (future == null || future.isDone()) ?
++            0 : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - future.getStartTime());
++    }
++
+     /**
+      * Job metrics
+      */
+diff --git a/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/distributed/dht/preloader/GridDhtPartitionsExchangeFuture.java b/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/distributed/dht/preloader/GridDhtPartitionsExchangeFuture.java
+index f39cc57216c9..5667fc87ea3d 100644
+--- a/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/distributed/dht/preloader/GridDhtPartitionsExchangeFuture.java
++++ b/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/distributed/dht/preloader/GridDhtPartitionsExchangeFuture.java
+@@ -543,6 +543,13 @@ public boolean dynamicCacheGroupStarted(int grpId) {
+         return exchActions != null && exchActions.cacheGroupStarting(grpId);
+     }
+ 
++    /**
++     * @return Start time in nanoseconds.
++     */
++    public long getStartTime() {
++        return startTime;
++    }
++
+     /**
+      * @return {@code True}
+      */
+diff --git a/modules/core/src/main/java/org/apache/ignite/mxbean/ClusterMetricsMXBean.java b/modules/core/src/main/java/org/apache/ignite/mxbean/ClusterMetricsMXBean.java
+index ffb4080836bc..5dd5ebcfe9e7 100644
+--- a/modules/core/src/main/java/org/apache/ignite/mxbean/ClusterMetricsMXBean.java
++++ b/modules/core/src/main/java/org/apache/ignite/mxbean/ClusterMetricsMXBean.java
+@@ -257,6 +257,10 @@ public interface ClusterMetricsMXBean extends ClusterMetrics {
+     @Override @MXBeanDescription("Total number of nodes.")
+     public int getTotalNodes();
+ 
++    /** {@inheritDoc} */
++    @Override @MXBeanDescription("Current PME duration in milliseconds.")
++    public long getCurrentPmeDuration();
++
+     /**
+      * Get count of total baseline nodes.
+      *
+diff --git a/modules/core/src/test/java/org/apache/ignite/spi/discovery/ClusterMetricsSnapshotSerializeSelfTest.java b/modules/core/src/test/java/org/apache/ignite/spi/discovery/ClusterMetricsSnapshotSerializeSelfTest.java
+index 70379f1bd63e..6970f8e0e063 100644
+--- a/modules/core/src/test/java/org/apache/ignite/spi/discovery/ClusterMetricsSnapshotSerializeSelfTest.java
++++ b/modules/core/src/test/java/org/apache/ignite/spi/discovery/ClusterMetricsSnapshotSerializeSelfTest.java
+@@ -149,6 +149,7 @@ private ClusterMetrics createMetrics() {
+         metrics.setHeapMemoryTotal(48);
+         metrics.setTotalNodes(49);
+         metrics.setTotalJobsExecutionTime(50);
++        metrics.setCurrentPmeDuration(51);
+ 
+         return metrics;
+     }
+@@ -206,6 +207,7 @@ private boolean isMetricsEquals(ClusterMetrics obj, ClusterMetrics obj1) {
+             obj.getNonHeapMemoryTotal() == obj1.getNonHeapMemoryTotal() &&
+             obj.getHeapMemoryTotal() == obj1.getHeapMemoryTotal() &&
+             obj.getTotalNodes() == obj1.getTotalNodes() &&
+-            obj.getTotalJobsExecutionTime() == obj1.getTotalJobsExecutionTime();
++            obj.getTotalJobsExecutionTime() == obj1.getTotalJobsExecutionTime() &&
++            obj.getCurrentPmeDuration() == obj1.getCurrentPmeDuration();
+     }
+ }
+diff --git a/modules/platforms/dotnet/Apache.Ignite.Core.Tests/ApiParity/ClusterMetricsParityTest.cs b/modules/platforms/dotnet/Apache.Ignite.Core.Tests/ApiParity/ClusterMetricsParityTest.cs
+index bb0b3cbe18a4..21160c16dbb0 100644
+--- a/modules/platforms/dotnet/Apache.Ignite.Core.Tests/ApiParity/ClusterMetricsParityTest.cs
++++ b/modules/platforms/dotnet/Apache.Ignite.Core.Tests/ApiParity/ClusterMetricsParityTest.cs
+@@ -29,7 +29,8 @@ public class ClusterMetricsParityTest
+         private static readonly string[] MissingProperties =
+         {
+             // IGNITE-7127
+-            "TotalJobsExecutionTime"
++            "TotalJobsExecutionTime",
++            "CurrentPmeDuration"
+         };
+ 
+         /// <summary>

@@ -1,0 +1,451 @@
+diff --git a/sql/catalyst/src/test/scala/org/apache/spark/sql/connector/InMemoryTable.scala b/sql/catalyst/src/test/scala/org/apache/spark/sql/connector/InMemoryTable.scala
+index 616fc72320caf..0b455edce03fd 100644
+--- a/sql/catalyst/src/test/scala/org/apache/spark/sql/connector/InMemoryTable.scala
++++ b/sql/catalyst/src/test/scala/org/apache/spark/sql/connector/InMemoryTable.scala
+@@ -32,6 +32,7 @@ import org.apache.spark.sql.connector.catalog._
+ import org.apache.spark.sql.connector.expressions.{BucketTransform, DaysTransform, HoursTransform, IdentityTransform, MonthsTransform, Transform, YearsTransform}
+ import org.apache.spark.sql.connector.read._
+ import org.apache.spark.sql.connector.write._
++import org.apache.spark.sql.connector.write.streaming.{StreamingDataWriterFactory, StreamingWrite}
+ import org.apache.spark.sql.sources.{And, EqualTo, Filter, IsNotNull}
+ import org.apache.spark.sql.types.{DataType, DateType, StructType, TimestampType}
+ import org.apache.spark.sql.util.CaseInsensitiveStringMap
+@@ -145,6 +146,7 @@ class InMemoryTable(
+   override def capabilities: util.Set[TableCapability] = Set(
+     TableCapability.BATCH_READ,
+     TableCapability.BATCH_WRITE,
++    TableCapability.STREAMING_WRITE,
+     TableCapability.OVERWRITE_BY_FILTER,
+     TableCapability.OVERWRITE_DYNAMIC,
+     TableCapability.TRUNCATE).asJava
+@@ -169,26 +171,32 @@ class InMemoryTable(
+ 
+     new WriteBuilder with SupportsTruncate with SupportsOverwrite with SupportsDynamicOverwrite {
+       private var writer: BatchWrite = Append
++      private var streamingWriter: StreamingWrite = StreamingAppend
+ 
+       override def truncate(): WriteBuilder = {
+         assert(writer == Append)
+         writer = TruncateAndAppend
++        streamingWriter = StreamingTruncateAndAppend
+         this
+       }
+ 
+       override def overwrite(filters: Array[Filter]): WriteBuilder = {
+         assert(writer == Append)
+         writer = new Overwrite(filters)
++        // streaming writer doesn't have equivalent semantic
+         this
+       }
+ 
+       override def overwriteDynamicPartitions(): WriteBuilder = {
+         assert(writer == Append)
+         writer = DynamicOverwrite
++        // streaming writer doesn't have equivalent semantic
+         this
+       }
+ 
+       override def buildForBatch(): BatchWrite = writer
++
++      override def buildForStreaming(): StreamingWrite = streamingWriter
+     }
+   }
+ 
+@@ -231,6 +239,31 @@ class InMemoryTable(
+     }
+   }
+ 
++  private abstract class TestStreamingWrite extends StreamingWrite {
++    def createStreamingWriterFactory(info: PhysicalWriteInfo): StreamingDataWriterFactory = {
++      BufferedRowsWriterFactory
++    }
++
++    def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {}
++  }
++
++  private object StreamingAppend extends TestStreamingWrite {
++    override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
++      dataMap.synchronized {
++        withData(messages.map(_.asInstanceOf[BufferedRows]))
++      }
++    }
++  }
++
++  private object StreamingTruncateAndAppend extends TestStreamingWrite {
++    override def commit(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
++      dataMap.synchronized {
++        dataMap.clear
++        withData(messages.map(_.asInstanceOf[BufferedRows]))
++      }
++    }
++  }
++
+   override def deleteWhere(filters: Array[Filter]): Unit = dataMap.synchronized {
+     import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.MultipartIdentifierHelper
+     dataMap --= InMemoryTable.filtersToKeys(dataMap.keys, partCols.map(_.toSeq.quoted), filters)
+@@ -310,10 +343,17 @@ private class BufferedRowsReader(partition: BufferedRows) extends PartitionReade
+   override def close(): Unit = {}
+ }
+ 
+-private object BufferedRowsWriterFactory extends DataWriterFactory {
++private object BufferedRowsWriterFactory extends DataWriterFactory with StreamingDataWriterFactory {
+   override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] = {
+     new BufferWriter
+   }
++
++  override def createWriter(
++      partitionId: Int,
++      taskId: Long,
++      epochId: Long): DataWriter[InternalRow] = {
++    new BufferWriter
++  }
+ }
+ 
+ private class BufferWriter extends DataWriter[InternalRow] {
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/Dataset.scala b/sql/core/src/main/scala/org/apache/spark/sql/Dataset.scala
+index 4cb923d94cc55..3a25cf5c5000a 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/Dataset.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/Dataset.scala
+@@ -58,7 +58,7 @@ import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2ScanRelation,
+ import org.apache.spark.sql.execution.python.EvaluatePython
+ import org.apache.spark.sql.execution.stat.StatFunctions
+ import org.apache.spark.sql.internal.SQLConf
+-import org.apache.spark.sql.streaming.DataStreamWriter
++import org.apache.spark.sql.streaming.{DataStreamWriter, DataStreamWriterV2}
+ import org.apache.spark.sql.types._
+ import org.apache.spark.sql.util.SchemaUtils
+ import org.apache.spark.storage.StorageLevel
+@@ -3380,7 +3380,6 @@ class Dataset[T] private[sql](
+    * @since 3.0.0
+    */
+   def writeTo(table: String): DataFrameWriterV2[T] = {
+-    // TODO: streaming could be adapted to use this interface
+     if (isStreaming) {
+       logicalPlan.failAnalysis(
+         "'writeTo' can not be called on streaming Dataset/DataFrame")
+@@ -3388,6 +3387,14 @@ class Dataset[T] private[sql](
+     new DataFrameWriterV2[T](table, this)
+   }
+ 
++  def writeStreamTo(table: String): DataStreamWriterV2[T] = {
++    if (!isStreaming) {
++      logicalPlan.failAnalysis(
++        "'writeStreamTo' can be called only on streaming Dataset/DataFrame")
++    }
++    new DataStreamWriterV2[T](table, this)
++  }
++
+   /**
+    * Interface for saving the content of the streaming Dataset out into external storage.
+    *
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/streaming/DataStreamWriterV2.scala b/sql/core/src/main/scala/org/apache/spark/sql/streaming/DataStreamWriterV2.scala
+new file mode 100644
+index 0000000000000..f2c1039031866
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/streaming/DataStreamWriterV2.scala
+@@ -0,0 +1,136 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.streaming
++
++import java.util.concurrent.TimeoutException
++
++import scala.collection.JavaConverters._
++import scala.collection.mutable
++
++import org.apache.spark.annotation.Experimental
++import org.apache.spark.sql.{DataFrame, Dataset}
++import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
++import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table}
++import org.apache.spark.sql.connector.catalog.TableCapability.{STREAMING_WRITE, TRUNCATE}
++
++@Experimental
++final class DataStreamWriterV2[T] private[sql](table: String, ds: Dataset[T]) {
++  import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
++  import org.apache.spark.sql.connector.catalog.CatalogV2Util._
++  import df.sparkSession.sessionState.analyzer.CatalogAndIdentifier
++
++  private val df: DataFrame = ds.toDF()
++
++  private val sparkSession = ds.sparkSession
++
++  private var trigger: Trigger = Trigger.ProcessingTime(0L)
++
++  private var extraOptions = new mutable.HashMap[String, String]()
++
++  private val tableName = sparkSession.sessionState.sqlParser.parseMultipartIdentifier(table)
++
++  private val (catalog, identifier) = {
++    val CatalogAndIdentifier(catalog, identifier) = tableName
++    (catalog.asTableCatalog, identifier)
++  }
++
++  def trigger(trigger: Trigger): DataStreamWriterV2[T] = {
++    this.trigger = trigger
++    this
++  }
++
++  def queryName(queryName: String): DataStreamWriterV2[T] = {
++    this.extraOptions += ("queryName" -> queryName)
++    this
++  }
++
++  def option(key: String, value: String): DataStreamWriterV2[T] = {
++    this.extraOptions += (key -> value)
++    this
++  }
++
++  def option(key: String, value: Boolean): DataStreamWriterV2[T] = option(key, value.toString)
++
++  def option(key: String, value: Long): DataStreamWriterV2[T] = option(key, value.toString)
++
++  def option(key: String, value: Double): DataStreamWriterV2[T] = option(key, value.toString)
++
++  def options(options: scala.collection.Map[String, String]): DataStreamWriterV2[T] = {
++    this.extraOptions ++= options
++    this
++  }
++
++  def options(options: java.util.Map[String, String]): DataStreamWriterV2[T] = {
++    this.options(options.asScala)
++    this
++  }
++
++  def checkpointLocation(location: String): DataStreamWriterV2[T] = {
++    this.extraOptions += "checkpointLocation" -> location
++    this
++  }
++
++  @throws[NoSuchTableException]
++  @throws[TimeoutException]
++  def append(): StreamingQuery = {
++    import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
++    loadTable(catalog, identifier) match {
++      case Some(t: SupportsWrite) if t.supports(STREAMING_WRITE) =>
++        start(t, OutputMode.Append())
++
++      case Some(t) =>
++        throw new IllegalArgumentException(s"Table ${t.name()} doesn't support streaming" +
++          " write!")
++
++      case _ =>
++        throw new NoSuchTableException(identifier)
++    }
++  }
++
++  @throws[NoSuchTableException]
++  @throws[TimeoutException]
++  def truncateAndAppend(): StreamingQuery = {
++    import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
++    loadTable(catalog, identifier) match {
++      case Some(t: SupportsWrite) if t.supports(STREAMING_WRITE) && t.supports(TRUNCATE) =>
++        start(t, OutputMode.Complete())
++
++      case Some(t) =>
++        throw new IllegalArgumentException(s"Table ${t.name()} doesn't support streaming" +
++          " write with truncate!")
++
++      case _ =>
++        throw new NoSuchTableException(identifier)
++    }
++  }
++
++  private def start(table: Table, outputMode: OutputMode): StreamingQuery = {
++    df.sparkSession.sessionState.streamingQueryManager.startQuery(
++      extraOptions.get("queryName"),
++      extraOptions.get("checkpointLocation"),
++      df,
++      extraOptions.toMap,
++      table,
++      outputMode,
++      // Here we simply use default values of `useTempCheckpointLocation` and
++      // `recoverFromCheckpointLocation`, which is required to be changed for some special built-in
++      // data sources. They're not available in catalog, hence it's safe as of now, but once the
++      // condition is broken we should take care of that.
++      trigger = trigger)
++  }
++}
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/streaming/DataStreamWriterV2Suite.scala b/sql/core/src/test/scala/org/apache/spark/sql/streaming/DataStreamWriterV2Suite.scala
+new file mode 100644
+index 0000000000000..5f692662e05cb
+--- /dev/null
++++ b/sql/core/src/test/scala/org/apache/spark/sql/streaming/DataStreamWriterV2Suite.scala
+@@ -0,0 +1,163 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.streaming
++
++import java.io.File
++
++import org.scalatest.BeforeAndAfter
++import org.scalatest.matchers.must.Matchers
++
++import org.apache.spark.internal.Logging
++import org.apache.spark.sql.Row
++import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
++import org.apache.spark.sql.connector.InMemoryTableCatalog
++import org.apache.spark.sql.execution.streaming.MemoryStream
++
++class DataStreamWriterV2Suite extends StreamTest with BeforeAndAfter with Matchers with Logging {
++  import testImplicits._
++
++  before {
++    spark.conf.set("spark.sql.catalog.testcat", classOf[InMemoryTableCatalog].getName)
++  }
++
++  after {
++    spark.sessionState.catalogManager.reset()
++    spark.sessionState.conf.clear()
++    sqlContext.streams.active.foreach(_.stop())
++  }
++
++  test("Append: basic") {
++    spark.sql("CREATE TABLE testcat.table_name (id bigint, data string) USING foo")
++
++    checkAnswer(spark.table("testcat.table_name"), Seq.empty)
++
++    def verifyStreamAppend(
++        checkpointDir: File,
++        prevInputs: Seq[Seq[(Long, String)]],
++        newInputs: Seq[(Long, String)],
++        expectedOutputs: Seq[(Long, String)]): Unit = {
++      runStreamQueryAppendMode(checkpointDir, prevInputs, newInputs)
++      checkAnswer(
++        spark.table("testcat.table_name"),
++        expectedOutputs.map { case (id, data) => Row(id, data) }
++      )
++    }
++
++    withTempDir { checkpointDir =>
++      val input1 = Seq((1L, "a"), (2L, "b"), (3L, "c"))
++      verifyStreamAppend(checkpointDir, Seq.empty, input1, input1)
++
++      val input2 = Seq((4L, "d"), (5L, "e"), (6L, "f"))
++      verifyStreamAppend(checkpointDir, Seq(input1), input2, input1 ++ input2)
++    }
++  }
++
++  test("Append: fail if table does not exist") {
++    withTempDir { checkpointDir =>
++      val exc = intercept[NoSuchTableException] {
++        runStreamQueryAppendMode(checkpointDir, Seq.empty, Seq.empty)
++      }
++      assert(exc.getMessage.contains("table_name"))
++    }
++  }
++
++  private def runStreamQueryAppendMode(
++      checkpointDir: File,
++      prevInputs: Seq[Seq[(Long, String)]],
++      newInputs: Seq[(Long, String)]): Unit = {
++    val inputData = MemoryStream[(Long, String)]
++    val inputDF = inputData.toDF().toDF("id", "data")
++
++    prevInputs.foreach { inputsPerBatch =>
++      inputData.addData(inputsPerBatch: _*)
++    }
++
++    val query = inputDF
++      .writeStreamTo("testcat.table_name")
++      .checkpointLocation(checkpointDir.getAbsolutePath)
++      .append()
++
++    inputData.addData(newInputs: _*)
++
++    query.processAllAvailable()
++    query.stop()
++  }
++
++  test("TruncateAndAppend (complete mode): basic") {
++    spark.sql("CREATE TABLE testcat.table_name (id bigint, sum bigint) USING foo")
++
++    checkAnswer(spark.table("testcat.table_name"), Seq.empty)
++
++    def verifyStreamTruncateAndAppend(
++        checkpointDir: File,
++        prevInputs: Seq[Seq[(Long, Long)]],
++        newInputs: Seq[(Long, Long)],
++        expectedOutputs: Seq[(Long, Long)]): Unit = {
++      runStreamQueryCompleteMode(checkpointDir, prevInputs, newInputs)
++      checkAnswer(
++        spark.table("testcat.table_name"),
++        expectedOutputs.map { case (id, data) => Row(id, data) }
++      )
++    }
++
++    withTempDir { checkpointDir =>
++      val input1 = Seq((1L, 1L), (2L, 2L), (3L, 3L))
++      verifyStreamTruncateAndAppend(checkpointDir, Seq.empty, input1, Seq((0L, 2L), (1L, 4L)))
++
++      val input2 = Seq((4L, 4L), (5L, 5L), (6L, 6L))
++      verifyStreamTruncateAndAppend(checkpointDir, Seq(input1), input2, Seq((0L, 12L), (1L, 9L)))
++    }
++  }
++
++  test("TruncateAndAppend (complete mode): fail if table does not exist") {
++    val inputData = MemoryStream[(Long, String)]
++    val inputDF = inputData.toDF().toDF("id", "data")
++
++    withTempDir { checkpointDir =>
++      val exc = intercept[NoSuchTableException] {
++        runStreamQueryCompleteMode(checkpointDir, Seq.empty, Seq.empty)
++      }
++      assert(exc.getMessage.contains("table_name"))
++    }
++  }
++
++  private def runStreamQueryCompleteMode(
++      checkpointDir: File,
++      prevInputs: Seq[Seq[(Long, Long)]],
++      newInputs: Seq[(Long, Long)]): Unit = {
++    val inputData = MemoryStream[(Long, Long)]
++    val inputDF = inputData.toDF().toDF("id", "value")
++
++    prevInputs.foreach { inputsPerBatch =>
++      inputData.addData(inputsPerBatch: _*)
++    }
++
++    val query = inputDF
++      .selectExpr("id % 2 AS key", "value")
++      .groupBy("key")
++      .agg("value" -> "sum")
++      .writeStreamTo("testcat.table_name")
++      .checkpointLocation(checkpointDir.getAbsolutePath)
++      .truncateAndAppend()
++
++    inputData.addData(newInputs: _*)
++
++    query.processAllAvailable()
++    query.stop()
++  }
++}

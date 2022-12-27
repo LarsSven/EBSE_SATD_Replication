@@ -1,0 +1,437 @@
+diff --git a/core/controller/src/main/scala/whisk/core/controller/Actions.scala b/core/controller/src/main/scala/whisk/core/controller/Actions.scala
+index ab0e17adfb4..78c4988b1b2 100644
+--- a/core/controller/src/main/scala/whisk/core/controller/Actions.scala
++++ b/core/controller/src/main/scala/whisk/core/controller/Actions.scala
+@@ -17,7 +17,6 @@
+ package whisk.core.controller
+ 
+ import scala.concurrent.Future
+-import scala.concurrent.Promise
+ import scala.concurrent.TimeoutException
+ import scala.concurrent.duration.DurationInt
+ import scala.util.Failure
+@@ -78,6 +77,7 @@ import whisk.http.ErrorResponse.terminate
+ import whisk.common.PrintStreamEmitter
+ import org.apache.kafka.common.errors.RecordTooLargeException
+ import whisk.utils.ExecutionContextFactory.FutureExtensions
++import scala.concurrent.duration.FiniteDuration
+ 
+ /**
+  * A singleton object which defines the properties that must be present in a configuration
+@@ -434,53 +434,57 @@ trait WhiskActionsApi extends WhiskCollectionAPI {
+             implicit transid: TransactionId): Future[(ActivationId, Option[WhiskActivation])] = {
+         // merge package parameters with action (action parameters supersede), then merge in payload
+         val args = { env map { _ ++ action.parameters } getOrElse action.parameters } merge payload
+-        val message = Message(transid, s"/actions/invoke/${action.namespace}/${action.name}/${action.rev}", user, ActivationId(), args)
+ 
++        val duration = action.limits.timeout()
++        val (activationId, blockingCallback) = if (blocking) {
++            val timeout = duration + blockingInvokeGrace
++            info(this, s"[POST] action activation will block on result up to $timeout ($duration + $blockingInvokeGrace grace)")
++            // Create the active ack listener eaerly to avoid a race between establishing the listener and the invoker
++            // actually sending an active ack for this action. This prevents an active ack response for the activation
++            // being dropped because the listener is not yet active (this can happen if the response is faster coming back
++            // to the controller than the future callbacks getting a chance to run) and forcing the db polling fall back to kick in.
++            val (aid, callback) = waitForActivationResponse(user.namespace, ActivationId(), timeout)
++            (aid, Some(callback))
++        } else (ActivationId(), None)
++
++        val message = Message(transid, s"/actions/invoke/${action.namespace}/${action.name}/${action.rev}", user, activationId, args)
+         info(this, s"[POST] action activation id: ${message.activationId}")
+-        performLoadBalancerRequest(INVOKER, message, transid) map {
+-            (action.limits.timeout(), _)
+-        } flatMap {
+-            case (duration, response) =>
+-                response.id match {
+-                    case Some(activationId) =>
+-                        Future successful (duration, activationId)
+-                    case None =>
+-                        if (response.error.getOrElse("??").equals("too many concurrent activations")) {
+-                            // DoS throttle
+-                            warn(this, s"[POST] action activation rejected: ${response.error.getOrElse("??")}")
+-                            Future failed new TooManyActivationException("too many concurrent activations")
+-                        } else {
+-                            error(this, s"[POST] action activation failed: ${response.error.getOrElse("??")}")
+-                            Future failed new IllegalStateException(s"activation failed with error: ${response.error.getOrElse("??")}")
+-                        }
++
++        performLoadBalancerRequest(INVOKER, message, transid) flatMap { response =>
++            response.id match {
++                case Some(activationId) =>
++                    Future successful activationId
++                case None =>
++                    if (response.error.getOrElse("??").equals("too many concurrent activations")) {
++                        // DoS throttle
++                        warn(this, s"[POST] action activation rejected: ${response.error.getOrElse("??")}")
++                        Future failed new TooManyActivationException("too many concurrent activations")
++                    } else {
++                        error(this, s"[POST] action activation failed: ${response.error.getOrElse("??")}")
++                        Future failed new IllegalStateException(s"activation failed with error: ${response.error.getOrElse("??")}")
++                    }
++            }
++        } flatMap { activationId =>
++            blockingCallback match {
++                case Some(callback) => {
++                    // Blocking invocation
++                    callback map { activation =>
++                        // Duration of the blocking activation in Controller.
++                        // We use the start time of the tid instead of a startMarker to avoid passing the start marker around.
++                        transid.finished(this, StartMarker(transid.meta.start, LoggingMarkers.CONTROLLER_ACTIVATION_BLOCKING))
++                        (activationId, Some(activation))
++                    } // will either complete with activation or fail with timeout
+                 }
+-        } flatMap {
+-            case (duration, activationId) =>
+-                if (blocking) {
+-                    val docid = DocId(WhiskEntity.qualifiedName(user.namespace, activationId))
+-                    val timeout = duration + blockingInvokeGrace
+-                    val promise = Promise[Option[WhiskActivation]]
+-                    info(this, s"[POST] action activation will block on result up to $timeout ($duration + $blockingInvokeGrace grace)")
+-                    pollLocalForResult(docid.asDocInfo, activationId, promise)
+-                    val response = promise.future map {
+-                        (activationId, _)
+-                    } withTimeout (timeout, new BlockingInvokeTimeout(activationId))
+-                    response onComplete {
+-                        case Success(_) =>
+-                            // Duration of the blocking activation in Controller.
+-                            // We use the start time of the tid instead of a startMarker to avoid passing the start marker around.
+-                            transid.finished(this, StartMarker(transid.meta.start, LoggingMarkers.CONTROLLER_ACTIVATION_BLOCKING))
+-                        case Failure(t) =>
+-                            // short circuits polling on result
+-                            promise.tryFailure(t)
++                case None => {
++                    // Non-blocking invocation
++                    Future {
++                        // Duration of the non-blocking activation in Controller.
++                        // We use the start time of the tid instead of a startMarker to avoid passing the start marker around.
++                        transid.finished(this, StartMarker(transid.meta.start, LoggingMarkers.CONTROLLER_ACTIVATION))
++                        (activationId, None)
+                     }
+-                    response // will either complete with activation or fail with timeout
+-                } else Future {
+-                    // Duration of the non-blocking activation in Controller.
+-                    // We use the start time of the tid instead of a startMarker to avoid passing the start marker around.
+-                    transid.finished(this, StartMarker(transid.meta.start, LoggingMarkers.CONTROLLER_ACTIVATION))
+-                    (activationId, None)
+                 }
++            }
+         }
+     }
+ 
+@@ -490,21 +494,27 @@ trait WhiskActionsApi extends WhiskCollectionAPI {
+      * If this mechanism fails to produce an answer quickly, the future will fail and we back off into using
+      * a database operation to obtain the canonical answer.
+      */
+-    private def pollLocalForResult(
+-        docid: DocInfo,
++    private def waitForActivationResponse(
++        namespace: Namespace,
+         activationId: ActivationId,
+-        promise: Promise[Option[WhiskActivation]])(
+-            implicit transid: TransactionId): Unit = {
+-        queryActivationResponse(activationId, transid) map {
+-            activation => promise.trySuccess { Some(activation) }
+-        } onFailure {
++        timeout: FiniteDuration)(
++            implicit transid: TransactionId): (ActivationId, Future[WhiskActivation]) = {
++
++        val (activationIdToSearch, activeCallback) = queryActivationResponse(activationId, transid)
++
++        val response = activeCallback.recoverWith {
++            // Callback not successful => manual polling from DB
+             case t: TimeoutException =>
+                 info(this, s"[POST] switching to poll db, active ack expired")
+-                pollDbForResult(docid, activationId, promise)
++                val docid = DocId(WhiskEntity.qualifiedName(namespace, activationIdToSearch)).asDocInfo
++                pollDbForResult(docid, activationIdToSearch)
+             case t: Throwable =>
+                 error(this, s"[POST] switching to poll db, active ack exception: ${t.getMessage}")
+-                pollDbForResult(docid, activationId, promise)
+-        }
++                val docid = DocId(WhiskEntity.qualifiedName(namespace, activationIdToSearch)).asDocInfo
++                pollDbForResult(docid, activationIdToSearch)
++        }.withTimeout(timeout, new BlockingInvokeTimeout(activationId)) // Abort waiting/polling for activationresult after timeout
++
++        (activationIdToSearch, response)
+     }
+ 
+     /**
+@@ -515,23 +525,17 @@ trait WhiskActionsApi extends WhiskCollectionAPI {
+      */
+     private def pollDbForResult(
+         docid: DocInfo,
+-        activationId: ActivationId,
+-        promise: Promise[Option[WhiskActivation]])(
+-            implicit transid: TransactionId): Unit = {
+-        if (!promise.isCompleted) {
+-            WhiskActivation.get(activationStore, docid) map {
+-                activation => promise.trySuccess { Some(activation) } // activation may have logs, do not strip them
+-            } onFailure {
+-                case e: NoDocumentException =>
+-                    Thread.sleep(500)
+-                    debug(this, s"[POST] action activation not yet timed out, will poll for result")
+-                    pollDbForResult(docid, activationId, promise)
+-                case t: Throwable =>
+-                    error(this, s"[POST] action activation failed while waiting on result: ${t.getMessage}")
+-                    promise.tryFailure(t)
+-            }
+-        } else {
+-            error(this, s"[POST] action activation timed out, terminated polling for result")
++        activationId: ActivationId)(
++            implicit transid: TransactionId): Future[WhiskActivation] = {
++
++        WhiskActivation.get(activationStore, docid) recoverWith {
++            case e: NoDocumentException =>
++                Thread.sleep(500)
++                debug(this, s"[POST] action activation not yet timed out, will poll for result")
++                pollDbForResult(docid, activationId)
++            case t: Throwable =>
++                error(this, s"[POST] action activation failed while waiting on result: ${t.getMessage}")
++                Future failed (t)
+         }
+     }
+ 
+diff --git a/core/controller/src/main/scala/whisk/core/controller/Backend.scala b/core/controller/src/main/scala/whisk/core/controller/Backend.scala
+index cd9ed965853..5d14970c9a0 100644
+--- a/core/controller/src/main/scala/whisk/core/controller/Backend.scala
++++ b/core/controller/src/main/scala/whisk/core/controller/Backend.scala
+@@ -70,7 +70,7 @@ object WhiskServices extends LoadbalancerRequest {
+      * and returns the HTTP response from the load balancer as a future
+      */
+     def makeLoadBalancerComponent(config: WhiskConfig, timeout: Timeout = 10 seconds)(
+-        implicit as: ActorSystem): (LoadBalancerReq => Future[LoadBalancerResponse], () => JsObject, (ActivationId, TransactionId) => Future[WhiskActivation]) = {
++        implicit as: ActorSystem): (LoadBalancerReq => Future[LoadBalancerResponse], () => JsObject, (ActivationId, TransactionId) => (ActivationId, Future[WhiskActivation])) = {
+         val loadBalancer = new LoadBalancerService(config, InfoLevel)
+         val requestTaker = (lbr: LoadBalancerReq) => { loadBalancer.doPublish(lbr._1, lbr._2)(lbr._3) }
+         (requestTaker, loadBalancer.getInvokerHealth, loadBalancer.queryActivationResponse)
+@@ -92,7 +92,7 @@ trait WhiskServices {
+     protected val performLoadBalancerRequest: WhiskServices.LoadBalancerReq => Future[LoadBalancerResponse]
+ 
+     /** Ask load balancer (instead of db) for activation response */
+-    protected val queryActivationResponse: (ActivationId, TransactionId) => Future[WhiskActivation]
++    protected val queryActivationResponse: (ActivationId, TransactionId) => (ActivationId, Future[WhiskActivation])
+ 
+     /** The hostname of the consul server */
+     protected val consulServer: String
+diff --git a/core/controller/src/main/scala/whisk/core/controller/RestAPIs.scala b/core/controller/src/main/scala/whisk/core/controller/RestAPIs.scala
+index dfe22dac527..2f532f16504 100644
+--- a/core/controller/src/main/scala/whisk/core/controller/RestAPIs.scala
++++ b/core/controller/src/main/scala/whisk/core/controller/RestAPIs.scala
+@@ -199,7 +199,7 @@ protected[controller] class RestAPIVersion_v1(
+             override val activationStore: ActivationStore,
+             override val entitlementService: EntitlementService,
+             override val performLoadBalancerRequest: LoadBalancerReq => Future[LoadBalancerResponse],
+-            override val queryActivationResponse: (ActivationId, TransactionId) => Future[WhiskActivation],
++            override val queryActivationResponse: (ActivationId, TransactionId) => (ActivationId, Future[WhiskActivation]),
+             override val consulServer: String,
+             override val executionContext: ExecutionContext)
+         extends WhiskActionsApi with WhiskServices {
+@@ -216,7 +216,7 @@ protected[controller] class RestAPIVersion_v1(
+             override val entitlementService: EntitlementService,
+             override val activationStore: ActivationStore,
+             override val performLoadBalancerRequest: LoadBalancerReq => Future[LoadBalancerResponse],
+-            override val queryActivationResponse: (ActivationId, TransactionId) => Future[WhiskActivation],
++            override val queryActivationResponse: (ActivationId, TransactionId) => (ActivationId, Future[WhiskActivation]),
+             override val consulServer: String,
+             override val executionContext: ExecutionContext)
+         extends WhiskTriggersApi with WhiskServices {
+@@ -232,7 +232,7 @@ protected[controller] class RestAPIVersion_v1(
+             override val entityStore: EntityStore,
+             override val entitlementService: EntitlementService,
+             override val performLoadBalancerRequest: LoadBalancerReq => Future[LoadBalancerResponse],
+-            override val queryActivationResponse: (ActivationId, TransactionId) => Future[WhiskActivation],
++            override val queryActivationResponse: (ActivationId, TransactionId) => (ActivationId, Future[WhiskActivation]),
+             override val consulServer: String,
+             override val executionContext: ExecutionContext)
+         extends WhiskRulesApi with WhiskServices {
+@@ -258,7 +258,7 @@ protected[controller] class RestAPIVersion_v1(
+             implicit override val entityStore: EntityStore,
+             override val entitlementService: EntitlementService,
+             override val performLoadBalancerRequest: LoadBalancerReq => Future[LoadBalancerResponse],
+-            override val queryActivationResponse: (ActivationId, TransactionId) => Future[WhiskActivation],
++            override val queryActivationResponse: (ActivationId, TransactionId) => (ActivationId, Future[WhiskActivation]),
+             override val consulServer: String,
+             override val executionContext: ExecutionContext)
+         extends WhiskPackagesApi with WhiskServices {
+diff --git a/core/controller/src/main/scala/whisk/core/loadBalancer/LoadBalancerService.scala b/core/controller/src/main/scala/whisk/core/loadBalancer/LoadBalancerService.scala
+index bd89aad4bb0..db6cd8c6351 100644
+--- a/core/controller/src/main/scala/whisk/core/loadBalancer/LoadBalancerService.scala
++++ b/core/controller/src/main/scala/whisk/core/loadBalancer/LoadBalancerService.scala
+@@ -27,6 +27,7 @@ import scala.util.Failure
+ import scala.util.Success
+ 
+ import akka.actor.ActorSystem
++import akka.event.Logging.LogLevel
+ import spray.json.JsBoolean
+ import spray.json.JsObject
+ import whisk.common.ConsulClient
+@@ -44,7 +45,6 @@ import whisk.core.connector.CompletionMessage
+ import whisk.core.entity.ActivationId
+ import whisk.core.entity.WhiskActivation
+ import whisk.utils.ExecutionContextFactory.PromiseExtensions
+-import akka.event.Logging.LogLevel
+ 
+ class LoadBalancerService(config: WhiskConfig, verbosity: LogLevel)(
+     implicit val actorSystem: ActorSystem)
+@@ -121,10 +121,10 @@ class LoadBalancerService(config: WhiskConfig, verbosity: LogLevel)(
+      * Instead of sleep/poll, the promise is filled in when the completion messages arrives.
+      * If for some reason, there is no ack, promise eventually times out and the promise is removed.
+      */
+-    def queryActivationResponse(activationId: ActivationId, transid: TransactionId): Future[WhiskActivation] = {
++    def queryActivationResponse(activationId: ActivationId, transid: TransactionId): (ActivationId, Future[WhiskActivation]) = {
+         implicit val tid = transid
+         // either create a new promise or reuse a previous one for this activation if it exists
+-        queryMap.getOrElseUpdate(activationId, {
++        val callback = queryMap.getOrElseUpdate(activationId, {
+             val promise = Promise[WhiskActivation]
+             // store the promise to complete on success, and the timed future that completes
+             // with the TimeoutException after alloted time has elapsed
+@@ -135,6 +135,8 @@ class LoadBalancerService(config: WhiskConfig, verbosity: LogLevel)(
+                 }
+             })
+         }).future
++
++        (activationId, callback)
+     }
+ 
+     val consumer = new KafkaConsumerConnector(config.kafkaHost, "completions", "completed")
+diff --git a/tests/src/whisk/core/controller/test/ActionsApiTests.scala b/tests/src/whisk/core/controller/test/ActionsApiTests.scala
+index 402292dccd4..d88517e5e45 100644
+--- a/tests/src/whisk/core/controller/test/ActionsApiTests.scala
++++ b/tests/src/whisk/core/controller/test/ActionsApiTests.scala
+@@ -595,44 +595,74 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
+     }
+ 
+     it should "invoke an action, blocking with timeout" in {
+-        implicit val tid = transid()
+-        val action = WhiskAction(namespace, aname, Exec.js("??"), limits = ActionLimits(TimeLimit(1 second), MemoryLimit(), LogLimit()))
+-        put(entityStore, action)
+-        Post(s"$collectionPath/${action.name}?blocking=true") ~> sealRoute(routes(creds)) ~> check {
+-            status should be(Accepted)
+-            val response = responseAs[JsObject]
+-            response.fields("activationId") should not be None
++        val stream = new ByteArrayOutputStream
++        val printstream = new PrintStream(stream)
++        val savedstream = this.outputStream
++        this.outputStream = printstream
++
++        try {
++            implicit val tid = transid()
++            val action = WhiskAction(namespace, aname, Exec.js("??"), limits = ActionLimits(TimeLimit(1 second), MemoryLimit(), LogLimit()))
++            put(entityStore, action)
++            Post(s"$collectionPath/${action.name}?blocking=true") ~> sealRoute(routes(creds)) ~> check {
++                status should be(Accepted)
++                val response = responseAs[JsObject]
++                response.fields("activationId") should not be None
++
++                // Check that Controller stops polling for result after timeout
++                stream.toString should include("action activation waiting period expired")
++            }
++        } finally {
++            this.outputStream = savedstream
++            stream.close()
++            printstream.close()
+         }
+     }
+ 
+     it should "invoke an action, blocking" in {
+-        implicit val tid = transid()
+-        val action = WhiskAction(namespace, aname, Exec.js("??"))
+-        val activation = WhiskActivation(action.namespace, action.name, creds.subject, activationId,
+-            start = Instant.now,
+-            end = Instant.now,
+-            response = ActivationResponse.success(Some(JsObject("test" -> "yes".toJson))))
+-        put(entityStore, action)
+-        put(activationStore, activation)
+-        Post(s"$collectionPath/${action.name}?blocking=true") ~> sealRoute(routes(creds)) ~> check {
+-            status should be(OK)
+-            val response = responseAs[JsObject]
+-            response should be(activation.toExtendedJson)
+-        }
++        val stream = new ByteArrayOutputStream
++        val printstream = new PrintStream(stream)
++        val savedstream = this.outputStream
++        this.outputStream = printstream
+ 
+-        // repeat invoke, get only result back
+-        Post(s"$collectionPath/${action.name}?blocking=true&result=true") ~> sealRoute(routes(creds)) ~> check {
+-            status should be(OK)
+-            val response = responseAs[JsObject]
+-            response should be(activation.resultAsJson)
+-        }
++        try {
++            implicit val tid = transid()
++            val action = WhiskAction(namespace, aname, Exec.js("??"))
++            activationIdForBlockingRequests = Some(activationId)
++            val activation = WhiskActivation(action.namespace, action.name, creds.subject, activationId,
++                start = Instant.now,
++                end = Instant.now,
++                response = ActivationResponse.success(Some(JsObject("test" -> "yes".toJson))))
++            put(entityStore, action)
++            put(activationStore, activation)
++            Post(s"$collectionPath/${action.name}?blocking=true") ~> sealRoute(routes(creds)) ~> check {
++                status should be(OK)
++                val response = responseAs[JsObject]
++                response should be(activation.toExtendedJson)
++            }
+ 
+-        deleteActivation(activation.docid)
++            // repeat invoke, get only result back
++            Post(s"$collectionPath/${action.name}?blocking=true&result=true") ~> sealRoute(routes(creds)) ~> check {
++                status should be(OK)
++                val response = responseAs[JsObject]
++                response should be(activation.resultAsJson)
++            }
++            deleteActivation(activation.docid)
++
++            // Check if the fallback for manual polling works
++            stream.toString should include("switching to poll db, active ack")
++        } finally {
++            activationIdForBlockingRequests = None
++            this.outputStream = savedstream
++            stream.close()
++            printstream.close()
++        }
+     }
+ 
+     it should "invoke a blocking action and return error response when activation fails" in {
+         implicit val tid = transid()
+         val action = WhiskAction(namespace, aname, Exec.js("??"))
++        activationIdForBlockingRequests = Some(activationId)
+         val activation = WhiskActivation(action.namespace, action.name, creds.subject, activationId,
+             start = Instant.now,
+             end = Instant.now,
+@@ -645,6 +675,7 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
+             response should be(activation.toExtendedJson)
+         }
+ 
++        activationIdForBlockingRequests = None
+         deleteActivation(activation.docid)
+     }
+ }
+diff --git a/tests/src/whisk/core/controller/test/ControllerTestCommon.scala b/tests/src/whisk/core/controller/test/ControllerTestCommon.scala
+index 0fed91d3626..c573c5c502f 100644
+--- a/tests/src/whisk/core/controller/test/ControllerTestCommon.scala
++++ b/tests/src/whisk/core/controller/test/ControllerTestCommon.scala
+@@ -82,12 +82,17 @@ protected trait ControllerTestCommon
+     val authStore = WhiskAuthStore.datastore(whiskConfig)
+     val entitlementService: EntitlementService = new LocalEntitlementService(whiskConfig)
+ 
+-    val activationId = ActivationId() // need a static activation id to test activations api
+     val performLoadBalancerRequest = (lbr: WhiskServices.LoadBalancerReq) => Future {
+-        LoadBalancerResponse.id(activationId)
++        LoadBalancerResponse.id(lbr._2.activationId)
+     }
+-    val queryActivationResponse = (activationId: ActivationId, transid: TransactionId) => Future.failed {
+-        new IllegalArgumentException("Unit test does not need fast path")
++    /**
++     * Activation Id to wait for activation of blocking invoke.
++     * Has to be set to <code>None</code> after the test to avoid duplicate usage.
++     */
++    var activationIdForBlockingRequests: Option[ActivationId] = None
++    def activationId = activationIdForBlockingRequests.getOrElse(ActivationId()) // need a static activation id to test activations api
++    val queryActivationResponse = (wrongActivationId: ActivationId, transid: TransactionId) => {
++        (activationId, Future.failed(new Exception))
+     }
+     val consulServer = "???"
+ 

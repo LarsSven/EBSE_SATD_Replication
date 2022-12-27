@@ -1,0 +1,753 @@
+diff --git a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
+index 486e34be6c9c..158e0dc27632 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
++++ b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
+@@ -22,6 +22,7 @@
+ import org.apache.kafka.common.errors.AuthenticationException;
+ import org.apache.kafka.common.errors.DisconnectException;
+ import org.apache.kafka.common.errors.GroupAuthorizationException;
++import org.apache.kafka.common.errors.GroupMaxSizeReachedException;
+ import org.apache.kafka.common.errors.IllegalGenerationException;
+ import org.apache.kafka.common.errors.InterruptException;
+ import org.apache.kafka.common.errors.MemberIdRequiredException;
+@@ -545,12 +546,17 @@ public void handle(JoinGroupResponse joinResponse, RequestFuture<ByteBuffer> fut
+                 future.raise(error);
+             } else if (error == Errors.INCONSISTENT_GROUP_PROTOCOL
+                     || error == Errors.INVALID_SESSION_TIMEOUT
+-                    || error == Errors.INVALID_GROUP_ID) {
+-                // log the error and re-throw the exception
++                    || error == Errors.INVALID_GROUP_ID
++                    || error == Errors.GROUP_AUTHORIZATION_FAILED
++                    || error == Errors.GROUP_MAX_SIZE_REACHED) {
+                 log.error("Attempt to join group failed due to fatal error: {}", error.message());
+-                future.raise(error);
+-            } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
+-                future.raise(new GroupAuthorizationException(groupId));
++                if (error == Errors.GROUP_MAX_SIZE_REACHED) {
++                    future.raise(new GroupMaxSizeReachedException(groupId));
++                } else if (error == Errors.GROUP_AUTHORIZATION_FAILED) {
++                    future.raise(new GroupAuthorizationException(groupId));
++                } else {
++                    future.raise(error);
++                }
+             } else if (error == Errors.MEMBER_ID_REQUIRED) {
+                 // Broker requires a concrete member id to be allowed to join the group. Update member id
+                 // and send another join group request in next cycle.
+@@ -563,6 +569,7 @@ public void handle(JoinGroupResponse joinResponse, RequestFuture<ByteBuffer> fut
+                 future.raise(Errors.MEMBER_ID_REQUIRED);
+             } else {
+                 // unexpected error, throw the exception
++                log.error("Attempt to join group failed due to unexpected error: {}", error.message());
+                 future.raise(new KafkaException("Unexpected error in join group response: " + error.message()));
+             }
+         }
+diff --git a/clients/src/main/java/org/apache/kafka/common/errors/GroupMaxSizeReachedException.java b/clients/src/main/java/org/apache/kafka/common/errors/GroupMaxSizeReachedException.java
+new file mode 100644
+index 000000000000..086b79ff0284
+--- /dev/null
++++ b/clients/src/main/java/org/apache/kafka/common/errors/GroupMaxSizeReachedException.java
+@@ -0,0 +1,28 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.common.errors;
++
++/**
++ * Indicates that a consumer group is already at its configured maximum capacity and cannot accommodate more members
++ */
++public class GroupMaxSizeReachedException extends ApiException {
++    private static final long serialVersionUID = 1L;
++
++    public GroupMaxSizeReachedException(String groupId) {
++        super("Consumer group " + groupId + " already has the configured maximum number of members.");
++    }
++}
+diff --git a/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java b/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java
+index 5bcff4363dc0..cc493c22f199 100644
+--- a/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java
++++ b/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java
+@@ -35,6 +35,7 @@
+ import org.apache.kafka.common.errors.FetchSessionIdNotFoundException;
+ import org.apache.kafka.common.errors.GroupAuthorizationException;
+ import org.apache.kafka.common.errors.GroupIdNotFoundException;
++import org.apache.kafka.common.errors.GroupMaxSizeReachedException;
+ import org.apache.kafka.common.errors.GroupNotEmptyException;
+ import org.apache.kafka.common.errors.IllegalGenerationException;
+ import org.apache.kafka.common.errors.IllegalSaslStateException;
+@@ -300,7 +301,8 @@ public enum Errors {
+     MEMBER_ID_REQUIRED(79, "The group member needs to have a valid member id before actually entering a consumer group",
+             MemberIdRequiredException::new),
+     PREFERRED_LEADER_NOT_AVAILABLE(80, "The preferred leader was not available",
+-            PreferredLeaderNotAvailableException::new);
++            PreferredLeaderNotAvailableException::new),
++    GROUP_MAX_SIZE_REACHED(81, "The consumer group has reached its max size.", GroupMaxSizeReachedException::new);
+ 
+     private static final Logger log = LoggerFactory.getLogger(Errors.class);
+ 
+diff --git a/clients/src/test/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinatorTest.java b/clients/src/test/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinatorTest.java
+index 957233c7ba40..1c076c8dc6bf 100644
+--- a/clients/src/test/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinatorTest.java
++++ b/clients/src/test/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinatorTest.java
+@@ -146,6 +146,23 @@ public void testTimeoutAndRetryJoinGroupIfNeeded() throws Exception {
+         }
+     }
+ 
++    @Test
++    public void testGroupMaxSizeExceptionIsFatal() {
++        setupCoordinator();
++        mockClient.prepareResponse(groupCoordinatorResponse(node, Errors.NONE));
++        coordinator.ensureCoordinatorReady(mockTime.timer(0));
++
++        final String memberId = "memberId";
++        final int generation = -1;
++
++        mockClient.prepareResponse(joinGroupFollowerResponse(generation, memberId, JoinGroupResponse.UNKNOWN_MEMBER_ID, Errors.GROUP_MAX_SIZE_REACHED));
++
++        RequestFuture<ByteBuffer> future = coordinator.sendJoinGroupRequest();
++        assertTrue(consumerClient.poll(future, mockTime.timer(REQUEST_TIMEOUT_MS)));
++        assertTrue(future.exception().getClass().isInstance(Errors.GROUP_MAX_SIZE_REACHED.exception()));
++        assertFalse(future.isRetriable());
++    }
++
+     @Test
+     public void testJoinGroupRequestTimeout() {
+         setupCoordinator(RETRY_BACKOFF_MS, REBALANCE_TIMEOUT_MS);
+diff --git a/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala b/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
+index 3332620a7286..8bfd1da8d01e 100644
+--- a/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
++++ b/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
+@@ -118,12 +118,13 @@ class GroupCoordinator(val brokerId: Int,
+       sessionTimeoutMs > groupConfig.groupMaxSessionTimeoutMs) {
+       responseCallback(joinError(memberId, Errors.INVALID_SESSION_TIMEOUT))
+     } else {
++      val isUnknownMember = memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID
+       groupManager.getGroup(groupId) match {
+         case None =>
+           // only try to create the group if the group is UNKNOWN AND
+           // the member id is UNKNOWN, if member is specified but group does not
+           // exist we should reject the request.
+-          if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
++          if (isUnknownMember) {
+             val group = groupManager.addGroup(new GroupMetadata(groupId, Empty, time))
+             doUnknownJoinGroup(group, requireKnownMemberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
+           } else {
+@@ -131,10 +132,17 @@ class GroupCoordinator(val brokerId: Int,
+           }
+ 
+         case Some(group) =>
+-          if (memberId == JoinGroupRequest.UNKNOWN_MEMBER_ID) {
+-            doUnknownJoinGroup(group, requireKnownMemberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
+-          } else {
+-            doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
++          group.inLock {
++            if ((groupIsOverCapacity(group)
++                  && group.has(memberId) && !group.get(memberId).isAwaitingJoin) // oversized group, need to shed members that haven't joined yet
++                || (isUnknownMember && group.size >= groupConfig.groupMaxSize)) {
++              group.remove(memberId)
++              responseCallback(joinError(JoinGroupRequest.UNKNOWN_MEMBER_ID, Errors.GROUP_MAX_SIZE_REACHED))
++            } else if (isUnknownMember) {
++              doUnknownJoinGroup(group, requireKnownMemberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
++            } else {
++              doJoinGroup(group, memberId, clientId, clientHost, rebalanceTimeoutMs, sessionTimeoutMs, protocolType, protocols, responseCallback)
++            }
+           }
+       }
+     }
+@@ -651,6 +659,10 @@ class GroupCoordinator(val brokerId: Int,
+     group.inLock {
+       info(s"Loading group metadata for ${group.groupId} with generation ${group.generationId}")
+       assert(group.is(Stable) || group.is(Empty))
++      if (groupIsOverCapacity(group)) {
++        prepareRebalance(group, s"Freshly-loaded group is over capacity ($groupConfig.groupMaxSize). Rebalacing in order to give a chance for consumers to commit offsets")
++      }
++
+       group.allMemberMetadata.foreach(completeAndScheduleNextHeartbeatExpiration(group, _))
+     }
+   }
+@@ -743,7 +755,7 @@ class GroupCoordinator(val brokerId: Int,
+                                     protocolType: String,
+                                     protocols: List[(String, Array[Byte])],
+                                     group: GroupMetadata,
+-                                    callback: JoinCallback): MemberMetadata = {
++                                    callback: JoinCallback) {
+     val member = new MemberMetadata(memberId, group.groupId, clientId, clientHost, rebalanceTimeoutMs,
+       sessionTimeoutMs, protocolType, protocols)
+ 
+@@ -765,7 +777,6 @@ class GroupCoordinator(val brokerId: Int,
+ 
+     maybePrepareRebalance(group, s"Adding new member $memberId")
+     group.removePendingMember(memberId)
+-    member
+   }
+ 
+   private def updateMemberAndRebalance(group: GroupMetadata,
+@@ -921,6 +932,10 @@ class GroupCoordinator(val brokerId: Int,
+ 
+   def partitionFor(group: String): Int = groupManager.partitionFor(group)
+ 
++  private def groupIsOverCapacity(group: GroupMetadata): Boolean = {
++    group.size > groupConfig.groupMaxSize
++  }
++
+   private def isCoordinatorForGroup(groupId: String) = groupManager.isGroupLocal(groupId)
+ 
+   private def isCoordinatorLoadInProgress(groupId: String) = groupManager.isGroupLoading(groupId)
+@@ -970,6 +985,7 @@ object GroupCoordinator {
+     val offsetConfig = this.offsetConfig(config)
+     val groupConfig = GroupConfig(groupMinSessionTimeoutMs = config.groupMinSessionTimeoutMs,
+       groupMaxSessionTimeoutMs = config.groupMaxSessionTimeoutMs,
++      groupMaxSize = config.groupMaxSize,
+       groupInitialRebalanceDelayMs = config.groupInitialRebalanceDelay)
+ 
+     val groupMetadataManager = new GroupMetadataManager(config.brokerId, config.interBrokerProtocolVersion,
+@@ -981,6 +997,7 @@ object GroupCoordinator {
+ 
+ case class GroupConfig(groupMinSessionTimeoutMs: Int,
+                        groupMaxSessionTimeoutMs: Int,
++                       groupMaxSize: Int,
+                        groupInitialRebalanceDelayMs: Int)
+ 
+ case class JoinGroupResult(members: Map[String, Array[Byte]],
+diff --git a/core/src/main/scala/kafka/coordinator/group/GroupMetadata.scala b/core/src/main/scala/kafka/coordinator/group/GroupMetadata.scala
+index 5bc08ebb1762..3bc0117850ea 100644
+--- a/core/src/main/scala/kafka/coordinator/group/GroupMetadata.scala
++++ b/core/src/main/scala/kafka/coordinator/group/GroupMetadata.scala
+@@ -201,6 +201,7 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
+   def not(groupState: GroupState) = state != groupState
+   def has(memberId: String) = members.contains(memberId)
+   def get(memberId: String) = members(memberId)
++  def size = members.size
+ 
+   def isLeader(memberId: String): Boolean = leaderId.contains(memberId)
+   def leaderOrNull: String = leaderId.orNull
+@@ -220,14 +221,14 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
+     members.put(member.memberId, member)
+     member.supportedProtocols.foreach{ case (protocol, _) => supportedProtocols(protocol) += 1 }
+     member.awaitingJoinCallback = callback
+-    if (member.awaitingJoinCallback != null)
++    if (member.isAwaitingJoin)
+       numMembersAwaitingJoin += 1
+   }
+ 
+   def remove(memberId: String) {
+     members.remove(memberId).foreach { member =>
+       member.supportedProtocols.foreach{ case (protocol, _) => supportedProtocols(protocol) -= 1 }
+-      if (member.awaitingJoinCallback != null)
++      if (member.isAwaitingJoin)
+         numMembersAwaitingJoin -= 1
+     }
+ 
+@@ -248,9 +249,9 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
+ 
+   def currentState = state
+ 
+-  def notYetRejoinedMembers = members.values.filter(_.awaitingJoinCallback == null).toList
++  def notYetRejoinedMembers = members.values.filter(!_.isAwaitingJoin).toList
+ 
+-  def hasAllMembersJoined = members.size <= numMembersAwaitingJoin && pendingMembers.isEmpty
++  def hasAllMembersJoined = members.size == numMembersAwaitingJoin && pendingMembers.isEmpty
+ 
+   def allMembers = members.keySet
+ 
+@@ -307,9 +308,9 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
+     protocols.foreach{ case (protocol, _) => supportedProtocols(protocol) += 1 }
+     member.supportedProtocols = protocols
+ 
+-    if (callback != null && member.awaitingJoinCallback == null) {
++    if (callback != null && !member.isAwaitingJoin) {
+       numMembersAwaitingJoin += 1
+-    } else if (callback == null && member.awaitingJoinCallback != null) {
++    } else if (callback == null && member.isAwaitingJoin) {
+       numMembersAwaitingJoin -= 1
+     }
+     member.awaitingJoinCallback = callback
+@@ -317,7 +318,7 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
+ 
+   def maybeInvokeJoinCallback(member: MemberMetadata,
+                               joinGroupResult: JoinGroupResult) : Unit = {
+-    if (member.awaitingJoinCallback != null) {
++    if (member.isAwaitingJoin) {
+       member.awaitingJoinCallback(joinGroupResult)
+       member.awaitingJoinCallback = null
+       numMembersAwaitingJoin -= 1
+diff --git a/core/src/main/scala/kafka/coordinator/group/MemberMetadata.scala b/core/src/main/scala/kafka/coordinator/group/MemberMetadata.scala
+index 6eb01a6b2bca..1932f423bac9 100644
+--- a/core/src/main/scala/kafka/coordinator/group/MemberMetadata.scala
++++ b/core/src/main/scala/kafka/coordinator/group/MemberMetadata.scala
+@@ -70,6 +70,8 @@ private[group] class MemberMetadata(val memberId: String,
+   var isLeaving: Boolean = false
+   var isNew: Boolean = false
+ 
++  def isAwaitingJoin = awaitingJoinCallback != null
++
+   /**
+    * Get metadata corresponding to the provided protocol.
+    */
+@@ -82,7 +84,7 @@ private[group] class MemberMetadata(val memberId: String,
+   }
+ 
+   def shouldKeepAlive(deadlineMs: Long): Boolean = {
+-    if (awaitingJoinCallback != null)
++    if (isAwaitingJoin)
+       !isNew || latestHeartbeat + GroupCoordinator.NewMemberJoinTimeoutMs > deadlineMs
+     else awaitingSyncCallback != null ||
+       latestHeartbeat + sessionTimeoutMs > deadlineMs
+diff --git a/core/src/main/scala/kafka/server/KafkaConfig.scala b/core/src/main/scala/kafka/server/KafkaConfig.scala
+index c3c3295835cf..ef93fd995ab5 100755
+--- a/core/src/main/scala/kafka/server/KafkaConfig.scala
++++ b/core/src/main/scala/kafka/server/KafkaConfig.scala
+@@ -152,6 +152,7 @@ object Defaults {
+   val GroupMinSessionTimeoutMs = 6000
+   val GroupMaxSessionTimeoutMs = 300000
+   val GroupInitialRebalanceDelayMs = 3000
++  val GroupMaxSize: Int = Int.MaxValue
+ 
+   /** ********* Offset management configuration ***********/
+   val OffsetMetadataMaxSize = OffsetConfig.DefaultMaxMetadataSize
+@@ -375,6 +376,7 @@ object KafkaConfig {
+   val GroupMinSessionTimeoutMsProp = "group.min.session.timeout.ms"
+   val GroupMaxSessionTimeoutMsProp = "group.max.session.timeout.ms"
+   val GroupInitialRebalanceDelayMsProp = "group.initial.rebalance.delay.ms"
++  val GroupMaxSizeProp = "group.max.size"
+   /** ********* Offset management configuration ***********/
+   val OffsetMetadataMaxSizeProp = "offset.metadata.max.bytes"
+   val OffsetsLoadBufferSizeProp = "offsets.load.buffer.size"
+@@ -686,10 +688,11 @@ object KafkaConfig {
+   val ControlledShutdownMaxRetriesDoc = "Controlled shutdown can fail for multiple reasons. This determines the number of retries when such failure happens"
+   val ControlledShutdownRetryBackoffMsDoc = "Before each retry, the system needs time to recover from the state that caused the previous failure (Controller fail over, replica lag etc). This config determines the amount of time to wait before retrying."
+   val ControlledShutdownEnableDoc = "Enable controlled shutdown of the server"
+-  /** ********* Consumer coordinator configuration ***********/
++  /** ********* Group coordinator configuration ***********/
+   val GroupMinSessionTimeoutMsDoc = "The minimum allowed session timeout for registered consumers. Shorter timeouts result in quicker failure detection at the cost of more frequent consumer heartbeating, which can overwhelm broker resources."
+   val GroupMaxSessionTimeoutMsDoc = "The maximum allowed session timeout for registered consumers. Longer timeouts give consumers more time to process messages in between heartbeats at the cost of a longer time to detect failures."
+   val GroupInitialRebalanceDelayMsDoc = "The amount of time the group coordinator will wait for more consumers to join a new group before performing the first rebalance. A longer delay means potentially fewer rebalances, but increases the time until processing begins."
++  val GroupMaxSizeDoc = "The maximum number of consumers that a single consumer group can accommodate."
+   /** ********* Offset management configuration ***********/
+   val OffsetMetadataMaxSizeDoc = "The maximum size for a metadata entry associated with an offset commit"
+   val OffsetsLoadBufferSizeDoc = "Batch size for reading from the offsets segments when loading offsets into the cache (soft-limit, overridden if records are too large)."
+@@ -956,6 +959,7 @@ object KafkaConfig {
+       .define(GroupMinSessionTimeoutMsProp, INT, Defaults.GroupMinSessionTimeoutMs, MEDIUM, GroupMinSessionTimeoutMsDoc)
+       .define(GroupMaxSessionTimeoutMsProp, INT, Defaults.GroupMaxSessionTimeoutMs, MEDIUM, GroupMaxSessionTimeoutMsDoc)
+       .define(GroupInitialRebalanceDelayMsProp, INT, Defaults.GroupInitialRebalanceDelayMs, MEDIUM, GroupInitialRebalanceDelayMsDoc)
++      .define(GroupMaxSizeProp, INT, Defaults.GroupMaxSize, atLeast(1), MEDIUM, GroupMaxSizeDoc)
+ 
+       /** ********* Offset management configuration ***********/
+       .define(OffsetMetadataMaxSizeProp, INT, Defaults.OffsetMetadataMaxSize, HIGH, OffsetMetadataMaxSizeDoc)
+@@ -1241,6 +1245,7 @@ class KafkaConfig(val props: java.util.Map[_, _], doLog: Boolean, dynamicConfigO
+   val groupMinSessionTimeoutMs = getInt(KafkaConfig.GroupMinSessionTimeoutMsProp)
+   val groupMaxSessionTimeoutMs = getInt(KafkaConfig.GroupMaxSessionTimeoutMsProp)
+   val groupInitialRebalanceDelay = getInt(KafkaConfig.GroupInitialRebalanceDelayMsProp)
++  val groupMaxSize = getInt(KafkaConfig.GroupMaxSizeProp)
+ 
+   /** ********* Offset management configuration ***********/
+   val offsetMetadataMaxSize = getInt(KafkaConfig.OffsetMetadataMaxSizeProp)
+diff --git a/core/src/test/scala/integration/kafka/api/ConsumerBounceTest.scala b/core/src/test/scala/integration/kafka/api/ConsumerBounceTest.scala
+index 46bd81cd5d76..e27ec900413a 100644
+--- a/core/src/test/scala/integration/kafka/api/ConsumerBounceTest.scala
++++ b/core/src/test/scala/integration/kafka/api/ConsumerBounceTest.scala
+@@ -13,20 +13,28 @@
+ 
+ package kafka.api
+ 
++import java.time
+ import java.util.concurrent._
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.locks.ReentrantLock
+ import java.util.{Collection, Collections, Properties}
+ 
++import util.control.Breaks._
+ import kafka.server.{BaseRequestTest, KafkaConfig}
+ import kafka.utils.{CoreUtils, Logging, ShutdownableThread, TestUtils}
+ import org.apache.kafka.clients.consumer._
+ import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+ import org.apache.kafka.common.TopicPartition
++import org.apache.kafka.common.errors.GroupMaxSizeReachedException
+ import org.apache.kafka.common.protocol.ApiKeys
+ import org.apache.kafka.common.requests.{FindCoordinatorRequest, FindCoordinatorResponse}
+ import org.junit.Assert._
+ import org.junit.{After, Before, Ignore, Test}
+ 
+ import scala.collection.JavaConverters._
++import scala.collection.mutable.ArrayBuffer
++import scala.concurrent.duration.Duration
++import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutor, Future => SFuture}
+ 
+ /**
+  * Integration tests for the consumer that cover basic usage as well as server failures
+@@ -35,17 +43,23 @@ class ConsumerBounceTest extends BaseRequestTest with Logging {
+   val topic = "topic"
+   val part = 0
+   val tp = new TopicPartition(topic, part)
++  val maxGroupSize = 5
+ 
+   // Time to process commit and leave group requests in tests when brokers are available
+   val gracefulCloseTimeMs = 1000
+   val executor = Executors.newScheduledThreadPool(2)
+ 
+   override def generateConfigs = {
++    generateKafkaConfigs()
++  }
++
++  private def generateKafkaConfigs(maxGroupSize: String = maxGroupSize.toString): Seq[KafkaConfig] = {
+     val properties = new Properties
+     properties.put(KafkaConfig.OffsetsTopicReplicationFactorProp, "3") // don't want to lose offset
+     properties.put(KafkaConfig.OffsetsTopicPartitionsProp, "1")
+     properties.put(KafkaConfig.GroupMinSessionTimeoutMsProp, "10") // set small enough session timeout
+     properties.put(KafkaConfig.GroupInitialRebalanceDelayMsProp, "0")
++    properties.put(KafkaConfig.GroupMaxSizeProp, maxGroupSize)
+     properties.put(KafkaConfig.UncleanLeaderElectionEnableProp, "true")
+     properties.put(KafkaConfig.AutoCreateTopicsEnableProp, "false")
+ 
+@@ -188,14 +202,14 @@ class ConsumerBounceTest extends BaseRequestTest with Logging {
+     }
+ 
+     sendRecords(numRecords, newtopic)
+-    receiveRecords(consumer, numRecords, newtopic, 10000)
++    receiveRecords(consumer, numRecords, 10000)
+ 
+     servers.foreach(server => killBroker(server.config.brokerId))
+     Thread.sleep(500)
+     restartDeadBrokers()
+ 
+     val future = executor.submit(new Runnable {
+-      def run() = receiveRecords(consumer, numRecords, newtopic, 10000)
++      def run() = receiveRecords(consumer, numRecords, 10000)
+     })
+     sendRecords(numRecords, newtopic)
+     future.get
+@@ -276,6 +290,166 @@ class ConsumerBounceTest extends BaseRequestTest with Logging {
+     future2.get
+   }
+ 
++  /**
++    * If we have a running consumer group of size N, configure consumer.group.max.size = N-1 and restart all brokers,
++    * the group should be forced to rebalance when it becomes hosted on a Coordinator with the new config.
++    * Then, 1 consumer should be left out of the group.
++    */
++  @Test
++  def testRollingBrokerRestartsWithSmallerMaxGroupSizeConfigDisruptsBigGroup(): Unit = {
++    val topic = "group-max-size-test"
++    val maxGroupSize = 2
++    val consumerCount = maxGroupSize + 1
++    var recordsProduced = maxGroupSize * 100
++    val partitionCount = consumerCount * 2
++    if (recordsProduced % partitionCount != 0) {
++      // ensure even record distribution per partition
++      recordsProduced += partitionCount - recordsProduced % partitionCount
++    }
++    val executor = Executors.newScheduledThreadPool(consumerCount * 2)
++    this.consumerConfig.setProperty(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, "60000")
++    this.consumerConfig.setProperty(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, "1000")
++    this.consumerConfig.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
++    val producer = createProducer()
++    createTopic(topic, numPartitions = partitionCount, replicationFactor = numBrokers)
++    val stableConsumers = createConsumersWithGroupId("group2", consumerCount, executor, topic = topic)
++
++    // assert group is stable and working
++    sendRecords(producer, recordsProduced, topic, numPartitions = Some(partitionCount))
++    stableConsumers.foreach { cons => {
++      receiveAndCommit(cons, recordsProduced / consumerCount, 10000)
++    }}
++
++    // roll all brokers with a lesser max group size to make sure coordinator has the new config
++    val newConfigs = generateKafkaConfigs(maxGroupSize.toString)
++    val kickedConsumerOut = new AtomicBoolean(false)
++    var kickedOutConsumerIdx: Option[Int] = None
++    val lock = new ReentrantLock
++    // restart brokers until the group moves to a Coordinator with the new config
++    breakable { for (broker <- servers.indices) {
++      killBroker(broker)
++      sendRecords(producer, recordsProduced, topic, numPartitions = Some(partitionCount))
++
++      var successfulConsumes = 0
++
++      // compute consumptions in a non-blocking way in order to account for the rebalance once the group.size takes effect
++      val consumeFutures = new ArrayBuffer[SFuture[Any]]
++      implicit val executorContext: ExecutionContextExecutor = ExecutionContext.fromExecutor(executor)
++      stableConsumers.indices.foreach(idx => {
++        val currentConsumer = stableConsumers(idx)
++        val consumeFuture = SFuture {
++          try {
++            receiveAndCommit(currentConsumer, recordsProduced / consumerCount, 10000)
++            CoreUtils.inLock(lock) { successfulConsumes += 1 }
++          } catch {
++            case e: Throwable =>
++              if (!e.isInstanceOf[GroupMaxSizeReachedException]) {
++                throw e
++              }
++              if (!kickedConsumerOut.compareAndSet(false, true)) {
++                fail(s"Received more than one ${classOf[GroupMaxSizeReachedException]}")
++              }
++              kickedOutConsumerIdx = Some(idx)
++          }
++        }
++
++        consumeFutures += consumeFuture
++      })
++      Await.result(SFuture.sequence(consumeFutures), Duration("12sec"))
++
++      if (kickedConsumerOut.get()) {
++        // validate the rest N-1 consumers consumed successfully
++        assertEquals(maxGroupSize, successfulConsumes)
++        break
++      }
++
++      val config = newConfigs(broker)
++      servers(broker) = TestUtils.createServer(config, time = brokerTime(config.brokerId))
++      restartDeadBrokers()
++    }}
++    if (!kickedConsumerOut.get())
++      fail(s"Should have received an ${classOf[GroupMaxSizeReachedException]} during the cluster roll")
++
++    // assert that the group has gone through a rebalance and shed off one consumer
++    stableConsumers.remove(kickedOutConsumerIdx.get)
++    sendRecords(producer, recordsProduced, topic, numPartitions = Some(partitionCount))
++    // should be only maxGroupSize consumers left in the group
++    stableConsumers.foreach { cons => {
++      receiveAndCommit(cons, recordsProduced / maxGroupSize, 10000)
++    }}
++  }
++
++  /**
++    * When we have the consumer group max size configured to X, the X+1th consumer trying to join should receive a fatal exception
++    */
++  @Test
++  def testConsumerReceivesFatalExceptionWhenGroupPassesMaxSize(): Unit = {
++    val topic = "group-max-size-test"
++    val groupId = "group1"
++    val executor = Executors.newScheduledThreadPool(maxGroupSize * 2)
++    createTopic(topic, maxGroupSize, numBrokers)
++    this.consumerConfig.setProperty(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, "60000")
++    this.consumerConfig.setProperty(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, "1000")
++    this.consumerConfig.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
++
++    // Create N+1 consumers in the same consumer group and assert that the N+1th consumer receives a fatal error when it tries to join the group
++    val stableConsumers = createConsumersWithGroupId(groupId, maxGroupSize, executor, topic)
++    val newConsumer = createConsumerWithGroupId(groupId)
++    var failedRebalance = false
++    var exception: Exception = null
++    waitForRebalance(5000, subscribeAndPoll(newConsumer, executor = executor, onException = e => {failedRebalance = true; exception = e}),
++      executor = executor, stableConsumers:_*)
++    assertTrue("Rebalance did not fail as expected", failedRebalance)
++    assertTrue(exception.isInstanceOf[GroupMaxSizeReachedException])
++
++    // assert group continues to live
++    val producer = createProducer()
++    sendRecords(producer, maxGroupSize * 100, topic, numPartitions = Some(maxGroupSize))
++    stableConsumers.foreach { cons => {
++        receiveExactRecords(cons, 100, 10000)
++    }}
++  }
++
++  /**
++    * Creates N consumers with the same group ID and ensures the group rebalances properly at each step
++    */
++  private def createConsumersWithGroupId(groupId: String, consumerCount: Int, executor: ExecutorService, topic: String = topic): ArrayBuffer[KafkaConsumer[Array[Byte], Array[Byte]]] = {
++    val stableConsumers = ArrayBuffer[KafkaConsumer[Array[Byte], Array[Byte]]]()
++    for (_ <- 1.to(consumerCount)) {
++      val newConsumer = createConsumerWithGroupId(groupId)
++      waitForRebalance(5000, subscribeAndPoll(newConsumer, executor = executor, topic = topic),
++        executor = executor, stableConsumers:_*)
++      stableConsumers += newConsumer
++    }
++    stableConsumers
++  }
++
++  def subscribeAndPoll(consumer: KafkaConsumer[Array[Byte], Array[Byte]], executor: ExecutorService, revokeSemaphore: Option[Semaphore] = None,
++                       onException: Exception => Unit = e => { throw e }, topic: String = topic, pollTimeout: Int = 1000): Future[Any] = {
++    executor.submit(CoreUtils.runnable {
++      try {
++        consumer.subscribe(Collections.singletonList(topic))
++        consumer.poll(java.time.Duration.ofMillis(pollTimeout))
++      } catch {
++        case e: Exception => onException.apply(e)
++      }
++    }, 0)
++  }
++
++  def waitForRebalance(timeoutMs: Long, future: Future[Any], executor: ExecutorService, otherConsumers: KafkaConsumer[Array[Byte], Array[Byte]]*) {
++    val startMs = System.currentTimeMillis
++    implicit val executorContext: ExecutionContextExecutor = ExecutionContext.fromExecutor(executor)
++
++    while (System.currentTimeMillis < startMs + timeoutMs && !future.isDone) {
++      val consumeFutures = otherConsumers.map(consumer => SFuture {
++        consumer.poll(time.Duration.ofMillis(1000))
++      })
++      Await.result(SFuture.sequence(consumeFutures), Duration("1500ms"))
++    }
++
++    assertTrue("Rebalance did not complete in time", future.isDone)
++  }
++
+   /**
+    * Consumer is closed during rebalance. Close should leave group and close
+    * immediately if rebalance is in progress. If brokers are not available,
+@@ -323,7 +497,6 @@ class ConsumerBounceTest extends BaseRequestTest with Logging {
+       assertFalse("Rebalance completed too early", future.isDone)
+       future
+     }
+-
+     val consumer1 = createConsumerWithGroupId(groupId)
+     waitForRebalance(2000, subscribeAndPoll(consumer1))
+     val consumer2 = createConsumerWithGroupId(groupId)
+@@ -360,18 +533,31 @@ class ConsumerBounceTest extends BaseRequestTest with Logging {
+       consumer.assign(Collections.singleton(tp))
+     else
+       consumer.subscribe(Collections.singleton(topic))
+-    receiveRecords(consumer, numRecords)
++    receiveExactRecords(consumer, numRecords)
+     consumer
+   }
+ 
+-  private def receiveRecords(consumer: KafkaConsumer[Array[Byte], Array[Byte]], numRecords: Int, topic: String = this.topic, timeoutMs: Long = 60000) {
++  private def receiveRecords(consumer: KafkaConsumer[Array[Byte], Array[Byte]], numRecords: Int, timeoutMs: Long = 60000): Long = {
+     var received = 0L
+     val endTimeMs = System.currentTimeMillis + timeoutMs
+     while (received < numRecords && System.currentTimeMillis < endTimeMs)
+-      received += consumer.poll(1000).count()
++      received += consumer.poll(time.Duration.ofMillis(100)).count()
++
++    received
++  }
++
++  private def receiveExactRecords(consumer: KafkaConsumer[Array[Byte], Array[Byte]], numRecords: Int, timeoutMs: Long = 60000): Unit = {
++    val received = receiveRecords(consumer, numRecords, timeoutMs)
+     assertEquals(numRecords, received)
+   }
+ 
++  @throws(classOf[CommitFailedException])
++  private def receiveAndCommit(consumer: KafkaConsumer[Array[Byte], Array[Byte]], numRecords: Int, timeoutMs: Long): Unit = {
++    val received = receiveRecords(consumer, numRecords, timeoutMs)
++    assertTrue(s"Received $received, expected at least $numRecords", numRecords <= received)
++    consumer.commitSync()
++  }
++
+   private def submitCloseAndValidate(consumer: KafkaConsumer[Array[Byte], Array[Byte]],
+       closeTimeoutMs: Long, minCloseTimeMs: Option[Long], maxCloseTimeMs: Option[Long]): Future[Any] = {
+     executor.submit(CoreUtils.runnable {
+@@ -427,9 +613,21 @@ class ConsumerBounceTest extends BaseRequestTest with Logging {
+ 
+   private def sendRecords(producer: KafkaProducer[Array[Byte], Array[Byte]],
+                           numRecords: Int,
+-                          topic: String = this.topic) {
++                          topic: String = this.topic,
++                          numPartitions: Option[Int] = None) {
++    var partitionIndex = 0
++    def getPartition: Int = {
++      numPartitions match {
++        case Some(partitions) =>
++          val nextPart = partitionIndex % partitions
++          partitionIndex += 1
++          nextPart
++        case None => part
++      }
++    }
++
+     val futures = (0 until numRecords).map { i =>
+-      producer.send(new ProducerRecord(topic, part, i.toString.getBytes, i.toString.getBytes))
++      producer.send(new ProducerRecord(topic, getPartition, i.toString.getBytes, i.toString.getBytes))
+     }
+     futures.map(_.get)
+   }
+diff --git a/core/src/test/scala/integration/kafka/api/GroupCoordinatorIntegrationTest.scala b/core/src/test/scala/integration/kafka/api/GroupCoordinatorIntegrationTest.scala
+index 158fe57d743d..61845cf19450 100644
+--- a/core/src/test/scala/integration/kafka/api/GroupCoordinatorIntegrationTest.scala
++++ b/core/src/test/scala/integration/kafka/api/GroupCoordinatorIntegrationTest.scala
+@@ -38,14 +38,13 @@ class GroupCoordinatorIntegrationTest extends KafkaServerTestHarness {
+   }
+ 
+   @Test
+-  def testGroupCoordinatorPropagatesOfffsetsTopicCompressionCodec() {
++  def testGroupCoordinatorPropagatesOffsetsTopicCompressionCodec() {
+     val consumer = TestUtils.createConsumer(TestUtils.getBrokerListStrFromServers(servers))
+     val offsetMap = Map(
+       new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0) -> new OffsetAndMetadata(10, "")
+     ).asJava
+     consumer.commitSync(offsetMap)
+     val logManager = servers.head.getLogManager
+-
+     def getGroupMetadataLogOpt: Option[Log] =
+       logManager.getLog(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0))
+ 
+diff --git a/core/src/test/scala/unit/kafka/coordinator/group/GroupCoordinatorTest.scala b/core/src/test/scala/unit/kafka/coordinator/group/GroupCoordinatorTest.scala
+index 04a03289a4a7..347839737c0a 100644
+--- a/core/src/test/scala/unit/kafka/coordinator/group/GroupCoordinatorTest.scala
++++ b/core/src/test/scala/unit/kafka/coordinator/group/GroupCoordinatorTest.scala
+@@ -40,6 +40,7 @@ import org.junit.{After, Assert, Before, Test}
+ import org.scalatest.junit.JUnitSuite
+ 
+ import scala.collection.mutable
++import scala.collection.mutable.ArrayBuffer
+ import scala.concurrent.duration.Duration
+ import scala.concurrent.{Await, Future, Promise, TimeoutException}
+ 
+@@ -58,6 +59,7 @@ class GroupCoordinatorTest extends JUnitSuite {
+   val ClientHost = "localhost"
+   val GroupMinSessionTimeout = 10
+   val GroupMaxSessionTimeout = 10 * 60 * 1000
++  val GroupMaxSize = 3
+   val DefaultRebalanceTimeout = 500
+   val DefaultSessionTimeout = 500
+   val GroupInitialRebalanceDelay = 50
+@@ -82,6 +84,7 @@ class GroupCoordinatorTest extends JUnitSuite {
+     val props = TestUtils.createBrokerConfig(nodeId = 0, zkConnect = "")
+     props.setProperty(KafkaConfig.GroupMinSessionTimeoutMsProp, GroupMinSessionTimeout.toString)
+     props.setProperty(KafkaConfig.GroupMaxSessionTimeoutMsProp, GroupMaxSessionTimeout.toString)
++    props.setProperty(KafkaConfig.GroupMaxSizeProp, GroupMaxSize.toString)
+     props.setProperty(KafkaConfig.GroupInitialRebalanceDelayMsProp, GroupInitialRebalanceDelay.toString)
+     // make two partitions of the group topic to make sure some partitions are not owned by the coordinator
+     val ret = mutable.Map[String, Map[Int, Seq[Int]]]()
+@@ -190,6 +193,28 @@ class GroupCoordinatorTest extends JUnitSuite {
+     assertEquals(Errors.NOT_COORDINATOR, joinGroupError)
+   }
+ 
++  @Test
++  def testJoinGroupShouldReceiveErrorIfGroupOverMaxSize() {
++    var futures = ArrayBuffer[Future[JoinGroupResult]]()
++    val rebalanceTimeout = GroupInitialRebalanceDelay * 2
++
++    for (i <- 1.to(GroupMaxSize)) {
++      futures += sendJoinGroup(groupId, JoinGroupRequest.UNKNOWN_MEMBER_ID, protocolType, protocols, rebalanceTimeout)
++      if (i != 1)
++        timer.advanceClock(GroupInitialRebalanceDelay)
++      EasyMock.reset(replicaManager)
++    }
++    // advance clock beyond rebalanceTimeout
++    timer.advanceClock(GroupInitialRebalanceDelay + 1)
++    for (future <- futures) {
++      assertEquals(Errors.NONE, await(future, 1).error)
++    }
++
++    // Should receive an error since the group is full
++    val errorFuture = sendJoinGroup(groupId, JoinGroupRequest.UNKNOWN_MEMBER_ID, protocolType, protocols, rebalanceTimeout)
++    assertEquals(Errors.GROUP_MAX_SIZE_REACHED, await(errorFuture, 1).error)
++  }
++
+   @Test
+   def testJoinGroupSessionTimeoutTooSmall() {
+     val memberId = JoinGroupRequest.UNKNOWN_MEMBER_ID
+diff --git a/core/src/test/scala/unit/kafka/server/KafkaConfigTest.scala b/core/src/test/scala/unit/kafka/server/KafkaConfigTest.scala
+index f21f38427b2d..1d7e687a279f 100755
+--- a/core/src/test/scala/unit/kafka/server/KafkaConfigTest.scala
++++ b/core/src/test/scala/unit/kafka/server/KafkaConfigTest.scala
+@@ -669,6 +669,7 @@ class KafkaConfigTest {
+         case KafkaConfig.GroupMinSessionTimeoutMsProp => assertPropertyInvalid(getBaseProperties(), name, "not_a_number")
+         case KafkaConfig.GroupMaxSessionTimeoutMsProp => assertPropertyInvalid(getBaseProperties(), name, "not_a_number")
+         case KafkaConfig.GroupInitialRebalanceDelayMsProp => assertPropertyInvalid(getBaseProperties(), name, "not_a_number")
++        case KafkaConfig.GroupMaxSizeProp => assertPropertyInvalid(getBaseProperties(), name, "not_a_number", "0", "-1")
+         case KafkaConfig.OffsetMetadataMaxSizeProp => assertPropertyInvalid(getBaseProperties(), name, "not_a_number")
+         case KafkaConfig.OffsetsLoadBufferSizeProp => assertPropertyInvalid(getBaseProperties(), name, "not_a_number", "0")
+         case KafkaConfig.OffsetsTopicReplicationFactorProp => assertPropertyInvalid(getBaseProperties(), name, "not_a_number", "0")

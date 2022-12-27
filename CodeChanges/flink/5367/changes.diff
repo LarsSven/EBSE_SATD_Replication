@@ -1,0 +1,172 @@
+diff --git a/flink-libraries/flink-table/src/main/scala/org/apache/flink/table/codegen/CodeGenerator.scala b/flink-libraries/flink-table/src/main/scala/org/apache/flink/table/codegen/CodeGenerator.scala
+index aca0ba33aae87..78086a0b4d8a5 100644
+--- a/flink-libraries/flink-table/src/main/scala/org/apache/flink/table/codegen/CodeGenerator.scala
++++ b/flink-libraries/flink-table/src/main/scala/org/apache/flink/table/codegen/CodeGenerator.scala
+@@ -26,6 +26,7 @@ import org.apache.calcite.sql.SqlOperator
+ import org.apache.calcite.sql.`type`.SqlTypeName._
+ import org.apache.calcite.sql.`type`.{ReturnTypes, SqlTypeName}
+ import org.apache.calcite.sql.fun.SqlStdOperatorTable.{ROW, _}
++import org.apache.calcite.util.NlsString
+ import org.apache.commons.lang3.StringEscapeUtils
+ import org.apache.flink.api.common.functions._
+ import org.apache.flink.api.common.typeinfo._
+@@ -42,6 +43,7 @@ import org.apache.flink.table.codegen.calls.{CurrentTimePointCallGen, FunctionGe
+ import org.apache.flink.table.functions.sql.{ProctimeSqlFunction, ScalarSqlFunctions, StreamRecordTimestampSqlFunction}
+ import org.apache.flink.table.functions.utils.UserDefinedFunctionUtils
+ import org.apache.flink.table.functions.{FunctionContext, UserDefinedFunction}
++import org.apache.flink.table.plan.schema.CompositeRelDataType
+ import org.apache.flink.table.typeutils.TimeIndicatorTypeInfo
+ import org.apache.flink.table.typeutils.TypeCheckUtils._
+ import org.joda.time.format.DateTimeFormatter
+@@ -578,9 +580,9 @@ abstract class CodeGenerator(
+   override def visitTableInputRef(rexTableInputRef: RexTableInputRef): GeneratedExpression =
+     visitInputRef(rexTableInputRef)
+ 
+-  override def visitFieldAccess(rexFieldAccess: RexFieldAccess): GeneratedExpression = {
+-    val refExpr = rexFieldAccess.getReferenceExpr.accept(this)
+-    val index = rexFieldAccess.getField.getIndex
++  private def generateFieldAccessExpr(
++    refExpr: GeneratedExpression,
++    index: Int): GeneratedExpression = {
+     val fieldAccessExpr = generateFieldAccess(
+       refExpr.resultType,
+       refExpr.resultTerm,
+@@ -616,6 +618,12 @@ abstract class CodeGenerator(
+     GeneratedExpression(resultTerm, nullTerm, resultCode, fieldAccessExpr.resultType)
+   }
+ 
++  override def visitFieldAccess(rexFieldAccess: RexFieldAccess): GeneratedExpression = {
++    val refExpr = rexFieldAccess.getReferenceExpr.accept(this)
++    val index = rexFieldAccess.getField.getIndex
++    generateFieldAccessExpr(refExpr, index)
++  }
++
+   override def visitLiteral(literal: RexLiteral): GeneratedExpression = {
+     val resultType = FlinkTypeFactory.toTypeInfo(literal.getType)
+     val value = literal.getValue3
+@@ -1001,6 +1009,17 @@ abstract class CodeGenerator(
+         requireArray(array)
+         generateArrayElement(this, array)
+ 
++      case DOT =>
++        // Due to https://issues.apache.org/jira/browse/CALCITE-2162, expression such as
++        // "array[1].a.b" won't work now.
++        require(operands.size == 2)
++        val fieldName =
++          call.operands.get(1).asInstanceOf[RexLiteral].getValue.asInstanceOf[NlsString].getValue
++        generateFieldAccessExpr(
++          operands.head,
++          call.operands.get(0).getType.asInstanceOf[CompositeRelDataType]
++            .compositeType.getFieldIndex(fieldName))
++
+       case ScalarSqlFunctions.CONCAT =>
+         generateConcat(this.nullCheck, operands)
+ 
+diff --git a/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/CompositeAccessTest.scala b/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/CompositeAccessTest.scala
+index bd1c19990f5d8..5c4f4aa4ab545 100644
+--- a/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/CompositeAccessTest.scala
++++ b/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/CompositeAccessTest.scala
+@@ -116,6 +116,48 @@ class CompositeAccessTest extends CompositeTypeTestBase {
+       "42")
+     testSqlApi("f0.*", "42")
+ 
++    testAllApis(
++      'f8.at(1).get("_1"),
++      "f8.at(1).get('_1')",
++      "f8[1]._1",
++      "null"
++    )
++
++    testAllApis(
++      'f8.at(1).get("_2"),
++      "f8.at(1).get('_2')",
++      "f8[1]._2",
++      "23"
++    )
++
++    testAllApis(
++      'f9.at(2).get("_1"),
++      "f9.at(2).get('_1')",
++      "f9[2]._1",
++      "null"
++    )
++
++    testAllApis(
++      'f10.at(1).get("stringField"),
++      "f10.at(1).get('stringField')",
++      "f10[1].stringField",
++      "Bob"
++    )
++
++    testAllApis(
++      'f11.at(1).get("myString"),
++      "f11.at(1).get('myString')",
++      "f11[1].myString",
++      "Hello"
++    )
++
++    testAllApis(
++      'f12.at(1).get("arrayField").at(1).get("stringField"),
++      "f12.at(1).get('arrayField').at(1).get('stringField')",
++      "f12[1].arrayField[1].stringField",
++      "Alice"
++    )
++
+     testTableApi(12.flatten(), "12.flatten()", "12")
+ 
+     testTableApi('f5.flatten(), "f5.flatten()", "13")
+diff --git a/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/utils/CompositeTypeTestBase.scala b/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/utils/CompositeTypeTestBase.scala
+index 8f7360ebee56a..71dad4f4a17fe 100644
+--- a/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/utils/CompositeTypeTestBase.scala
++++ b/flink-libraries/flink-table/src/test/scala/org/apache/flink/table/expressions/utils/CompositeTypeTestBase.scala
+@@ -22,13 +22,13 @@ import org.apache.flink.api.common.typeinfo.TypeInformation
+ import org.apache.flink.api.java.typeutils.{RowTypeInfo, TupleTypeInfo, TypeExtractor}
+ import org.apache.flink.api.scala.createTypeInformation
+ import org.apache.flink.table.api.Types
+-import org.apache.flink.table.expressions.utils.CompositeTypeTestBase.{MyCaseClass, MyCaseClass2, MyPojo}
++import org.apache.flink.table.expressions.utils.CompositeTypeTestBase.{MyCaseClass, MyCaseClass2, MyCaseClass3, MyPojo}
+ import org.apache.flink.types.Row
+ 
+ class CompositeTypeTestBase extends ExpressionTestBase {
+ 
+   def testData: Row = {
+-    val testData = new Row(8)
++    val testData = new Row(13)
+     testData.setField(0, MyCaseClass(42, "Bob", booleanField = true))
+     testData.setField(1, MyCaseClass2(MyCaseClass(25, "Timo", booleanField = false)))
+     testData.setField(2, ("a", "b"))
+@@ -37,6 +37,11 @@ class CompositeTypeTestBase extends ExpressionTestBase {
+     testData.setField(5, 13)
+     testData.setField(6, MyCaseClass2(null))
+     testData.setField(7, Tuple1(true))
++    testData.setField(8, Array(Tuple2(null, 23), Tuple2(false, 12)))
++    testData.setField(9, Array(Tuple1(true), null))
++    testData.setField(10, Array(MyCaseClass(42, "Bob", booleanField = true)))
++    testData.setField(11, Array(new MyPojo()))
++    testData.setField(12, Array(MyCaseClass3(Array(MyCaseClass(42, "Alice", booleanField = true)))))
+     testData
+   }
+ 
+@@ -49,7 +54,12 @@ class CompositeTypeTestBase extends ExpressionTestBase {
+       TypeExtractor.createTypeInfo(classOf[MyPojo]),
+       Types.INT,
+       createTypeInformation[MyCaseClass2],
+-      createTypeInformation[Tuple1[Boolean]]
++      createTypeInformation[Tuple1[Boolean]],
++      createTypeInformation[Array[Tuple2[Boolean, Int]]],
++      createTypeInformation[Array[Tuple1[Boolean]]],
++      createTypeInformation[Array[MyCaseClass]],
++      createTypeInformation[Array[MyPojo]],
++      createTypeInformation[Array[MyCaseClass3]]
+       ).asInstanceOf[TypeInformation[Any]]
+   }
+ }
+@@ -59,6 +69,8 @@ object CompositeTypeTestBase {
+ 
+   case class MyCaseClass2(objectField: MyCaseClass)
+ 
++  case class MyCaseClass3(arrayField: Array[MyCaseClass])
++
+   class MyPojo {
+     private var myInt: Int = 0
+     private var myString: String = "Hello"

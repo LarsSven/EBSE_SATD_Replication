@@ -1,0 +1,2250 @@
+diff --git a/nifi-api/src/main/java/org/apache/nifi/components/PropertyDescriptor.java b/nifi-api/src/main/java/org/apache/nifi/components/PropertyDescriptor.java
+index 3e767baa813..e39b75d9495 100644
+--- a/nifi-api/src/main/java/org/apache/nifi/components/PropertyDescriptor.java
++++ b/nifi-api/src/main/java/org/apache/nifi/components/PropertyDescriptor.java
+@@ -88,7 +88,7 @@ public final class PropertyDescriptor implements Comparable<PropertyDescriptor>
+     private final ExpressionLanguageScope expressionLanguageScope;
+     /**
+      * indicates whether or not this property represents resources that should be added
+-     * to the classpath for this instance of the component
++     * to the classpath and used for loading native libraries for this instance of the component
+      */
+     private final boolean dynamicallyModifiesClasspath;
+ 
+@@ -310,11 +310,21 @@ public Builder dynamic(final boolean dynamic) {
+ 
+         /**
+          * Specifies that the value of this property represents one or more resources that the
+-         * framework should add to the classpath of the given component.
+-         *
++         * framework should add to the classpath of as well as consider when looking for native
++         * libraries for the given component.
++         * <p/>
+          * NOTE: If a component contains a PropertyDescriptor where dynamicallyModifiesClasspath is set to true,
+-         *  the component must also be annotated with @RequiresInstanceClassloading, otherwise the component will be
+-         *  considered invalid.
++         *  the component may also be annotated with @RequiresInstanceClassloading, in which case every class will
++         *  be loaded by a separate InstanceClassLoader for each processor instance.<br/>
++         *  It also allows to load native libraries from the extra classpath.
++         *  <p/>
++         *  One can chose to omit the annotation. In this case the loading of native libraries from the extra classpath
++         *  is not supported.
++         *  Also by default, classes will be loaded by a common NarClassLoader, however it's possible to acquire an
++         *  InstanceClassLoader by calling Thread.currentThread().getContextClassLoader() which can be used manually
++         *  to load required classes on an instance-by-instance basis
++         *  (by calling {@link Class#forName(String, boolean, ClassLoader)} for example).
++         *
+          *
+          * @param dynamicallyModifiesClasspath whether or not this property should be used by the framework to modify the classpath
+          * @return the builder
+diff --git a/nifi-docs/src/main/asciidoc/developer-guide.adoc b/nifi-docs/src/main/asciidoc/developer-guide.adoc
+index bd79c1ae631..c0c98df5a06 100644
+--- a/nifi-docs/src/main/asciidoc/developer-guide.adoc
++++ b/nifi-docs/src/main/asciidoc/developer-guide.adoc
+@@ -2479,6 +2479,9 @@ attempts to resolve filesystem resources from the value of the property. The val
+ comma-separated list of one or more directories or files, where any paths that do not exist are
+ skipped. If the resource represents a directory, the directory is listed, and all of the files
+ in that directory are added to the classpath individually.
++These directories also will be scanned for native libraries. If a library is found in one of these
++directories, an OS-handled temporary copy is created and cached before loading it to maintain consistency
++and classloader isolation.
+ 
+ Each property may impose further restrictions on the format of the value through the validators.
+ For example, using StandardValidators.FILE_EXISTS_VALIDATOR restricts the property to accepting a
+diff --git a/nifi-nar-bundles/nifi-extension-utils/nifi-hadoop-utils/src/main/java/org/apache/nifi/processors/hadoop/AbstractHadoopProcessor.java b/nifi-nar-bundles/nifi-extension-utils/nifi-hadoop-utils/src/main/java/org/apache/nifi/processors/hadoop/AbstractHadoopProcessor.java
+index c46fd6395cf..c277cc517c5 100644
+--- a/nifi-nar-bundles/nifi-extension-utils/nifi-hadoop-utils/src/main/java/org/apache/nifi/processors/hadoop/AbstractHadoopProcessor.java
++++ b/nifi-nar-bundles/nifi-extension-utils/nifi-hadoop-utils/src/main/java/org/apache/nifi/processors/hadoop/AbstractHadoopProcessor.java
+@@ -112,8 +112,8 @@ public abstract class AbstractHadoopProcessor extends AbstractProcessor {
+ 
+     public static final PropertyDescriptor ADDITIONAL_CLASSPATH_RESOURCES = new PropertyDescriptor.Builder()
+             .name("Additional Classpath Resources")
+-            .description("A comma-separated list of paths to files and/or directories that will be added to the classpath. When specifying a " +
+-                    "directory, all files with in the directory will be added to the classpath, but further sub-directories will not be included.")
++            .description("A comma-separated list of paths to files and/or directories that will be added to the classpath and used for loading native libraries. " +
++                    "When specifying a directory, all files with in the directory will be added to the classpath, but further sub-directories will not be included.")
+             .required(false)
+             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+             .dynamicallyModifiesClasspath(true)
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/pom.xml b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/pom.xml
+index c9b7ff164d5..bfe3d37621a 100644
+--- a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/pom.xml
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/pom.xml
+@@ -22,6 +22,10 @@ language governing permissions and limitations under the License. -->
+             <groupId>org.apache.nifi</groupId>
+             <artifactId>nifi-framework-nar-utils</artifactId>
+         </dependency>
++        <dependency>
++            <groupId>org.apache.nifi</groupId>
++            <artifactId>nifi-nar-utils</artifactId>
++        </dependency>
+         <dependency>
+             <groupId>org.apache.nifi</groupId>
+             <artifactId>nifi-utils</artifactId>
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/src/test/java/org/apache/nifi/controller/TestAbstractComponentNode.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/src/test/java/org/apache/nifi/controller/TestAbstractComponentNode.java
+index 687d347f10e..65a24714208 100644
+--- a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/src/test/java/org/apache/nifi/controller/TestAbstractComponentNode.java
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core-api/src/test/java/org/apache/nifi/controller/TestAbstractComponentNode.java
+@@ -17,6 +17,7 @@
+ 
+ package org.apache.nifi.controller;
+ 
++import org.apache.nifi.nar.ExtensionManager;
+ import org.apache.nifi.parameter.ParameterLookup;
+ import org.apache.nifi.authorization.Resource;
+ import org.apache.nifi.authorization.resource.Authorizable;
+@@ -27,7 +28,6 @@
+ import org.apache.nifi.components.validation.ValidationStatus;
+ import org.apache.nifi.components.validation.ValidationTrigger;
+ import org.apache.nifi.controller.service.ControllerServiceProvider;
+-import org.apache.nifi.nar.StandardExtensionDiscoveringManager;
+ import org.apache.nifi.parameter.ParameterContext;
+ import org.apache.nifi.registry.ComponentVariableRegistry;
+ import org.junit.Test;
+@@ -88,7 +88,7 @@ private static class ValidationControlledAbstractComponentNode extends AbstractC
+         public ValidationControlledAbstractComponentNode(final long pauseMillis, final ValidationTrigger validationTrigger) {
+             super("id", Mockito.mock(ValidationContextFactory.class), Mockito.mock(ControllerServiceProvider.class), "unit test component",
+                 ValidationControlledAbstractComponentNode.class.getCanonicalName(), Mockito.mock(ComponentVariableRegistry.class), Mockito.mock(ReloadComponent.class),
+-                Mockito.mock(StandardExtensionDiscoveringManager.class), validationTrigger, false);
++                Mockito.mock(ExtensionManager.class), validationTrigger, false);
+ 
+             this.pauseMillis = pauseMillis;
+         }
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core/src/test/java/org/apache/nifi/controller/TestStandardProcessorNode.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core/src/test/java/org/apache/nifi/controller/TestStandardProcessorNode.java
+index d1fb5115878..62e1288feaf 100644
+--- a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core/src/test/java/org/apache/nifi/controller/TestStandardProcessorNode.java
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core/src/test/java/org/apache/nifi/controller/TestStandardProcessorNode.java
+@@ -17,9 +17,11 @@
+ 
+ package org.apache.nifi.controller;
+ 
++import org.apache.nifi.admin.service.AuditService;
+ import org.apache.nifi.annotation.lifecycle.OnScheduled;
+ import org.apache.nifi.annotation.lifecycle.OnStopped;
+ import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
++import org.apache.nifi.authorization.Authorizer;
+ import org.apache.nifi.bundle.Bundle;
+ import org.apache.nifi.bundle.BundleCoordinate;
+ import org.apache.nifi.components.PropertyDescriptor;
+@@ -29,11 +31,16 @@
+ import org.apache.nifi.controller.exception.ProcessorInstantiationException;
+ import org.apache.nifi.controller.kerberos.KerberosConfig;
+ import org.apache.nifi.controller.reporting.ReportingTaskInstantiationException;
++import org.apache.nifi.controller.repository.FlowFileEventRepository;
+ import org.apache.nifi.controller.service.ControllerServiceNode;
+ import org.apache.nifi.engine.FlowEngine;
++import org.apache.nifi.events.VolatileBulletinRepository;
+ import org.apache.nifi.expression.ExpressionLanguageCompiler;
+ import org.apache.nifi.nar.ExtensionDiscoveringManager;
++import org.apache.nifi.nar.InstanceClassLoader;
++import org.apache.nifi.nar.NarClassLoader;
+ import org.apache.nifi.nar.NarCloseable;
++import org.apache.nifi.nar.OSUtil;
+ import org.apache.nifi.nar.StandardExtensionDiscoveringManager;
+ import org.apache.nifi.nar.SystemBundle;
+ import org.apache.nifi.parameter.ParameterContext;
+@@ -46,8 +53,11 @@
+ import org.apache.nifi.processor.StandardProcessorInitializationContext;
+ import org.apache.nifi.processor.exception.ProcessException;
+ import org.apache.nifi.processor.util.StandardValidators;
++import org.apache.nifi.provenance.MockProvenanceRepository;
+ import org.apache.nifi.registry.VariableDescriptor;
+ import org.apache.nifi.registry.VariableRegistry;
++import org.apache.nifi.registry.flow.FlowRegistryClient;
++import org.apache.nifi.registry.variable.FileBasedVariableRegistry;
+ import org.apache.nifi.registry.variable.StandardComponentVariableRegistry;
+ import org.apache.nifi.test.processors.ModifiesClasspathNoAnnotationProcessor;
+ import org.apache.nifi.test.processors.ModifiesClasspathProcessor;
+@@ -58,7 +68,6 @@
+ import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Test;
+-import org.mockito.Mockito;
+ 
+ import java.io.File;
+ import java.net.MalformedURLException;
+@@ -75,11 +84,17 @@
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.atomic.AtomicReference;
+ 
++import static org.hamcrest.CoreMatchers.containsString;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
++import static org.junit.Assume.assumeTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
+ 
+ public class TestStandardProcessorNode {
+ 
+@@ -88,13 +103,25 @@ public class TestStandardProcessorNode {
+     private ExtensionDiscoveringManager extensionManager;
+     private NiFiProperties niFiProperties;
+ 
++    private final AtomicReference<InstanceClassLoader> currentInstanceClassLoaderHolder = new AtomicReference<>();
++
+     @Before
+     public void setup() {
+         variableRegistry = new MockVariableRegistry();
+         niFiProperties = NiFiProperties.createBasicNiFiProperties("src/test/resources/conf/nifi.properties", null);
+ 
+         systemBundle = SystemBundle.create(niFiProperties);
+-        extensionManager = new StandardExtensionDiscoveringManager();
++        extensionManager = new StandardExtensionDiscoveringManager() {
++            @Override
++            public InstanceClassLoader createInstanceClassLoader(String classType, String instanceIdentifier, Bundle bundle, Set<URL> additionalUrls) {
++                InstanceClassLoader instanceClassLoader = super.createInstanceClassLoader(classType, instanceIdentifier, bundle, additionalUrls);
++
++                currentInstanceClassLoaderHolder.set(instanceClassLoader);
++
++                return instanceClassLoader;
++
++            }
++        };
+         extensionManager.discoverExtensions(systemBundle, Collections.emptySet());
+     }
+ 
+@@ -106,8 +133,8 @@ public void testStart() throws InterruptedException {
+         ProcessorInitializationContext initContext = new StandardProcessorInitializationContext(uuid, null, null, null, KerberosConfig.NOT_CONFIGURED);
+         processor.initialize(initContext);
+ 
+-        final ReloadComponent reloadComponent = Mockito.mock(ReloadComponent.class);
+-        final BundleCoordinate coordinate = Mockito.mock(BundleCoordinate.class);
++        final ReloadComponent reloadComponent = mock(ReloadComponent.class);
++        final BundleCoordinate coordinate = mock(BundleCoordinate.class);
+ 
+         final LoggableComponent<Processor> loggableComponent = new LoggableComponent<>(processor, coordinate, null);
+         final StandardProcessorNode procNode = new StandardProcessorNode(loggableComponent, uuid, createValidationContextFactory(), null, null,
+@@ -179,6 +206,69 @@ public void testSinglePropertyDynamicallyModifiesClasspath() throws MalformedURL
+         }
+     }
+ 
++    @Test
++    public void testNativeLibLoadedFromDynamicallyModifiesClasspathProperty() throws Exception {
++        // GIVEN
++        assumeTrue("Test only runs on Mac OS", new OSUtil(){}.isOsMac());
++
++        // Init NiFi
++        NarClassLoader narClassLoader = mock(NarClassLoader.class);
++        when(narClassLoader.getURLs()).thenReturn(new URL[0]);
++
++        Bundle narBundle = SystemBundle.create(niFiProperties, narClassLoader);
++
++        HashMap<String, String> additionalProperties = new HashMap<>();
++        additionalProperties.put(NiFiProperties.ADMINISTRATIVE_YIELD_DURATION, "1 sec");
++        additionalProperties.put(NiFiProperties.STATE_MANAGEMENT_CONFIG_FILE, "target/test-classes/state-management.xml");
++        additionalProperties.put(NiFiProperties.STATE_MANAGEMENT_LOCAL_PROVIDER_ID, "local-provider");
++        additionalProperties.put(NiFiProperties.PROVENANCE_REPO_IMPLEMENTATION_CLASS, MockProvenanceRepository.class.getName());
++        additionalProperties.put("nifi.remote.input.socket.port", "");
++        additionalProperties.put("nifi.remote.input.secure", "");
++
++        final NiFiProperties nifiProperties = NiFiProperties.createBasicNiFiProperties("src/test/resources/conf/nifi.properties", additionalProperties);
++
++        final FlowController flowController = FlowController.createStandaloneInstance(mock(FlowFileEventRepository.class), nifiProperties,
++                mock(Authorizer.class), mock(AuditService.class), null, new VolatileBulletinRepository(),
++                new FileBasedVariableRegistry(nifiProperties.getVariableRegistryPropertiesPaths()),
++                mock(FlowRegistryClient.class), extensionManager);
++
++        // Init processor
++        final PropertyDescriptor classpathProp = new PropertyDescriptor.Builder().name("Classpath Resources")
++                .dynamicallyModifiesClasspath(true).addValidator(StandardValidators.NON_EMPTY_VALIDATOR).build();
++
++        final ModifiesClasspathProcessor processor = new ModifiesClasspathProcessor(Arrays.asList(classpathProp));
++        final String uuid = UUID.randomUUID().toString();
++
++        final ValidationContextFactory validationContextFactory = createValidationContextFactory();
++        final ProcessScheduler processScheduler = mock(ProcessScheduler.class);
++        final TerminationAwareLogger componentLog = mock(TerminationAwareLogger.class);
++
++        final ReloadComponent reloadComponent = new StandardReloadComponent(flowController);
++        ProcessorInitializationContext initContext = new StandardProcessorInitializationContext(uuid, componentLog, null, null, KerberosConfig.NOT_CONFIGURED);
++        ((Processor) processor).initialize(initContext);
++
++        final LoggableComponent<Processor> loggableComponent = new LoggableComponent<>(processor, narBundle.getBundleDetails().getCoordinate(), componentLog);
++        final StandardProcessorNode procNode = new StandardProcessorNode(loggableComponent, uuid, validationContextFactory, processScheduler,
++                null, new StandardComponentVariableRegistry(variableRegistry), reloadComponent, extensionManager, new SynchronousValidationTrigger());
++
++        final Map<String, String> properties = new HashMap<>();
++        properties.put(classpathProp.getName(), "src/test/resources/native");
++        procNode.setProperties(properties);
++
++        try (final NarCloseable narCloseable = NarCloseable.withComponentNarLoader(extensionManager, procNode.getProcessor().getClass(), procNode.getIdentifier())){
++            // Should pass validation
++            assertTrue(procNode.computeValidationErrors(procNode.getValidationContext()).isEmpty());
++
++            // WHEN
++            String actualLibraryLocation = currentInstanceClassLoaderHolder.get().findLibrary("testjni");
++
++            // THEN
++            assertThat(actualLibraryLocation, containsString(currentInstanceClassLoaderHolder.get().getIdentifier()));
++        } finally {
++            extensionManager.removeInstanceClassLoader(procNode.getIdentifier());
++        }
++    }
++
+ 
+     @Test
+     public void testUpdateOtherPropertyDoesNotImpactClasspath() throws MalformedURLException {
+@@ -400,8 +490,8 @@ public void testVerifyCanUpdateBundle() {
+     private StandardProcessorNode createProcessorNode(final Processor processor, final ReloadComponent reloadComponent) {
+         final String uuid = UUID.randomUUID().toString();
+         final ValidationContextFactory validationContextFactory = createValidationContextFactory();
+-        final ProcessScheduler processScheduler = Mockito.mock(ProcessScheduler.class);
+-        final TerminationAwareLogger componentLog = Mockito.mock(TerminationAwareLogger.class);
++        final ProcessScheduler processScheduler = mock(ProcessScheduler.class);
++        final TerminationAwareLogger componentLog = mock(TerminationAwareLogger.class);
+ 
+         extensionManager.createInstanceClassLoader(processor.getClass().getName(), uuid, systemBundle, null);
+ 
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core/src/test/resources/native/libtestjni.dylib b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core/src/test/resources/native/libtestjni.dylib
+new file mode 100644
+index 00000000000..a06ff7c74f9
+Binary files /dev/null and b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-core/src/test/resources/native/libtestjni.dylib differ
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/AbstractTestNarLoader.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/AbstractTestNarLoader.java
+new file mode 100644
+index 00000000000..70daa631720
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/AbstractTestNarLoader.java
+@@ -0,0 +1,114 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.nar;
++
++import org.apache.nifi.bundle.Bundle;
++import org.apache.nifi.controller.ControllerService;
++import org.apache.nifi.processor.Processor;
++import org.apache.nifi.reporting.ReportingTask;
++import org.apache.nifi.util.NiFiProperties;
++import org.junit.Before;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.FileVisitResult;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.SimpleFileVisitor;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.util.Collections;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++public abstract class AbstractTestNarLoader {
++    abstract String getWorkDir();
++    abstract String getNarAutoloadDir();
++    abstract String getPropertiesFile();
++
++    Bundle systemBundle;
++    NiFiProperties properties;
++    ExtensionMapping extensionMapping;
++
++    StandardNarLoader narLoader;
++    NarClassLoaders narClassLoaders;
++    ExtensionDiscoveringManager extensionManager;
++
++    @Before
++    public void setup() throws IOException, ClassNotFoundException {
++        deleteDir(getWorkDir());
++        deleteDir(getNarAutoloadDir());
++
++        final File extensionsDir = new File(getNarAutoloadDir());
++        assertTrue(extensionsDir.mkdirs());
++
++        // Create NiFiProperties
++        final String propertiesFile = getPropertiesFile();
++        properties = NiFiProperties.createBasicNiFiProperties(propertiesFile, Collections.emptyMap());
++
++        // Unpack NARs
++        systemBundle = SystemBundle.create(properties);
++        extensionMapping = NarUnpacker.unpackNars(properties, systemBundle);
++        assertEquals(0, extensionMapping.getAllExtensionNames().size());
++
++        // Initialize NarClassLoaders
++        narClassLoaders = new NarClassLoaders();
++        narClassLoaders.init(properties.getFrameworkWorkingDirectory(), properties.getExtensionsWorkingDirectory());
++
++        extensionManager = new StandardExtensionDiscoveringManager();
++
++        // Should have Framework and Jetty NARs loaded here
++        assertEquals(2, narClassLoaders.getBundles().size());
++
++        // No extensions should be loaded yet
++        assertEquals(0, extensionManager.getExtensions(Processor.class).size());
++        assertEquals(0, extensionManager.getExtensions(ControllerService.class).size());
++        assertEquals(0, extensionManager.getExtensions(ReportingTask.class).size());
++
++        // Create class we are testing
++        narLoader = new StandardNarLoader(
++                properties.getExtensionsWorkingDirectory(),
++                properties.getComponentDocumentationWorkingDirectory(),
++                narClassLoaders,
++                extensionManager,
++                extensionMapping,
++                (bundles) -> {
++                });
++    }
++
++    private void deleteDir(String path) throws IOException {
++        Path directory = Paths.get(path);
++        if (!directory.toFile().exists()) {
++            return;
++        }
++
++        Files.walkFileTree(directory, new SimpleFileVisitor<Path>() {
++            @Override
++            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
++                Files.delete(file);
++                return FileVisitResult.CONTINUE;
++            }
++
++            @Override
++            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
++                Files.delete(dir);
++                return FileVisitResult.CONTINUE;
++            }
++        });
++    }
++}
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestLoadNativeLibFromNar.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestLoadNativeLibFromNar.java
+new file mode 100644
+index 00000000000..575a66e356e
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestLoadNativeLibFromNar.java
+@@ -0,0 +1,145 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.nar;
++
++import org.apache.nifi.bundle.Bundle;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.StandardCopyOption;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Set;
++import java.util.UUID;
++import java.util.stream.Collectors;
++
++import static org.hamcrest.CoreMatchers.containsString;
++import static org.hamcrest.CoreMatchers.hasItem;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertThat;
++import static org.junit.Assume.assumeTrue;
++
++public class TestLoadNativeLibFromNar extends AbstractTestNarLoader {
++    static final String WORK_DIR = "./target/work";
++    static final String NAR_AUTOLOAD_DIR = "./target/nars_with_native_lib";
++    static final String PROPERTIES_FILE = "./src/test/resources/conf/nifi.nar_with_native_lib.properties";
++    static final String EXTENSIONS_DIR = "./src/test/resources/nars_with_native_lib";
++
++    @BeforeClass
++    public static void setUpSuite() {
++        assumeTrue("Test only runs on Mac OS", new OSUtil(){}.isOsMac());
++    }
++
++    @Test
++    public void testLoadSameLibraryFromBy2NarClassLoadersFromNar() throws Exception {
++        final File extensionsDir = new File(EXTENSIONS_DIR);
++        final Path narAutoLoadDir = Paths.get(NAR_AUTOLOAD_DIR);
++        for (final File extensionFile : extensionsDir.listFiles()) {
++            Files.copy(extensionFile.toPath(), narAutoLoadDir.resolve(extensionFile.getName()), StandardCopyOption.REPLACE_EXISTING);
++        }
++
++        final List<File> narFiles = Arrays.asList(narAutoLoadDir.toFile().listFiles());
++        assertEquals(2, narFiles.size());
++
++        final NarLoadResult narLoadResult = narLoader.load(narFiles);
++        assertNotNull(narLoadResult);
++
++        List<NarClassLoader> narClassLoaders = this.narClassLoaders.getBundles().stream()
++                .filter(bundle -> bundle.getBundleDetails().getCoordinate().getCoordinate().contains("nifi-nar_with_native_lib-"))
++                .map(Bundle::getClassLoader)
++                .filter(NarClassLoader.class::isInstance)
++                .map(NarClassLoader.class::cast)
++                .collect(Collectors.toList());
++
++        Set<String> actualLibraryLocations = narClassLoaders.stream()
++                .map(classLoader -> classLoader.findLibrary("testjni"))
++                .collect(Collectors.toSet());
++
++        for (NarClassLoader narClassLoader : narClassLoaders) {
++            Class<?> TestJNI = narClassLoader.loadClass("org.apache.nifi.nar.sharedlib.TestJNI");
++
++            Object actualJniMethodReturnValue = TestJNI
++                    .getMethod("testJniMethod")
++                    .invoke(TestJNI.newInstance());
++
++            assertEquals("calledNativeTestJniMethod", actualJniMethodReturnValue);
++        }
++
++        assertEquals(2, actualLibraryLocations.size());
++        assertThat(actualLibraryLocations, hasItem(containsString("nifi-nar_with_native_lib-1")));
++        assertThat(actualLibraryLocations, hasItem(containsString("nifi-nar_with_native_lib-2")));
++    }
++
++    @Test
++    public void testLoadSameLibraryBy2InstanceClassLoadersFromNar() throws Exception {
++        final File extensionsDir = new File(EXTENSIONS_DIR);
++        final Path narAutoLoadDir = Paths.get(NAR_AUTOLOAD_DIR);
++        for (final File extensionFile : extensionsDir.listFiles()) {
++            Files.copy(extensionFile.toPath(), narAutoLoadDir.resolve(extensionFile.getName()), StandardCopyOption.REPLACE_EXISTING);
++        }
++
++        final List<File> narFiles = Arrays.asList(narAutoLoadDir.toFile().listFiles());
++        assertEquals(2, narFiles.size());
++
++        final NarLoadResult narLoadResult = narLoader.load(narFiles);
++        assertNotNull(narLoadResult);
++
++        Bundle bundleWithNativeLib = this.narClassLoaders.getBundles().stream()
++                .filter(bundle -> bundle.getBundleDetails().getCoordinate().getCoordinate().contains("nifi-nar_with_native_lib-"))
++                .findFirst().get();
++
++        Class<?> processorClass = bundleWithNativeLib.getClassLoader().loadClass("org.apache.nifi.nar.ModifiesClasspathProcessor");
++
++        List<InstanceClassLoader> instanceClassLoaders = Arrays.asList(
++                extensionManager.createInstanceClassLoader(processorClass.getName(), UUID.randomUUID().toString(), bundleWithNativeLib, null),
++                extensionManager.createInstanceClassLoader(processorClass.getName(), UUID.randomUUID().toString(), bundleWithNativeLib, null)
++        );
++
++        for (InstanceClassLoader instanceClassLoader : instanceClassLoaders) {
++            String actualLibraryLocation = instanceClassLoader.findLibrary("testjni");
++
++            Class<?> TestJNI = instanceClassLoader.loadClass("org.apache.nifi.nar.sharedlib.TestJNI");
++
++            Object actualJniMethodReturnValue = TestJNI
++                    .getMethod("testJniMethod")
++                    .invoke(TestJNI.newInstance());
++
++            assertThat(actualLibraryLocation, containsString(instanceClassLoader.getIdentifier()));
++            assertEquals("calledNativeTestJniMethod", actualJniMethodReturnValue);
++        }
++    }
++
++    @Override
++    String getWorkDir() {
++        return WORK_DIR;
++    }
++
++    @Override
++    String getNarAutoloadDir() {
++        return NAR_AUTOLOAD_DIR;
++    }
++
++    @Override
++    String getPropertiesFile() {
++        return PROPERTIES_FILE;
++    }
++}
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestLoadNativeLibViaSystemProperty.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestLoadNativeLibViaSystemProperty.java
+new file mode 100644
+index 00000000000..cbb569c5939
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestLoadNativeLibViaSystemProperty.java
+@@ -0,0 +1,160 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.nar;
++
++import org.apache.nifi.bundle.Bundle;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.StandardCopyOption;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Set;
++import java.util.UUID;
++import java.util.stream.Collectors;
++
++import static org.hamcrest.CoreMatchers.containsString;
++import static org.hamcrest.CoreMatchers.hasItem;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertThat;
++import static org.junit.Assume.assumeTrue;
++
++public class TestLoadNativeLibViaSystemProperty extends AbstractTestNarLoader {
++    static final String WORK_DIR = "./target/work";
++    static final String NAR_AUTOLOAD_DIR = "./target/nars_without_native_lib";
++    static final String PROPERTIES_FILE = "./src/test/resources/conf/nifi.nar_without_native_lib.properties";
++    static final String EXTENSIONS_DIR = "./src/test/resources/nars_without_native_lib";
++
++    private static String oldJavaLibraryPath;
++
++    @BeforeClass
++    public static void setUpClass() {
++        assumeTrue("Test only runs on Mac OS", new OSUtil(){}.isOsMac());
++
++        oldJavaLibraryPath = System.getProperty("java.library.path");
++        System.setProperty("java.library.path", "./src/test/resources/native");
++    }
++
++    @AfterClass
++    public static void tearDownSuite() {
++        if (oldJavaLibraryPath != null) {
++            System.setProperty("java.library.path", oldJavaLibraryPath);
++            oldJavaLibraryPath = null;
++        }
++    }
++
++    @Test
++    public void testLoadSameLibraryByNarClassLoaderFromSystemProperty() throws Exception {
++        final File extensionsDir = new File(EXTENSIONS_DIR);
++        final Path narAutoLoadDir = Paths.get(NAR_AUTOLOAD_DIR);
++        for (final File extensionFile : extensionsDir.listFiles()) {
++            Files.copy(extensionFile.toPath(), narAutoLoadDir.resolve(extensionFile.getName()), StandardCopyOption.REPLACE_EXISTING);
++        }
++
++        final List<File> narFiles = Arrays.asList(narAutoLoadDir.toFile().listFiles());
++        assertEquals(1, narFiles.size());
++
++        final NarLoadResult narLoadResult = narLoader.load(narFiles);
++        assertNotNull(narLoadResult);
++
++        List<NarClassLoader> narClassLoaders = this.narClassLoaders.getBundles().stream()
++                .filter(bundle -> bundle.getBundleDetails().getCoordinate().getCoordinate().contains("nifi-nar_without_native_lib-"))
++                .map(Bundle::getClassLoader)
++                .filter(NarClassLoader.class::isInstance)
++                .map(NarClassLoader.class::cast)
++                .collect(Collectors.toList());
++
++
++        Set<String> actualLibraryLocations = narClassLoaders.stream()
++                .map(classLoader -> classLoader.findLibrary("testjni"))
++                .collect(Collectors.toSet());
++
++        for (NarClassLoader narClassLoader : narClassLoaders) {
++            Class<?> TestJNI = narClassLoader.loadClass("org.apache.nifi.nar.sharedlib.TestJNI");
++
++            Object actualJniMethodReturnValue = TestJNI
++                    .getMethod("testJniMethod")
++                    .invoke(TestJNI.newInstance());
++
++            assertEquals("calledNativeTestJniMethod", actualJniMethodReturnValue);
++        }
++
++        assertEquals(1, actualLibraryLocations.size());
++        assertThat(actualLibraryLocations, hasItem(containsString("nifi-nar_without_native_lib-1")));
++    }
++
++    @Test
++    public void testLoadSameLibraryBy2InstanceClassLoadersFromSystemProperty() throws Exception {
++        final File extensionsDir = new File(EXTENSIONS_DIR);
++        final Path narAutoLoadDir = Paths.get(NAR_AUTOLOAD_DIR);
++        for (final File extensionFile : extensionsDir.listFiles()) {
++            Files.copy(extensionFile.toPath(), narAutoLoadDir.resolve(extensionFile.getName()), StandardCopyOption.REPLACE_EXISTING);
++        }
++
++        final List<File> narFiles = Arrays.asList(narAutoLoadDir.toFile().listFiles());
++        assertEquals(1, narFiles.size());
++
++        final NarLoadResult narLoadResult = narLoader.load(narFiles);
++        assertNotNull(narLoadResult);
++
++        Bundle bundleWithNativeLib = this.narClassLoaders.getBundles().stream()
++                .filter(bundle -> bundle.getBundleDetails().getCoordinate().getCoordinate().contains("nifi-nar_without_native_lib-"))
++                .findFirst().get();
++
++        Class<?> processorClass = bundleWithNativeLib.getClassLoader().loadClass("org.apache.nifi.nar.ModifiesClasspathProcessor");
++
++        List<InstanceClassLoader> instanceClassLoaders = Arrays.asList(
++                extensionManager.createInstanceClassLoader(processorClass.getName(), UUID.randomUUID().toString(), bundleWithNativeLib, null),
++                extensionManager.createInstanceClassLoader(processorClass.getName(), UUID.randomUUID().toString(), bundleWithNativeLib, null)
++        );
++
++        for (InstanceClassLoader instanceClassLoader : instanceClassLoaders) {
++            String actualLibraryLocation = instanceClassLoader.findLibrary("testjni");
++
++            Class<?> TestJNI = instanceClassLoader.loadClass("org.apache.nifi.nar.sharedlib.TestJNI");
++
++
++            Object actualJniMethodReturnValue = TestJNI
++                    .getMethod("testJniMethod")
++                    .invoke(TestJNI.newInstance());
++
++            assertThat(actualLibraryLocation, containsString(instanceClassLoader.getIdentifier()));
++            assertEquals("calledNativeTestJniMethod", actualJniMethodReturnValue);
++        }
++    }
++
++    @Override
++    String getWorkDir() {
++        return WORK_DIR;
++    }
++
++    @Override
++    String getNarAutoloadDir() {
++        return NAR_AUTOLOAD_DIR;
++    }
++
++    @Override
++    String getPropertiesFile() {
++        return PROPERTIES_FILE;
++    }
++}
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestNarLoader.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestNarLoader.java
+index 66cb829fe3e..8fdb4b383a9 100644
+--- a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestNarLoader.java
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/java/org/apache/nifi/nar/TestNarLoader.java
+@@ -16,86 +16,29 @@
+  */
+ package org.apache.nifi.nar;
+ 
+-import org.apache.nifi.bundle.Bundle;
+ import org.apache.nifi.controller.ControllerService;
+ import org.apache.nifi.processor.Processor;
+ import org.apache.nifi.reporting.ReportingTask;
+-import org.apache.nifi.util.NiFiProperties;
+-import org.junit.Before;
+ import org.junit.Test;
+ 
+ import java.io.File;
+ import java.io.IOException;
+-import java.nio.file.FileVisitResult;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+-import java.nio.file.SimpleFileVisitor;
+ import java.nio.file.StandardCopyOption;
+-import java.nio.file.attribute.BasicFileAttributes;
+ import java.util.Arrays;
+-import java.util.Collections;
+ import java.util.List;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+-import static org.junit.Assert.assertTrue;
+-
+-public class TestNarLoader {
+ 
++public class TestNarLoader extends AbstractTestNarLoader {
+     static final String WORK_DIR = "./target/work";
+     static final String NAR_AUTOLOAD_DIR = "./target/extensions";
++    static final String PROPERTIES_FILE = "./src/test/resources/conf/nifi.properties";
+     static final String EXTENSIONS_DIR = "./src/test/resources/extensions";
+ 
+-    private NiFiProperties properties;
+-    private ExtensionMapping extensionMapping;
+-
+-    private StandardNarLoader narLoader;
+-    private NarClassLoaders narClassLoaders;
+-    private ExtensionDiscoveringManager extensionManager;
+-
+-    @Before
+-    public void setup() throws IOException, ClassNotFoundException {
+-        deleteDir(WORK_DIR);
+-        deleteDir(NAR_AUTOLOAD_DIR);
+-
+-        final File extensionsDir = new File(NAR_AUTOLOAD_DIR);
+-        assertTrue(extensionsDir.mkdirs());
+-
+-        // Create NiFiProperties
+-        final String propertiesFile = "./src/test/resources/conf/nifi.properties";
+-        properties = NiFiProperties.createBasicNiFiProperties(propertiesFile , Collections.emptyMap());
+-
+-        // Unpack NARs
+-        final Bundle systemBundle = SystemBundle.create(properties);
+-        extensionMapping = NarUnpacker.unpackNars(properties, systemBundle);
+-        assertEquals(0, extensionMapping.getAllExtensionNames().size());
+-
+-        // Initialize NarClassLoaders
+-        narClassLoaders = new NarClassLoaders();
+-        narClassLoaders.init(properties.getFrameworkWorkingDirectory(), properties.getExtensionsWorkingDirectory());
+-
+-        extensionManager = new StandardExtensionDiscoveringManager();
+-        extensionManager.discoverExtensions(systemBundle, narClassLoaders.getBundles());
+-
+-        // Should have Framework and Jetty NARs loaded here
+-        assertEquals(2, narClassLoaders.getBundles().size());
+-
+-        // No extensions should be loaded yet
+-        assertEquals(0, extensionManager.getExtensions(Processor.class).size());
+-        assertEquals(0, extensionManager.getExtensions(ControllerService.class).size());
+-        assertEquals(0, extensionManager.getExtensions(ReportingTask.class).size());
+-
+-        // Create class we are testing
+-        narLoader = new StandardNarLoader(
+-                properties.getExtensionsWorkingDirectory(),
+-                properties.getComponentDocumentationWorkingDirectory(),
+-                narClassLoaders,
+-                extensionManager,
+-                extensionMapping,
+-                (bundles) -> {});
+-    }
+-
+     @Test
+     public void testNarLoaderWhenAllAvailable() throws IOException {
+         // Copy all NARs from src/test/resources/extensions to target/extensions
+@@ -166,24 +109,18 @@ public void testNarLoaderWhenDependentNarsAreMissing() throws IOException {
+         assertEquals(0, extensionManager.getExtensions(ReportingTask.class).size());
+     }
+ 
+-    private void deleteDir(String path) throws IOException {
+-        Path directory = Paths.get(path);
+-        if (!directory.toFile().exists()) {
+-            return;
+-        }
++    @Override
++    String getWorkDir() {
++        return WORK_DIR;
++    }
++
++    @Override
++    String getNarAutoloadDir() {
++        return NAR_AUTOLOAD_DIR;
++    }
+ 
+-        Files.walkFileTree(directory, new SimpleFileVisitor<Path>() {
+-            @Override
+-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+-                Files.delete(file);
+-                return FileVisitResult.CONTINUE;
+-            }
+-
+-            @Override
+-            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+-                Files.delete(dir);
+-                return FileVisitResult.CONTINUE;
+-            }
+-        });
++    @Override
++    String getPropertiesFile() {
++        return PROPERTIES_FILE;
+     }
+ }
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/conf/nifi.nar_with_native_lib.properties b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/conf/nifi.nar_with_native_lib.properties
+new file mode 100644
+index 00000000000..33133b6d3cc
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/conf/nifi.nar_with_native_lib.properties
+@@ -0,0 +1,124 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# Core Properties #
++nifi.flow.configuration.file=./target/flow.xml.gz
++nifi.flow.configuration.archive.dir=./target/archive/
++nifi.flowcontroller.autoResumeState=true
++nifi.flowcontroller.graceful.shutdown.period=10 sec
++nifi.flowservice.writedelay.interval=2 sec
++nifi.administrative.yield.duration=30 sec
++
++nifi.reporting.task.configuration.file=./target/reporting-tasks.xml
++nifi.controller.service.configuration.file=./target/controller-services.xml
++nifi.templates.directory=./target/templates
++nifi.ui.banner.text=UI Banner Text
++nifi.ui.autorefresh.interval=30 sec
++nifi.nar.library.directory=./src/test/resources/lib/
++nifi.nar.library.autoload.directory=./target/nars_with_native_lib
++
++nifi.nar.working.directory=./target/work/nar/
++nifi.documentation.working.directory=./target/work/docs/components
++
++# H2 Settings
++nifi.database.directory=./target/database_repository
++nifi.h2.url.append=;LOCK_TIMEOUT=25000;WRITE_DELAY=0;AUTO_SERVER=FALSE
++
++# FlowFile Repository
++nifi.flowfile.repository.directory=./target/test-repo
++nifi.flowfile.repository.partitions=1
++nifi.flowfile.repository.checkpoint.interval=2 mins
++nifi.queue.swap.threshold=20000
++nifi.swap.storage.directory=./target/test-repo/swap
++nifi.swap.in.period=5 sec
++nifi.swap.in.threads=1
++nifi.swap.out.period=5 sec
++nifi.swap.out.threads=4
++
++# Content Repository
++nifi.content.claim.max.appendable.size=10 MB
++nifi.content.claim.max.flow.files=100
++nifi.content.repository.directory.default=./target/content_repository
++
++# Provenance Repository Properties
++nifi.provenance.repository.storage.directory=./target/provenance_repository
++nifi.provenance.repository.max.storage.time=24 hours
++nifi.provenance.repository.max.storage.size=1 GB
++nifi.provenance.repository.rollover.time=30 secs
++nifi.provenance.repository.rollover.size=100 MB
++
++# Site to Site properties
++nifi.remote.input.socket.port=9990
++nifi.remote.input.secure=true
++
++# web properties #
++nifi.web.war.directory=./target/lib
++nifi.web.http.host=
++nifi.web.http.port=8080
++nifi.web.https.host=
++nifi.web.https.port=
++nifi.web.jetty.working.directory=./target/work/jetty
++
++# security properties #
++nifi.sensitive.props.key=key
++nifi.sensitive.props.algorithm=PBEWITHMD5AND256BITAES-CBC-OPENSSL
++nifi.sensitive.props.provider=BC
++
++nifi.security.keystore=
++nifi.security.keystoreType=
++nifi.security.keystorePasswd=
++nifi.security.keyPasswd=
++nifi.security.truststore=
++nifi.security.truststoreType=
++nifi.security.truststorePasswd=
++nifi.security.user.authorizer=
++
++# cluster common properties (cluster manager and nodes must have same values) #
++nifi.cluster.protocol.heartbeat.interval=5 sec
++nifi.cluster.protocol.is.secure=false
++nifi.cluster.protocol.socket.timeout=30 sec
++nifi.cluster.protocol.connection.handshake.timeout=45 sec
++# if multicast is used, then nifi.cluster.protocol.multicast.xxx properties must be configured #
++nifi.cluster.protocol.use.multicast=false
++nifi.cluster.protocol.multicast.address=
++nifi.cluster.protocol.multicast.port=
++nifi.cluster.protocol.multicast.service.broadcast.delay=500 ms
++nifi.cluster.protocol.multicast.service.locator.attempts=3
++nifi.cluster.protocol.multicast.service.locator.attempts.delay=1 sec
++
++# cluster node properties (only configure for cluster nodes) #
++nifi.cluster.is.node=false
++nifi.cluster.node.address=
++nifi.cluster.node.protocol.port=
++nifi.cluster.node.protocol.threads=2
++# if multicast is not used, nifi.cluster.node.unicast.xxx must have same values as nifi.cluster.manager.xxx #
++nifi.cluster.node.unicast.manager.address=
++nifi.cluster.node.unicast.manager.protocol.port=
++nifi.cluster.node.unicast.manager.authority.provider.port=
++
++# cluster manager properties (only configure for cluster manager) #
++nifi.cluster.is.manager=false
++nifi.cluster.manager.address=
++nifi.cluster.manager.protocol.port=
++nifi.cluster.manager.authority.provider.port=
++nifi.cluster.manager.authority.provider.threads=10
++nifi.cluster.manager.node.firewall.file=
++nifi.cluster.manager.node.event.history.size=10
++nifi.cluster.manager.node.api.connection.timeout=30 sec
++nifi.cluster.manager.node.api.read.timeout=30 sec
++nifi.cluster.manager.node.api.request.threads=10
++nifi.cluster.manager.flow.retrieval.delay=5 sec
++nifi.cluster.manager.protocol.threads=10
++nifi.cluster.manager.safemode.duration=0 sec
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/conf/nifi.nar_without_native_lib.properties b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/conf/nifi.nar_without_native_lib.properties
+new file mode 100644
+index 00000000000..47844463407
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/conf/nifi.nar_without_native_lib.properties
+@@ -0,0 +1,124 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# Core Properties #
++nifi.flow.configuration.file=./target/flow.xml.gz
++nifi.flow.configuration.archive.dir=./target/archive/
++nifi.flowcontroller.autoResumeState=true
++nifi.flowcontroller.graceful.shutdown.period=10 sec
++nifi.flowservice.writedelay.interval=2 sec
++nifi.administrative.yield.duration=30 sec
++
++nifi.reporting.task.configuration.file=./target/reporting-tasks.xml
++nifi.controller.service.configuration.file=./target/controller-services.xml
++nifi.templates.directory=./target/templates
++nifi.ui.banner.text=UI Banner Text
++nifi.ui.autorefresh.interval=30 sec
++nifi.nar.library.directory=./src/test/resources/lib/
++nifi.nar.library.autoload.directory=./target/nars_without_native_lib
++
++nifi.nar.working.directory=./target/work/nar/
++nifi.documentation.working.directory=./target/work/docs/components
++
++# H2 Settings
++nifi.database.directory=./target/database_repository
++nifi.h2.url.append=;LOCK_TIMEOUT=25000;WRITE_DELAY=0;AUTO_SERVER=FALSE
++
++# FlowFile Repository
++nifi.flowfile.repository.directory=./target/test-repo
++nifi.flowfile.repository.partitions=1
++nifi.flowfile.repository.checkpoint.interval=2 mins
++nifi.queue.swap.threshold=20000
++nifi.swap.storage.directory=./target/test-repo/swap
++nifi.swap.in.period=5 sec
++nifi.swap.in.threads=1
++nifi.swap.out.period=5 sec
++nifi.swap.out.threads=4
++
++# Content Repository
++nifi.content.claim.max.appendable.size=10 MB
++nifi.content.claim.max.flow.files=100
++nifi.content.repository.directory.default=./target/content_repository
++
++# Provenance Repository Properties
++nifi.provenance.repository.storage.directory=./target/provenance_repository
++nifi.provenance.repository.max.storage.time=24 hours
++nifi.provenance.repository.max.storage.size=1 GB
++nifi.provenance.repository.rollover.time=30 secs
++nifi.provenance.repository.rollover.size=100 MB
++
++# Site to Site properties
++nifi.remote.input.socket.port=9990
++nifi.remote.input.secure=true
++
++# web properties #
++nifi.web.war.directory=./target/lib
++nifi.web.http.host=
++nifi.web.http.port=8080
++nifi.web.https.host=
++nifi.web.https.port=
++nifi.web.jetty.working.directory=./target/work/jetty
++
++# security properties #
++nifi.sensitive.props.key=key
++nifi.sensitive.props.algorithm=PBEWITHMD5AND256BITAES-CBC-OPENSSL
++nifi.sensitive.props.provider=BC
++
++nifi.security.keystore=
++nifi.security.keystoreType=
++nifi.security.keystorePasswd=
++nifi.security.keyPasswd=
++nifi.security.truststore=
++nifi.security.truststoreType=
++nifi.security.truststorePasswd=
++nifi.security.user.authorizer=
++
++# cluster common properties (cluster manager and nodes must have same values) #
++nifi.cluster.protocol.heartbeat.interval=5 sec
++nifi.cluster.protocol.is.secure=false
++nifi.cluster.protocol.socket.timeout=30 sec
++nifi.cluster.protocol.connection.handshake.timeout=45 sec
++# if multicast is used, then nifi.cluster.protocol.multicast.xxx properties must be configured #
++nifi.cluster.protocol.use.multicast=false
++nifi.cluster.protocol.multicast.address=
++nifi.cluster.protocol.multicast.port=
++nifi.cluster.protocol.multicast.service.broadcast.delay=500 ms
++nifi.cluster.protocol.multicast.service.locator.attempts=3
++nifi.cluster.protocol.multicast.service.locator.attempts.delay=1 sec
++
++# cluster node properties (only configure for cluster nodes) #
++nifi.cluster.is.node=false
++nifi.cluster.node.address=
++nifi.cluster.node.protocol.port=
++nifi.cluster.node.protocol.threads=2
++# if multicast is not used, nifi.cluster.node.unicast.xxx must have same values as nifi.cluster.manager.xxx #
++nifi.cluster.node.unicast.manager.address=
++nifi.cluster.node.unicast.manager.protocol.port=
++nifi.cluster.node.unicast.manager.authority.provider.port=
++
++# cluster manager properties (only configure for cluster manager) #
++nifi.cluster.is.manager=false
++nifi.cluster.manager.address=
++nifi.cluster.manager.protocol.port=
++nifi.cluster.manager.authority.provider.port=
++nifi.cluster.manager.authority.provider.threads=10
++nifi.cluster.manager.node.firewall.file=
++nifi.cluster.manager.node.event.history.size=10
++nifi.cluster.manager.node.api.connection.timeout=30 sec
++nifi.cluster.manager.node.api.read.timeout=30 sec
++nifi.cluster.manager.node.api.request.threads=10
++nifi.cluster.manager.flow.retrieval.delay=5 sec
++nifi.cluster.manager.protocol.threads=10
++nifi.cluster.manager.safemode.duration=0 sec
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_with_native_lib/nifi-nar_with_native_lib-1-1.0.nar b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_with_native_lib/nifi-nar_with_native_lib-1-1.0.nar
+new file mode 100644
+index 00000000000..2d62b0cf2ae
+Binary files /dev/null and b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_with_native_lib/nifi-nar_with_native_lib-1-1.0.nar differ
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_with_native_lib/nifi-nar_with_native_lib-2-1.0.nar b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_with_native_lib/nifi-nar_with_native_lib-2-1.0.nar
+new file mode 100644
+index 00000000000..0e87d9445af
+Binary files /dev/null and b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_with_native_lib/nifi-nar_with_native_lib-2-1.0.nar differ
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_without_native_lib/nifi-nar_without_native_lib-1-1.0.nar b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_without_native_lib/nifi-nar_without_native_lib-1-1.0.nar
+new file mode 100644
+index 00000000000..b9c7419d3e7
+Binary files /dev/null and b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/nars_without_native_lib/nifi-nar_without_native_lib-1-1.0.nar differ
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/TestJNI.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/TestJNI.java
+new file mode 100644
+index 00000000000..781c05ef8b2
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/TestJNI.java
+@@ -0,0 +1,25 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.nar.sharedlib;
++
++public class TestJNI {
++    static {
++        System.loadLibrary("testjni");
++    }
++
++    public native String testJniMethod();
++}
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/libtestjni.dylib b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/libtestjni.dylib
+new file mode 100644
+index 00000000000..a06ff7c74f9
+Binary files /dev/null and b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/libtestjni.dylib differ
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.cpp b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.cpp
+new file mode 100644
+index 00000000000..d58496c7735
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.cpp
+@@ -0,0 +1,24 @@
++/* DO NOT EDIT THIS FILE - it is machine generated */
++#include <jni.h>
++/* Header for class org_apache_nifi_nar_sharedlib_TestJNI */
++
++#ifndef _Included_org_apache_nifi_nar_sharedlib_TestJNI
++#define _Included_org_apache_nifi_nar_sharedlib_TestJNI
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*
++ * Class:     org_apache_nifi_nar_sharedlib_TestJNI
++ * Method:    testJniMethod
++ * Signature: ()Ljava/lang/String;
++ */
++JNIEXPORT jstring JNICALL Java_org_apache_nifi_nar_sharedlib_TestJNI_testJniMethod
++  (JNIEnv *env, jobject thisObject) {
++  jstring result = (*env).NewStringUTF("calledNativeTestJniMethod");
++  return result;
++ }
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.h b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.h
+new file mode 100644
+index 00000000000..1d750871051
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.h
+@@ -0,0 +1,21 @@
++/* DO NOT EDIT THIS FILE - it is machine generated */
++#include <jni.h>
++/* Header for class org_apache_nifi_nar_sharedlib_TestJNI */
++
++#ifndef _Included_org_apache_nifi_nar_sharedlib_TestJNI
++#define _Included_org_apache_nifi_nar_sharedlib_TestJNI
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*
++ * Class:     org_apache_nifi_nar_sharedlib_TestJNI
++ * Method:    testJniMethod
++ * Signature: ()Ljava/lang/String;
++ */
++JNIEXPORT jstring JNICALL Java_org_apache_nifi_nar_sharedlib_TestJNI_testJniMethod
++  (JNIEnv *, jobject);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.o b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.o
+new file mode 100755
+index 00000000000..3a71bf29530
+Binary files /dev/null and b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-loading-utils/src/test/resources/native/org_apache_nifi_nar_sharedlib_TestJNI.o differ
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/InstanceClassLoader.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/InstanceClassLoader.java
+index d9e23fa2167..bf78768bd07 100644
+--- a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/InstanceClassLoader.java
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/InstanceClassLoader.java
+@@ -19,10 +19,14 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import java.io.File;
++import java.net.URISyntaxException;
+ import java.net.URL;
+-import java.net.URLClassLoader;
++import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.HashSet;
+ import java.util.LinkedHashSet;
++import java.util.List;
+ import java.util.Set;
+ 
+ /**
+@@ -31,7 +35,7 @@
+  * The InstanceClassLoader will either be an empty pass-through to the NARClassLoader, or will contain a
+  * copy of all the NAR's resources in the case of components that @RequireInstanceClassLoading.
+  */
+-public class InstanceClassLoader extends URLClassLoader {
++public class InstanceClassLoader extends AbstractNativeLibHandlingClassLoader {
+ 
+     private static final Logger logger = LoggerFactory.getLogger(InstanceClassLoader.class);
+ 
+@@ -48,7 +52,18 @@ public class InstanceClassLoader extends URLClassLoader {
+      * @param parent the parent ClassLoader
+      */
+     public InstanceClassLoader(final String identifier, final String type, final Set<URL> instanceUrls, final Set<URL> additionalResourceUrls, final ClassLoader parent) {
+-        super(combineURLs(instanceUrls, additionalResourceUrls), parent);
++        this(identifier, type, instanceUrls, additionalResourceUrls, Collections.emptySet(), parent);
++    }
++
++    public InstanceClassLoader(
++            final String identifier,
++            final String type,
++            final Set<URL> instanceUrls,
++            final Set<URL> additionalResourceUrls,
++            final Set<File> narNativeLibDirs,
++            final ClassLoader parent
++    ) {
++        super(combineURLs(instanceUrls, additionalResourceUrls), parent, initNativeLibDirList(narNativeLibDirs, additionalResourceUrls), identifier);
+         this.identifier = identifier;
+         this.instanceType = type;
+         this.instanceUrls = Collections.unmodifiableSet(
+@@ -57,6 +72,35 @@ public InstanceClassLoader(final String identifier, final String type, final Set
+                 additionalResourceUrls == null ? Collections.emptySet() : new LinkedHashSet<>(additionalResourceUrls));
+     }
+ 
++    private static List<File> initNativeLibDirList(Set<File> narNativeLibDirs, Set<URL> additionalResourceUrls) {
++        List<File> nativeLibDirList = new ArrayList<>(narNativeLibDirs);
++
++        Set<File> additionalNativeLibDirs = new HashSet<>();
++        if (additionalResourceUrls != null) {
++            for (URL url : additionalResourceUrls) {
++                File file;
++
++                try {
++                    file = new File(url.toURI());
++                } catch (URISyntaxException e) {
++                    file = new File(url.getPath());
++                } catch (Exception e) {
++                    logger.error("Couldn't convert url '" + url + "' to a file");
++                    file = null;
++                }
++
++                File dir = toDir(file);
++                if (dir != null) {
++                    additionalNativeLibDirs.add(dir);
++                }
++            }
++        }
++
++        nativeLibDirList.addAll(additionalNativeLibDirs);
++
++        return nativeLibDirList;
++    }
++
+     private static URL[] combineURLs(final Set<URL> instanceUrls, final Set<URL> additionalResourceUrls) {
+         final Set<URL> allUrls = new LinkedHashSet<>();
+ 
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/StandardExtensionDiscoveringManager.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/StandardExtensionDiscoveringManager.java
+index f037569c203..f7804004e7d 100644
+--- a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/StandardExtensionDiscoveringManager.java
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-framework-nar-utils/src/main/java/org/apache/nifi/nar/StandardExtensionDiscoveringManager.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.nifi.nar;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.net.URL;
+ import java.net.URLClassLoader;
+@@ -367,6 +368,9 @@ public InstanceClassLoader createInstanceClassLoader(final String classType, fin
+             logger.debug("Including ClassLoader resources from {} for component {}", new Object[] {bundle.getBundleDetails(), instanceIdentifier});
+ 
+             final Set<URL> instanceUrls = new LinkedHashSet<>();
++            final Set<File> narNativeLibDirs = new LinkedHashSet<>();
++
++            narNativeLibDirs.add(narBundleClassLoader.getNARNativeLibDir());
+             instanceUrls.addAll(Arrays.asList(narBundleClassLoader.getURLs()));
+ 
+             ClassLoader ancestorClassLoader = narBundleClassLoader.getParent();
+@@ -385,12 +389,15 @@ public InstanceClassLoader createInstanceClassLoader(final String classType, fin
+                     }
+ 
+                     final NarClassLoader ancestorNarClassLoader = (NarClassLoader) ancestorClassLoader;
++
++                    narNativeLibDirs.add(ancestorNarClassLoader.getNARNativeLibDir());
+                     Collections.addAll(instanceUrls, ancestorNarClassLoader.getURLs());
++
+                     ancestorClassLoader = ancestorNarClassLoader.getParent();
+                 }
+             }
+ 
+-            instanceClassLoader = new InstanceClassLoader(instanceIdentifier, classType, instanceUrls, additionalUrls, ancestorClassLoader);
++            instanceClassLoader = new InstanceClassLoader(instanceIdentifier, classType, instanceUrls, additionalUrls, narNativeLibDirs, ancestorClassLoader);
+         } else {
+             instanceClassLoader = new InstanceClassLoader(instanceIdentifier, classType, Collections.emptySet(), additionalUrls, bundleClassLoader);
+         }
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/AbstractNativeLibHandlingClassLoader.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/AbstractNativeLibHandlingClassLoader.java
+new file mode 100644
+index 00000000000..4edbe9d853c
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/AbstractNativeLibHandlingClassLoader.java
+@@ -0,0 +1,190 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.nar;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.File;
++import java.net.URL;
++import java.net.URLClassLoader;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
++
++/**
++ * An extension of {@link URLClassLoader} that can load native libraries from a
++ * predefined list of directories as well as from those that are defined by
++ * the java.library.path system property.
++ *
++ * Once a library is found an OS-handled temporary copy is created and cached
++ * to maintain consistency and classloader isolation.
++ */
++public abstract class AbstractNativeLibHandlingClassLoader extends URLClassLoader implements OSUtil {
++
++    private final Logger logger = LoggerFactory.getLogger(this.getClass());
++
++    /**
++     * Directories in which to look for native libraries
++     */
++    protected final List<File> nativeLibDirList;
++    /**
++     * Used to cache (the paths of) temporary copies of loaded libraries
++     */
++    protected final Map<String, Path> nativeLibNameToPath = new HashMap<>();
++    /**
++     * Used as prefix when creating the temporary copies of libraries
++     */
++    private final String tmpLibFilePrefix;
++
++    public AbstractNativeLibHandlingClassLoader(URL[] urls, List<File> initialNativeLibDirList, String tmpLibFilePrefix) {
++        super(urls);
++
++        this.nativeLibDirList = buildNativeLibDirList(initialNativeLibDirList);
++        this.tmpLibFilePrefix = tmpLibFilePrefix;
++    }
++
++    public AbstractNativeLibHandlingClassLoader(URL[] urls, ClassLoader parent, List<File> initialNativeLibDirList, String tmpLibFilePrefix) {
++        super(urls, parent);
++
++        this.nativeLibDirList = buildNativeLibDirList(initialNativeLibDirList);
++        this.tmpLibFilePrefix = tmpLibFilePrefix;
++    }
++
++    public static File toDir(File fileOrDir) {
++        if (fileOrDir == null) {
++            return null;
++        } else if (fileOrDir.isFile()) {
++            return fileOrDir.getParentFile();
++        } else if (fileOrDir.isDirectory()) {
++            return fileOrDir;
++        } else {
++            return null;
++        }
++    }
++
++    public String findLibrary(String libname) {
++        String libLocationString;
++
++        Path libLocation = nativeLibNameToPath.compute(
++                libname,
++                (__, currentLocation) -> {
++                    if (currentLocation != null && currentLocation.toFile().exists()) {
++                        return currentLocation;
++                    } else {
++                        for (File nativeLibDir : nativeLibDirList) {
++                            String libraryOriginalPathString = findLibrary(libname, nativeLibDir);
++                            if (libraryOriginalPathString != null) {
++                                return createTempCopy(libname, libraryOriginalPathString);
++                            }
++                        }
++
++                        return null;
++                    }
++                }
++        );
++
++        if (libLocation == null) {
++            libLocationString = null;
++        } else {
++            libLocationString = libLocation.toFile().getAbsolutePath();
++        }
++
++        return libLocationString;
++    }
++
++    protected Set<File> getUsrLibDirs() {
++        Set<File> usrLibDirs = Arrays.stream(getJavaLibraryPath().split(File.pathSeparator))
++                .map(String::trim)
++                .filter(pathAsString -> !pathAsString.isEmpty())
++                .map(File::new)
++                .map(AbstractNativeLibHandlingClassLoader::toDir)
++                .filter(Objects::nonNull)
++                .collect(Collectors.toSet());
++
++        return usrLibDirs;
++    }
++
++    protected String getJavaLibraryPath() {
++        return System.getProperty("java.library.path", "");
++    }
++
++    protected Path createTempCopy(String libname, String libraryOriginalPathString) {
++        Path tempFile;
++
++        try {
++            tempFile = Files.createTempFile(tmpLibFilePrefix + "_", "_" + libname);
++            Files.copy(Paths.get(libraryOriginalPathString), tempFile, REPLACE_EXISTING);
++        } catch (Exception e) {
++            logger.error("Couldn't create temporary copy of the library '" + libname + "' found at '" + libraryOriginalPathString + "'", e);
++
++            tempFile = null;
++        }
++
++        return tempFile;
++    }
++
++    protected String findLibrary(String libname, File nativeLibDir) {
++        final File dllFile = new File(nativeLibDir, libname + ".dll");
++        final File dylibFile = new File(nativeLibDir, libname + ".dylib");
++        final File libdylibFile = new File(nativeLibDir, "lib" + libname + ".dylib");
++        final File libsoFile = new File(nativeLibDir, "lib" + libname + ".so");
++        final File soFile = new File(nativeLibDir, libname + ".so");
++
++        if (isOsWindows() && dllFile.exists()) {
++            return dllFile.getAbsolutePath();
++        } else if (isOsMac()) {
++            if (dylibFile.exists()) {
++                return dylibFile.getAbsolutePath();
++            } else if (libdylibFile.exists()) {
++                return libdylibFile.getAbsolutePath();
++            } else if (soFile.exists()) {
++                return soFile.getAbsolutePath();
++            } else if (libsoFile.exists()) {
++                return libsoFile.getAbsolutePath();
++            }
++        } else if (isOsLinuxUnix()) {
++            if (soFile.exists()) {
++                return soFile.getAbsolutePath();
++            } else if (libsoFile.exists()) {
++                return libsoFile.getAbsolutePath();
++            }
++        }
++
++        // not found in the nar. try system native dir
++        return null;
++    }
++
++    private List<File> buildNativeLibDirList(List<File> initialNativeLibDirList) {
++        List<File> allNativeLibDirList = new ArrayList<>(initialNativeLibDirList);
++
++        allNativeLibDirList.addAll(getUsrLibDirs());
++
++        return Collections.unmodifiableList(allNativeLibDirList);
++    }
++}
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/NarClassLoader.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/NarClassLoader.java
+index 776ec28bbd5..5c1abe281f5 100644
+--- a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/NarClassLoader.java
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/NarClassLoader.java
+@@ -20,9 +20,10 @@
+ import java.io.FileFilter;
+ import java.io.IOException;
+ import java.net.URL;
+-import java.net.URLClassLoader;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Comparator;
++import java.util.List;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -52,12 +53,17 @@
+  *
+  * <pre>
+  *   +META-INF/
+- *   +-- bundled-dependencies/
++ *   +-- bundled-dependencies/[native]
+  *   +-- &lt;JAR files&gt;
+  *   +-- MANIFEST.MF
+  * </pre>
+  * </p>
+  *
++ * The optional "native" subdirectory under "bundled-dependencies" may contain native
++ * libraries. Directories defined via the java.library.path system property are also scanned.
++ * After a library is found an OS-handled temporary copy is created and cached before loading
++ * it to maintain consistency and classloader isolation.
++ *
+  * <p>
+  * The MANIFEST.MF file contains the same information as a typical JAR file but
+  * also includes two additional NiFi properties: {@code Nar-Id} and
+@@ -116,7 +122,7 @@
+  * Maven NAR plugin will fail to build the NAR.
+  * </p>
+  */
+-public class NarClassLoader extends URLClassLoader {
++public class NarClassLoader extends AbstractNativeLibHandlingClassLoader {
+ 
+     private static final Logger LOGGER = LoggerFactory.getLogger(NarClassLoader.class);
+ 
+@@ -144,7 +150,7 @@ public boolean accept(File pathname) {
+      * @throws IOException if an error occurs while loading the NAR.
+      */
+     public NarClassLoader(final File narWorkingDirectory) throws ClassNotFoundException, IOException {
+-        super(new URL[0]);
++        super(new URL[0], initNativeLibDirList(narWorkingDirectory), narWorkingDirectory.getName());
+         this.narWorkingDirectory = narWorkingDirectory;
+ 
+         // process the classpath
+@@ -163,7 +169,7 @@ public NarClassLoader(final File narWorkingDirectory) throws ClassNotFoundExcept
+      * @throws IOException if an error occurs while loading the NAR.
+      */
+     public NarClassLoader(final File narWorkingDirectory, final ClassLoader parentClassLoader) throws ClassNotFoundException, IOException {
+-        super(new URL[0], parentClassLoader);
++        super(new URL[0], parentClassLoader, initNativeLibDirList(narWorkingDirectory), narWorkingDirectory.getName());
+         this.narWorkingDirectory = narWorkingDirectory;
+ 
+         // process the classpath
+@@ -204,27 +210,25 @@ private void updateClasspath(File root) throws IOException {
+         }
+     }
+ 
+-    @Override
+-    protected String findLibrary(final String libname) {
++    public File getNARNativeLibDir() {
++        return getNARNativeLibDir(narWorkingDirectory);
++    }
++
++    private static List<File> initNativeLibDirList(File narWorkingDirectory) {
++        ArrayList<File> nativeLibDirList = new ArrayList<>();
++
++        nativeLibDirList.add(getNARNativeLibDir(narWorkingDirectory));
++
++        return nativeLibDirList;
++    }
++
++    private static File getNARNativeLibDir(File narWorkingDirectory) {
+         File dependencies = new File(narWorkingDirectory, "NAR-INF/bundled-dependencies");
+         if (!dependencies.isDirectory()) {
+             LOGGER.warn(narWorkingDirectory + " does not contain NAR-INF/bundled-dependencies!");
+         }
+ 
+-        final File nativeDir = new File(dependencies, "native");
+-        final File libsoFile = new File(nativeDir, "lib" + libname + ".so");
+-        final File dllFile = new File(nativeDir, libname + ".dll");
+-        final File soFile = new File(nativeDir, libname + ".so");
+-        if (libsoFile.exists()) {
+-            return libsoFile.getAbsolutePath();
+-        } else if (dllFile.exists()) {
+-            return dllFile.getAbsolutePath();
+-        } else if (soFile.exists()) {
+-            return soFile.getAbsolutePath();
+-        }
+-
+-        // not found in the nar. try system native dir
+-        return null;
++        return new File(dependencies, "native");
+     }
+ 
+     @Override
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/OSUtil.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/OSUtil.java
+new file mode 100644
+index 00000000000..83f54e3df25
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/main/java/org/apache/nifi/nar/OSUtil.java
+@@ -0,0 +1,33 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.nar;
++
++public interface OSUtil {
++    String OS = System.getProperty("os.name").toLowerCase();
++
++    default boolean isOsWindows() {
++        return OS.contains("win");
++    }
++
++    default boolean isOsMac() {
++        return OS.contains("mac");
++    }
++
++    default boolean isOsLinuxUnix() {
++        return OS.contains("nix") || OS.contains("nux") || OS.contains("aix");
++    }
++}
+diff --git a/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/test/java/org/apache/nifi/nar/AbstractNativeLibHandlingClassLoaderTest.java b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/test/java/org/apache/nifi/nar/AbstractNativeLibHandlingClassLoaderTest.java
+new file mode 100644
+index 00000000000..01fd49f818f
+--- /dev/null
++++ b/nifi-nar-bundles/nifi-framework-bundle/nifi-framework/nifi-nar-utils/src/test/java/org/apache/nifi/nar/AbstractNativeLibHandlingClassLoaderTest.java
+@@ -0,0 +1,540 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.nifi.nar;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.mockito.Mock;
++
++import java.io.File;
++import java.io.IOException;
++import java.net.URL;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
++
++import static org.junit.Assert.assertEquals;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
++import static org.mockito.MockitoAnnotations.initMocks;
++
++public class AbstractNativeLibHandlingClassLoaderTest {
++    public static final String NATIVE_LIB_NAME = "native_lib";
++
++    @Mock
++    private AbstractNativeLibHandlingClassLoader testSubjectHelper;
++
++    private Path tempDirectory;
++
++    private String javaLibraryPath = "";
++
++    private List<File> nativeLibDirs = new ArrayList<>();
++    private final Map<String, Path> nativeLibNameToPath = new HashMap<>();
++
++    private boolean isOsWindows;
++    private boolean isOsMaxOsx;
++    private boolean isOsLinux;
++
++    @Before
++    public void setUp() throws Exception {
++        initMocks(this);
++        tempDirectory = Files.createTempDirectory(this.getClass().getSimpleName());
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        tempDirectory.toFile().deleteOnExit();
++
++        Files.walk(tempDirectory)
++                .sorted(Comparator.reverseOrder())
++                .map(Path::toFile)
++                .forEach(File::delete);
++
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnNullOnWindowsWhenNoDLLAvailable() throws Exception {
++        // GIVEN
++        isOsWindows = true;
++
++        createTempFile("so");
++        createTempFile("lib", "so");
++        createTempFile("dylib");
++        createTempFile("lib", "dylib");
++
++        String expected = null;
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnDLLOnWindows() throws Exception {
++        // GIVEN
++        isOsWindows = true;
++
++        Path expectedNativeLib = createTempFile("dll");
++        createTempFile("so");
++        createTempFile("lib", "so");
++        createTempFile("dylib");
++        createTempFile("lib", "dylib");
++
++        String expected = expectedNativeLib.toFile().getAbsolutePath();
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnNullOnMacWhenNoDylibOrSoAvailable() throws Exception {
++        // GIVEN
++        isOsMaxOsx = true;
++
++        createTempFile("dll");
++
++        String expected = null;
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnDylibOnMac() throws Exception {
++        // GIVEN
++        isOsMaxOsx = true;
++
++        createTempFile("dll");
++        createTempFile("so");
++        createTempFile("lib", "so");
++        Path expectedNativeLib = createTempFile("dylib");
++        createTempFile("lib", "dylib");
++
++        String expected = expectedNativeLib.toFile().getAbsolutePath();
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnLibDylibOnMac() throws Exception {
++        // GIVEN
++        isOsMaxOsx = true;
++
++        createTempFile("dll");
++        createTempFile("so");
++        createTempFile("lib", "so");
++        Path expectedNativeLib = createTempFile("lib", "dylib");
++
++        String expected = expectedNativeLib.toFile().getAbsolutePath();
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryMayReturnSoOnMac() throws Exception {
++        // GIVEN
++        isOsMaxOsx = true;
++
++        createTempFile("dll");
++        Path expectedNativeLib = createTempFile("so");
++        createTempFile("lib", "so");
++
++        String expected = expectedNativeLib.toFile().getAbsolutePath();
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryMayReturnLibSoOnMac() throws Exception {
++        // GIVEN
++        isOsMaxOsx = true;
++
++        createTempFile("dll");
++        Path expectedNativeLib = createTempFile("lib", "so");
++
++        String expected = expectedNativeLib.toFile().getAbsolutePath();
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnNullOnLinuxWhenNoSoAvailable() throws Exception {
++        // GIVEN
++        isOsLinux = true;
++
++        createTempFile("dll");
++        createTempFile("dylib");
++        createTempFile("lib", "dylib");
++
++        String expected = null;
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnSoOnLinux() throws Exception {
++        // GIVEN
++        isOsLinux = true;
++
++        createTempFile("dll");
++        Path expectedNativeLib = createTempFile("so");
++        createTempFile("lib", "so");
++        createTempFile("dylib");
++        createTempFile("lib", "dylib");
++
++        String expected = expectedNativeLib.toFile().getAbsolutePath();
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnLibSoOnLinux() throws Exception {
++        // GIVEN
++        isOsLinux = true;
++
++        createTempFile("dll");
++        Path expectedNativeLib = createTempFile("lib", "so");
++        createTempFile("dylib");
++        createTempFile("lib", "dylib");
++
++        String expected = expectedNativeLib.toFile().getAbsolutePath();
++
++        // WHEN
++        // THEN
++        testFindLibrary(expected);
++    }
++
++    private void testFindLibrary(String expected) {
++        String actual = createTestSubjectForOS().findLibrary(NATIVE_LIB_NAME, tempDirectory.toFile());
++
++        assertEquals(expected, actual);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnLibLocation() throws Exception {
++        // GIVEN
++        File nativeLibDir = mock(File.class);
++
++        nativeLibDirs = Arrays.asList(nativeLibDir);
++
++        Path libPath = createTempFile("mocked").toAbsolutePath();
++        when(testSubjectHelper.findLibrary("libName", nativeLibDir)).thenReturn("libLocation");
++        when(testSubjectHelper.createTempCopy("libName", "libLocation")).thenReturn(libPath);
++
++        String expected = libPath.toFile().getAbsolutePath();
++
++        AbstractNativeLibHandlingClassLoader testSubject = createTestSubject();
++
++        // WHEN
++        String actual = testSubject.findLibrary("libName");
++
++        // THEN
++        assertEquals(expected, actual);
++        verify(testSubjectHelper).findLibrary("libName", nativeLibDir);
++        verify(testSubjectHelper).createTempCopy("libName", "libLocation");
++        verifyNoMoreInteractions(testSubjectHelper);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnFirstFoundLibLocation() throws Exception {
++        // GIVEN
++        File nativeLibDir1 = mock(File.class);
++        File nativeLibDir2 = mock(File.class);
++        File nativeLibDir3 = mock(File.class);
++
++        nativeLibDirs = Arrays.asList(nativeLibDir1, nativeLibDir2, nativeLibDir3);
++
++        Path libPath = createTempFile("mocked").toAbsolutePath();
++        when(testSubjectHelper.findLibrary("libName", nativeLibDir1)).thenReturn(null);
++        when(testSubjectHelper.findLibrary("libName", nativeLibDir2)).thenReturn("firstFoundLibLocation");
++        when(testSubjectHelper.createTempCopy("libName", "firstFoundLibLocation")).thenReturn(libPath);
++
++        String expected = libPath.toFile().getAbsolutePath();
++
++        AbstractNativeLibHandlingClassLoader testSubject = createTestSubject();
++
++        // WHEN
++        String actual = testSubject.findLibrary("libName");
++
++        // THEN
++        assertEquals(expected, actual);
++        verify(testSubjectHelper).findLibrary("libName", nativeLibDir1);
++        verify(testSubjectHelper).findLibrary("libName", nativeLibDir2);
++        verify(testSubjectHelper).createTempCopy("libName", "firstFoundLibLocation");
++        verifyNoMoreInteractions(testSubjectHelper);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnCachedLibLocation() throws Exception {
++        // GIVEN
++        File nativeLibDir = mock(File.class);
++
++        nativeLibDirs = Arrays.asList(nativeLibDir);
++
++        Path cachedLibPath = createTempFile("cached", "mocked").toAbsolutePath();
++        nativeLibNameToPath.put("libName", cachedLibPath);
++
++        AbstractNativeLibHandlingClassLoader testSubject = createTestSubject();
++        String expected = cachedLibPath.toFile().getAbsolutePath();
++
++        // WHEN
++        String actual = testSubject.findLibrary("libName");
++
++        // THEN
++        assertEquals(expected, actual);
++        verifyNoMoreInteractions(testSubjectHelper);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnFoundThenCachedLibLocation() throws Exception {
++        // GIVEN
++        File nativeLibDir = mock(File.class);
++
++        nativeLibDirs = Arrays.asList(nativeLibDir);
++
++        Path libPath = createTempFile("mocked").toAbsolutePath();
++        when(testSubjectHelper.findLibrary("libName", nativeLibDir)).thenReturn("libLocation");
++        when(testSubjectHelper.createTempCopy("libName", "libLocation")).thenReturn(libPath);
++
++        String expected = libPath.toFile().getAbsolutePath();
++
++        AbstractNativeLibHandlingClassLoader testSubject = createTestSubject();
++
++        // WHEN
++        String actual1 = testSubject.findLibrary("libName");
++        String actual2 = testSubject.findLibrary("libName");
++
++        // THEN
++        assertEquals(expected, actual1);
++        assertEquals(expected, actual2);
++        verify(testSubjectHelper).findLibrary("libName", nativeLibDir);
++        verify(testSubjectHelper).createTempCopy("libName", "libLocation");
++        verifyNoMoreInteractions(testSubjectHelper);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnNullWhenLibDirNotRegistered() throws Exception {
++        // GIVEN
++        nativeLibDirs = new ArrayList<>();
++
++        AbstractNativeLibHandlingClassLoader testSubject = createTestSubject();
++        String expected = null;
++
++        // WHEN
++        String actual = testSubject.findLibrary("libName");
++
++        // THEN
++        assertEquals(expected, actual);
++        verifyNoMoreInteractions(testSubjectHelper);
++    }
++
++    @Test
++    public void testFindLibraryShouldReturnNullWhenLibNotFound() throws Exception {
++        // GIVEN
++        File nativeLibDir = mock(File.class);
++
++        nativeLibDirs = Arrays.asList(nativeLibDir);
++
++        when(testSubjectHelper.findLibrary("libName", nativeLibDir)).thenReturn(null);
++
++        AbstractNativeLibHandlingClassLoader testSubject = createTestSubject();
++        String expected = null;
++
++        // WHEN
++        String actual = testSubject.findLibrary("libName");
++
++        // THEN
++        assertEquals(expected, actual);
++        verify(testSubjectHelper).findLibrary("libName", nativeLibDir);
++        verifyNoMoreInteractions(testSubjectHelper);
++    }
++
++    @Test
++    public void testToDirShouldReturnNullForNullInput() throws Exception {
++        // GIVEN
++        File expected = null;
++
++        // WHEN
++        File actual = createTestSubject().toDir(null);
++
++        // THEN
++        assertEquals(expected, actual);
++    }
++
++    @Test
++    public void testToDirShouldReturnParentForFile() throws Exception {
++        // GIVEN
++        Path filePath = createTempFile("mocked").toAbsolutePath();
++        File expected = filePath.getParent().toFile();
++
++        // WHEN
++        File actual = createTestSubject().toDir(filePath.toFile());
++
++        // THEN
++        assertEquals(expected, actual);
++    }
++
++    @Test
++    public void testToDirShouldReturnDirUnchanged() throws Exception {
++        // GIVEN
++        Path dirPath = createTempFile("mocked").getParent();
++        File expected = dirPath.toFile();
++
++        // WHEN
++        File actual = createTestSubject().toDir(dirPath.toFile());
++
++        // THEN
++        assertEquals(expected, actual);
++    }
++
++    @Test
++    public void testGetUsrLibDirsShouldReturnUniqueDirs() throws Exception {
++        Path dir1 = Files.createDirectory(tempDirectory.resolve("dir1"));
++        Path dir2 = Files.createDirectory(tempDirectory.resolve("dir2"));
++        Path dir3 = Files.createDirectory(tempDirectory.resolve("dir3"));
++        Path dir4 = Files.createDirectory(tempDirectory.resolve("dir4"));
++
++        Path file11 = createTempFile(dir1, "usrLib", "file11");
++        Path file12 = createTempFile(dir1, "usrLib", "file12");
++        Path file21 = createTempFile(dir2, "usrLib", "file21");
++        Path file31 = createTempFile(dir3, "usrLib", "file31");
++
++        javaLibraryPath = Stream.of(
++                file11,
++                file12,
++                file21,
++                file31,
++                dir3,
++                dir4
++        )
++                .map(Path::toFile)
++                .map(File::getAbsolutePath)
++                .collect(Collectors.joining(File.pathSeparator));
++
++        HashSet<File> expected = new HashSet<>();
++        expected.add(dir1.toFile());
++        expected.add(dir2.toFile());
++        expected.add(dir3.toFile());
++        expected.add(dir4.toFile());
++
++        Set<File> actual = createTestSubject().getUsrLibDirs();
++
++        assertEquals(expected, actual);
++    }
++
++    private AbstractNativeLibHandlingClassLoader createTestSubjectForOS() {
++        AbstractNativeLibHandlingClassLoader testSubject = new AbstractNativeLibHandlingClassLoader(new URL[0], nativeLibDirs, "unimportant") {
++            @Override
++            public boolean isOsWindows() {
++                return isOsWindows;
++            }
++
++            @Override
++            public boolean isOsMac() {
++                return isOsMaxOsx;
++            }
++
++            @Override
++            public boolean isOsLinuxUnix() {
++                return isOsLinux;
++            }
++
++            @Override
++            public String getJavaLibraryPath() {
++                return javaLibraryPath;
++            }
++        };
++
++        return testSubject;
++    }
++
++    private AbstractNativeLibHandlingClassLoader createTestSubject() {
++        AbstractNativeLibHandlingClassLoader testSubject = new AbstractNativeLibHandlingClassLoader(new URL[0], nativeLibDirs, "unimportant") {
++            @Override
++            public Path createTempCopy(String libname, String libraryOriginalPathString) {
++                return testSubjectHelper.createTempCopy(libname, libraryOriginalPathString);
++            }
++
++            @Override
++            public String findLibrary(String libname, File nativeLibDir) {
++                return testSubjectHelper.findLibrary(libname, nativeLibDir);
++            }
++
++            @Override
++            public boolean isOsWindows() {
++                return isOsWindows;
++            }
++
++            @Override
++            public boolean isOsMac() {
++                return isOsMaxOsx;
++            }
++
++            @Override
++            public boolean isOsLinuxUnix() {
++                return isOsLinux;
++            }
++
++            @Override
++            public String getJavaLibraryPath() {
++                return javaLibraryPath;
++            }
++        };
++
++        testSubject.nativeLibNameToPath.putAll(this.nativeLibNameToPath);
++
++        return testSubject;
++    }
++
++    private Path createTempFile(String suffix) throws IOException {
++        return createTempFile("", suffix);
++    }
++
++    private Path createTempFile(String prefix, String suffix) throws IOException {
++        return createTempFile(tempDirectory, prefix, suffix);
++    }
++
++    private Path createTempFile(Path tempDirectory, String prefix, String suffix) throws IOException {
++        return Files.createFile(tempDirectory.resolve(prefix + NATIVE_LIB_NAME + "." + suffix));
++    }
++}

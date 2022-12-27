@@ -1,0 +1,172 @@
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
+index 6b16408e27840..9b058101549f5 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
+@@ -30,7 +30,7 @@ import org.apache.spark.sql.execution
+ import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
+ import org.apache.spark.sql.execution.command._
+ import org.apache.spark.sql.execution.exchange.ShuffleExchange
+-import org.apache.spark.sql.execution.joins.{BuildLeft, BuildRight}
++import org.apache.spark.sql.execution.joins._
+ import org.apache.spark.sql.execution.streaming._
+ import org.apache.spark.sql.internal.SQLConf
+ import org.apache.spark.sql.streaming.StreamingQuery
+@@ -156,12 +156,12 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+ 
+       case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+         if canBuildRight(joinType) && canBroadcast(right) =>
+-        Seq(joins.BroadcastHashJoinExec(
++        Seq(BroadcastHashJoinExec(
+           leftKeys, rightKeys, joinType, BuildRight, condition, planLater(left), planLater(right)))
+ 
+       case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+         if canBuildLeft(joinType) && canBroadcast(left) =>
+-        Seq(joins.BroadcastHashJoinExec(
++        Seq(BroadcastHashJoinExec(
+           leftKeys, rightKeys, joinType, BuildLeft, condition, planLater(left), planLater(right)))
+ 
+       // --- ShuffledHashJoin ---------------------------------------------------------------------
+@@ -170,40 +170,40 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+          if !conf.preferSortMergeJoin && canBuildRight(joinType) && canBuildLocalHashMap(right)
+            && muchSmaller(right, left) ||
+            !RowOrdering.isOrderable(leftKeys) =>
+-        Seq(joins.ShuffledHashJoinExec(
++        Seq(ShuffledHashJoinExec(
+           leftKeys, rightKeys, joinType, BuildRight, condition, planLater(left), planLater(right)))
+ 
+       case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+          if !conf.preferSortMergeJoin && canBuildLeft(joinType) && canBuildLocalHashMap(left)
+            && muchSmaller(left, right) ||
+            !RowOrdering.isOrderable(leftKeys) =>
+-        Seq(joins.ShuffledHashJoinExec(
++        Seq(ShuffledHashJoinExec(
+           leftKeys, rightKeys, joinType, BuildLeft, condition, planLater(left), planLater(right)))
+ 
+       // --- SortMergeJoin ------------------------------------------------------------
+ 
+       case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+         if RowOrdering.isOrderable(leftKeys) =>
+-        joins.SortMergeJoinExec(
++        SortMergeJoinExec(
+           leftKeys, rightKeys, joinType, condition, planLater(left), planLater(right)) :: Nil
+ 
+       // --- Without joining keys ------------------------------------------------------------
+ 
+       // Pick BroadcastNestedLoopJoin if one side could be broadcasted
+-      case j @ logical.Join(left, right, joinType, condition)
++      case j @ Join(left, right, joinType, condition)
+           if canBuildRight(joinType) && canBroadcast(right) =>
+-        joins.BroadcastNestedLoopJoinExec(
++        BroadcastNestedLoopJoinExec(
+           planLater(left), planLater(right), BuildRight, joinType, condition) :: Nil
+-      case j @ logical.Join(left, right, joinType, condition)
++      case j @ Join(left, right, joinType, condition)
+           if canBuildLeft(joinType) && canBroadcast(left) =>
+-        joins.BroadcastNestedLoopJoinExec(
++        BroadcastNestedLoopJoinExec(
+           planLater(left), planLater(right), BuildLeft, joinType, condition) :: Nil
+ 
+       // Pick CartesianProduct for InnerJoin
+-      case logical.Join(left, right, _: InnerLike, condition) =>
+-        joins.CartesianProductExec(planLater(left), planLater(right), condition) :: Nil
++      case Join(left, right, _: InnerLike, condition) =>
++        CartesianProductExec(planLater(left), planLater(right), condition) :: Nil
+ 
+-      case logical.Join(left, right, joinType, condition) =>
++      case Join(left, right, joinType, condition) =>
+         val buildSide =
+           if (right.stats.sizeInBytes <= left.stats.sizeInBytes) {
+             BuildRight
+@@ -211,7 +211,7 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+             BuildLeft
+           }
+         // This join could be very slow or OOM
+-        joins.BroadcastNestedLoopJoinExec(
++        BroadcastNestedLoopJoinExec(
+           planLater(left), planLater(right), buildSide, joinType, condition) :: Nil
+ 
+       // --- Cases where this strategy does not apply ---------------------------------------------
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala
+index 5a25d72308370..c0df165245bee 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala
+@@ -244,4 +244,48 @@ class JoinBenchmark extends BenchmarkBase {
+      *shuffle hash join codegen=true           1773 / 1792          2.4         422.7       1.1X
+      */
+   }
++
++  ignore("cartesian product") {
++    val N = 1 << 12
++    sparkSession.conf.set("spark.sql.autoBroadcastJoinThreshold", 32767)
++    runBenchmark("cartesian product", N) {
++      val df1 = sparkSession.range(N).selectExpr("id + rand(10) as k1")
++      val df2 = sparkSession.range(N).selectExpr("id + rand(10) as k2")
++      val df = df1.join(df2, col("k1") >= (col("k2") - 1.0) && col("k1") <= (col("k2") + 1.0))
++      assert(df.queryExecution.sparkPlan.find(_.isInstanceOf[CartesianProductExec]).isDefined)
++      df.count()
++    }
++
++    /*
++     *Java HotSpot(TM) 64-Bit Server VM 1.8.0_60-b27 on Windows 7 6.1
++     *Intel64 Family 6 Model 94 Stepping 3, GenuineIntel
++     *cartesian product:                       Best/Avg Time(ms)    Rate(M/s)   Per Row(ns)   Relative
++     *------------------------------------------------------------------------------------------------
++     *cartesian product codegen=false               817 /  850          0.0      199394.7       1.0X
++     *cartesian product codegen=true                719 /  730          0.0      175493.6       1.1X
++     */
++  }
++
++  ignore("broadcast nested loop join") {
++    val N = 1 << 12
++    sparkSession.conf.set("spark.sql.autoBroadcastJoinThreshold", "10000000")
++    runBenchmark("nested loop join", N) {
++      val df1 = sparkSession.range(N).selectExpr("id as k", "id + rand(10) as k1")
++      val df2 = sparkSession.range(N / 2).selectExpr("id * 2 as k2", "id * 2 + rand(10) as k3")
++      val df = df1.join(df2,
++        col("k") === col("k2") || col("k1") >= (col("k3") - 1.0) && col("k1") <= (col("k3") + 1.0))
++      assert(df.queryExecution.sparkPlan.find(_.isInstanceOf[BroadcastNestedLoopJoinExec])
++        .isDefined)
++      df.count()
++    }
++
++    /*
++     *Java HotSpot(TM) 64-Bit Server VM 1.8.0_60-b27 on Windows 7 6.1
++     *Intel64 Family 6 Model 94 Stepping 3, GenuineIntel
++     *nested loop join:                        Best/Avg Time(ms)    Rate(M/s)   Per Row(ns)   Relative
++     *------------------------------------------------------------------------------------------------
++     *nested loop join codegen=false                413 /  446          0.0      100849.9       1.0X
++     *nested loop join codegen=true                 339 /  373          0.0       82703.1       1.2X
++     */
++  }
+ }
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/InnerJoinSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/InnerJoinSuite.scala
+index 4408ece112258..b75f27b950bb3 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/InnerJoinSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/InnerJoinSuite.scala
+@@ -91,7 +91,7 @@ class InnerJoinSuite extends SparkPlanTest with SharedSQLContext {
+         leftPlan: SparkPlan,
+         rightPlan: SparkPlan,
+         side: BuildSide) = {
+-      val broadcastJoin = joins.BroadcastHashJoinExec(
++      val broadcastJoin = BroadcastHashJoinExec(
+         leftKeys,
+         rightKeys,
+         Inner,
+@@ -109,7 +109,7 @@ class InnerJoinSuite extends SparkPlanTest with SharedSQLContext {
+         leftPlan: SparkPlan,
+         rightPlan: SparkPlan,
+         side: BuildSide) = {
+-      val shuffledHashJoin = joins.ShuffledHashJoinExec(leftKeys, rightKeys, Inner,
++      val shuffledHashJoin = ShuffledHashJoinExec(leftKeys, rightKeys, Inner,
+         side, None, leftPlan, rightPlan)
+       val filteredJoin =
+         boundCondition.map(FilterExec(_, shuffledHashJoin)).getOrElse(shuffledHashJoin)
+@@ -122,7 +122,7 @@ class InnerJoinSuite extends SparkPlanTest with SharedSQLContext {
+         boundCondition: Option[Expression],
+         leftPlan: SparkPlan,
+         rightPlan: SparkPlan) = {
+-      val sortMergeJoin = joins.SortMergeJoinExec(leftKeys, rightKeys, Inner, boundCondition,
++      val sortMergeJoin = SortMergeJoinExec(leftKeys, rightKeys, Inner, boundCondition,
+         leftPlan, rightPlan)
+       EnsureRequirements(spark.sessionState.conf).apply(sortMergeJoin)
+     }

@@ -1,0 +1,63 @@
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKAssign.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKAssign.java
+index 297e96e74979..b2e1e1eeb15f 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKAssign.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKAssign.java
+@@ -868,7 +868,15 @@ public static int transitionNode(ZooKeeperWatcher zkw, HRegionInfo region,
+     try {
+       rt = RegionTransition.createRegionTransition(
+           endState, region.getRegionName(), serverName, payload);
+-      if(!ZKUtil.setData(zkw, node, rt.toByteArray(), stat.getVersion())) {
++      boolean isDataSet;
++      try {
++        isDataSet = ZKUtil.setData(zkw, node, rt.toByteArray(), stat.getVersion());
++      } catch (KeeperException.BadVersionException e) {
++        isDataSet = false;
++        LOG.error("Received BadVersionException from ZK for " + encoded
++          + ", version: " + stat.getVersion());
++      }
++      if (!isDataSet) {
+         LOG.warn(zkw.prefix("Attempt to transition the " +
+         "unassigned node for " + encoded +
+         " from " + beginState + " to " + endState + " failed, " +
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/coordination/ZKSplitTransactionCoordination.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/coordination/ZKSplitTransactionCoordination.java
+index f6e96fa3073b..8bfbe363c227 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/coordination/ZKSplitTransactionCoordination.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/coordination/ZKSplitTransactionCoordination.java
+@@ -40,6 +40,9 @@ public class ZKSplitTransactionCoordination implements SplitTransactionCoordinat
+   private CoordinatedStateManager coordinationManager;
+   private final ZooKeeperWatcher watcher;
+ 
++  // max wait for split transaction - 100 times in a loop with 100 ms of thread sleep each time
++  private static final int SPLIT_WAIT_TIMEOUT = 100;
++
+   private static final Log LOG = LogFactory.getLog(ZKSplitTransactionCoordination.class);
+ 
+   public ZKSplitTransactionCoordination(CoordinatedStateManager coordinationProvider,
+@@ -163,6 +166,10 @@ public void waitForSplitTransaction(final RegionServerServices services, Region
+         }
+         Thread.sleep(100);
+         spins++;
++        if (spins > SPLIT_WAIT_TIMEOUT) {
++          throw new IOException("Waiting time for Split Transaction exceeded for region: "
++            + parent.getRegionInfo().getRegionNameAsString());
++        }
+         byte[] data = ZKAssign.getDataNoWatch(watcher, node, stat);
+         if (data == null) {
+           throw new IOException("Data is null, splitting node " + node + " no longer exists");
+@@ -222,9 +229,14 @@ public void completeSplitTransaction(final RegionServerServices services, Region
+     // Tell master about split by updating zk. If we fail, abort.
+     if (coordinationManager.getServer() != null) {
+       try {
+-        zstd.setZnodeVersion(transitionSplittingNode(parent.getRegionInfo(), a.getRegionInfo(),
++        int newNodeVersion = transitionSplittingNode(parent.getRegionInfo(), a.getRegionInfo(),
+           b.getRegionInfo(), coordinationManager.getServer().getServerName(), zstd,
+-          RS_ZK_REGION_SPLITTING, RS_ZK_REGION_SPLIT));
++          RS_ZK_REGION_SPLITTING, RS_ZK_REGION_SPLIT);
++        if (newNodeVersion == -1) {
++          throw new IOException("Notifying master of RS split failed for region: "
++            + parent.getRegionInfo().getRegionNameAsString());
++        }
++        zstd.setZnodeVersion(newNodeVersion);
+ 
+         int spins = 0;
+         // Now wait for the master to process the split. We know it's done

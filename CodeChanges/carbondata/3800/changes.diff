@@ -1,0 +1,195 @@
+diff --git a/core/src/main/java/org/apache/carbondata/core/metadata/SegmentFileStore.java b/core/src/main/java/org/apache/carbondata/core/metadata/SegmentFileStore.java
+index 335e0f50cf2..2f274c3c709 100644
+--- a/core/src/main/java/org/apache/carbondata/core/metadata/SegmentFileStore.java
++++ b/core/src/main/java/org/apache/carbondata/core/metadata/SegmentFileStore.java
+@@ -1141,6 +1141,23 @@ private static boolean pathExistsInPartitionSpec(List<PartitionSpec> partitionSp
+     return false;
+   }
+ 
++  /**
++   * Get the partition specs of the segment
++   * @param segmentId
++   * @param tablePath
++   * @return
++   * @throws IOException
++   */
++  public static List<PartitionSpec> getPartitionSpecs(String segmentId, String tablePath,
++      String segmentFilePath, String loadStartTime) throws IOException {
++    SegmentFileStore fileStore = new SegmentFileStore(tablePath, segmentFilePath);
++    List<PartitionSpec> partitionSpecs = fileStore.getPartitionSpecs();
++    for (PartitionSpec spec : partitionSpecs) {
++      spec.setUuid(segmentId + "_" + loadStartTime);
++    }
++    return partitionSpecs;
++  }
++
+   /**
+    * Get the partition specs of the segment
+    * @param segmentId
+diff --git a/hadoop/src/main/java/org/apache/carbondata/hadoop/api/CarbonOutputCommitter.java b/hadoop/src/main/java/org/apache/carbondata/hadoop/api/CarbonOutputCommitter.java
+index 02c8d4c5f91..4b8fc4346a4 100644
+--- a/hadoop/src/main/java/org/apache/carbondata/hadoop/api/CarbonOutputCommitter.java
++++ b/hadoop/src/main/java/org/apache/carbondata/hadoop/api/CarbonOutputCommitter.java
+@@ -232,10 +232,13 @@ private void commitJobFinal(JobContext context, CarbonLoadModel loadModel,
+     String segmentsToBeDeleted =
+         context.getConfiguration().get(CarbonTableOutputFormat.SEGMENTS_TO_BE_DELETED, "");
+     List<Segment> segmentDeleteList = Segment.toSegmentList(segmentsToBeDeleted.split(","), null);
+-    Set<Segment> segmentSet = new HashSet<>(
+-        new SegmentStatusManager(carbonTable.getAbsoluteTableIdentifier(),
+-            context.getConfiguration()).getValidAndInvalidSegments(carbonTable.isMV())
+-            .getValidSegments());
++    Set<Segment> segmentSet = new HashSet<>();
++    if (updateTime != null || uniqueId != null) {
++      segmentSet = new HashSet<>(
++          new SegmentStatusManager(carbonTable.getAbsoluteTableIdentifier(),
++              context.getConfiguration()).getValidAndInvalidSegments(carbonTable.isMV())
++                  .getValidSegments());
++    }
+     if (updateTime != null) {
+       CarbonUpdateUtil.updateTableMetadataStatus(segmentSet, carbonTable, updateTime, true,
+           segmentDeleteList);
+diff --git a/integration/spark/src/main/scala/org/apache/spark/rdd/CarbonMergeFilesRDD.scala b/integration/spark/src/main/scala/org/apache/spark/rdd/CarbonMergeFilesRDD.scala
+index ebac5e40321..695ee27f130 100644
+--- a/integration/spark/src/main/scala/org/apache/spark/rdd/CarbonMergeFilesRDD.scala
++++ b/integration/spark/src/main/scala/org/apache/spark/rdd/CarbonMergeFilesRDD.scala
+@@ -229,14 +229,15 @@ class CarbonMergeFilesRDD(
+ 
+   override def internalGetPartitions: Array[Partition] = {
+     if (isHivePartitionedTable) {
+-      val metadataDetails = SegmentStatusManager
+-        .readLoadMetadata(CarbonTablePath.getMetadataPath(carbonTable.getTablePath))
+       // in case of partition table make rdd partitions per partition of the carbon table
+       val partitionPaths: java.util.Map[String, java.util.List[String]] = new java.util.HashMap()
+       if (partitionInfo == null || partitionInfo.isEmpty) {
+         segments.foreach(segment => {
++          val loadStartTime = segmentFileNameToSegmentIdMap.get(segment)
++          val segmentFileName = SegmentFileStore.genSegmentFileName(
++            segment, loadStartTime) + CarbonTablePath.SEGMENT_EXT
+           val partitionSpecs = SegmentFileStore
+-            .getPartitionSpecs(segment, carbonTable.getTablePath, metadataDetails)
++            .getPartitionSpecs(segment, carbonTable.getTablePath, segmentFileName, loadStartTime)
+             .asScala.map(_.getLocation.toString)
+           partitionPaths.put(segment, partitionSpecs.asJava)
+         })
+diff --git a/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CarbonInsertIntoCommand.scala b/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CarbonInsertIntoCommand.scala
+index 8dfad7674c6..8c1491733ec 100644
+--- a/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CarbonInsertIntoCommand.scala
++++ b/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CarbonInsertIntoCommand.scala
+@@ -202,8 +202,6 @@ case class CarbonInsertIntoCommand(databaseNameOp: Option[String],
+           updateModel = None,
+           operationContext = operationContext)
+ 
+-      // Clean up the old invalid segment data before creating a new entry for new load.
+-      SegmentStatusManager.deleteLoadsAndUpdateMetadata(table, false, currPartitions)
+       // add the start entry for the new load in the table status file
+       if (!table.isHivePartitionTable) {
+         CarbonLoaderUtil.readAndUpdateLoadProgressInTableMeta(
+diff --git a/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CommonLoadUtils.scala b/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CommonLoadUtils.scala
+index 20d29d82d05..71649b8562e 100644
+--- a/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CommonLoadUtils.scala
++++ b/integration/spark/src/main/scala/org/apache/spark/sql/execution/command/management/CommonLoadUtils.scala
+@@ -126,7 +126,6 @@ object CommonLoadUtils {
+             TableIdentifier(tableName, databaseNameOp))).collect {
+           case l: LogicalRelation => l
+         }.head
+-      sizeInBytes = logicalPartitionRelation.relation.sizeInBytes
+       finalPartition = getCompletePartitionValues(partition, table)
+     }
+     (sizeInBytes, table, dbName, logicalPartitionRelation, finalPartition)
+@@ -843,8 +842,6 @@ object CommonLoadUtils {
+   def loadDataWithPartition(loadParams: CarbonLoadParams): Seq[Row] = {
+     val table = loadParams.carbonLoadModel.getCarbonDataLoadSchema.getCarbonTable
+     val catalogTable: CatalogTable = loadParams.logicalPartitionRelation.catalogTable.get
+-    // Clean up the already dropped partitioned data
+-    SegmentFileStore.cleanSegments(table, null, false)
+     CarbonUtils.threadSet("partition.operationcontext", loadParams.operationContext)
+     val attributes = if (loadParams.scanResultRDD.isDefined) {
+       // take the already re-arranged attributes
+@@ -1102,7 +1099,7 @@ object CommonLoadUtils {
+     val specs =
+       SegmentFileStore.getPartitionSpecs(loadParams.carbonLoadModel.getSegmentId,
+         loadParams.carbonLoadModel.getTablePath,
+-        SegmentStatusManager.readLoadMetadata(CarbonTablePath.getMetadataPath(table.getTablePath)))
++        loadParams.carbonLoadModel.getLoadMetadataDetails.asScala.toArray)
+     if (specs != null) {
+       specs.asScala.map { spec =>
+         Row(spec.getPartitions.asScala.mkString("/"), spec.getLocation.toString, spec.getUuid)
+diff --git a/integration/spark/src/main/scala/org/apache/spark/sql/execution/datasources/SparkCarbonTableFormat.scala b/integration/spark/src/main/scala/org/apache/spark/sql/execution/datasources/SparkCarbonTableFormat.scala
+index f1f0b809e23..225daf5d8d6 100644
+--- a/integration/spark/src/main/scala/org/apache/spark/sql/execution/datasources/SparkCarbonTableFormat.scala
++++ b/integration/spark/src/main/scala/org/apache/spark/sql/execution/datasources/SparkCarbonTableFormat.scala
+@@ -159,13 +159,16 @@ with Serializable {
+     if (currEntry != null) {
+       val loadEntry =
+         ObjectSerializationUtil.convertStringToObject(currEntry).asInstanceOf[LoadMetadataDetails]
+-      val details =
+-        SegmentStatusManager.readLoadMetadata(CarbonTablePath.getMetadataPath(model.getTablePath))
+       model.setSegmentId(loadEntry.getLoadName)
+       model.setFactTimeStamp(loadEntry.getLoadStartTime)
+-      val list = new util.ArrayList[LoadMetadataDetails](details.toList.asJava)
+-      list.add(loadEntry)
+-      model.setLoadMetadataDetails(list)
++      if (!isLoadDetailsContainTheCurrentEntry(
++        model.getLoadMetadataDetails.asScala.toArray, loadEntry)) {
++        val details =
++          SegmentStatusManager.readLoadMetadata(CarbonTablePath.getMetadataPath(model.getTablePath))
++        val list = new util.ArrayList[LoadMetadataDetails](details.toList.asJava)
++        list.add(loadEntry)
++        model.setLoadMetadataDetails(list)
++      }
+     }
+     // Set the update timestamp if user sets in case of update query. It needs to be updated
+     // in load status update time
+@@ -224,6 +227,14 @@ with Serializable {
+     }
+   }
+   override def equals(other: Any): Boolean = other.isInstanceOf[SparkCarbonTableFormat]
++
++  private def isLoadDetailsContainTheCurrentEntry(
++      loadDetails: Array[LoadMetadataDetails],
++      currentEntry: LoadMetadataDetails): Boolean = {
++    (loadDetails.length - 1 to 0).exists { index =>
++      loadDetails(index).getLoadName.equals(currentEntry.getLoadName)
++    }
++  }
+ }
+ 
+ case class CarbonSQLHadoopMapReduceCommitProtocol(jobId: String, path: String, isAppend: Boolean)
+diff --git a/integration/spark/src/main/scala/org/apache/spark/sql/secondaryindex/events/SILoadEventListenerForFailedSegments.scala b/integration/spark/src/main/scala/org/apache/spark/sql/secondaryindex/events/SILoadEventListenerForFailedSegments.scala
+index 2e6a441dae9..20713853342 100644
+--- a/integration/spark/src/main/scala/org/apache/spark/sql/secondaryindex/events/SILoadEventListenerForFailedSegments.scala
++++ b/integration/spark/src/main/scala/org/apache/spark/sql/secondaryindex/events/SILoadEventListenerForFailedSegments.scala
+@@ -64,7 +64,6 @@ class SILoadEventListenerForFailedSegments extends OperationEventListener with L
+           .lookupRelation(Some(carbonLoadModel.getDatabaseName),
+             carbonLoadModel.getTableName)(sparkSession).asInstanceOf[CarbonRelation].carbonTable
+         val indexMetadata = carbonTable.getIndexMetadata
+-        val mainTableDetails = SegmentStatusManager.readLoadMetadata(carbonTable.getMetadataPath)
+         val secondaryIndexProvider = IndexType.SI.getIndexProviderName
+         if (null != indexMetadata && null != indexMetadata.getIndexesMap &&
+             null != indexMetadata.getIndexesMap.get(secondaryIndexProvider)) {
+@@ -72,6 +71,8 @@ class SILoadEventListenerForFailedSegments extends OperationEventListener with L
+             .get(secondaryIndexProvider).keySet().asScala
+           // if there are no index tables for a given fact table do not perform any action
+           if (indexTables.nonEmpty) {
++            val mainTableDetails =
++              SegmentStatusManager.readLoadMetadata(carbonTable.getMetadataPath)
+             indexTables.foreach {
+               indexTableName =>
+                 val isLoadSIForFailedSegments = sparkSession.sessionState.catalog
+diff --git a/processing/src/main/java/org/apache/carbondata/processing/loading/TableProcessingOperations.java b/processing/src/main/java/org/apache/carbondata/processing/loading/TableProcessingOperations.java
+index 358295de079..f0f14d6fe27 100644
+--- a/processing/src/main/java/org/apache/carbondata/processing/loading/TableProcessingOperations.java
++++ b/processing/src/main/java/org/apache/carbondata/processing/loading/TableProcessingOperations.java
+@@ -54,11 +54,10 @@ public class TableProcessingOperations {
+   public static void deletePartialLoadDataIfExist(CarbonTable carbonTable,
+       final boolean isCompactionFlow) throws IOException {
+     String metaDataLocation = carbonTable.getMetadataPath();
+-    final LoadMetadataDetails[] details = SegmentStatusManager.readLoadMetadata(metaDataLocation);
+-
+     //delete folder which metadata no exist in tablestatus
+     String partitionPath = CarbonTablePath.getPartitionDir(carbonTable.getTablePath());
+     if (FileFactory.isFileExist(partitionPath)) {
++      final LoadMetadataDetails[] details = SegmentStatusManager.readLoadMetadata(metaDataLocation);
+       CarbonFile carbonFile = FileFactory.getCarbonFile(partitionPath);
+       CarbonFile[] listFiles = carbonFile.listFiles(new CarbonFileFilter() {
+         @Override

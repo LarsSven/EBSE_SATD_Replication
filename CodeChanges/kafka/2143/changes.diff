@@ -1,0 +1,203 @@
+diff --git a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/AbstractHerder.java b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/AbstractHerder.java
+index ba4894bc1e14..0288dda2a0ab 100644
+--- a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/AbstractHerder.java
++++ b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/AbstractHerder.java
+@@ -238,8 +238,7 @@ public ConnectorStateInfo.TaskState taskStatus(ConnectorTaskId id) {
+                 status.workerId(), status.trace());
+     }
+ 
+-    protected Map<String, ConfigValue> validateBasicConnectorConfig(Connector connector,
+-                                                                    ConfigDef configDef,
++    protected Map<String, ConfigValue> validateBasicConnectorConfig(ConfigDef configDef,
+                                                                     Map<String, String> config) {
+         return configDef.validateAll(config);
+     }
+@@ -263,7 +262,7 @@ public ConfigInfos validateConnectorConfig(Map<String, String> connectorConfig)
+         List<String> allGroups = new ArrayList<>();
+ 
+         // do basic connector validation (name, connector type, etc.)
+-        Map<String, ConfigValue> validatedConnectorConfig = validateBasicConnectorConfig(connector, connectorConfigDef, connectorConfig);
++        Map<String, ConfigValue> validatedConnectorConfig = validateBasicConnectorConfig(connectorConfigDef, connectorConfig);
+         configValues.addAll(validatedConnectorConfig.values());
+         configKeys.putAll(connectorConfigDef.configKeys());
+         allGroups.addAll(connectorConfigDef.groups());
+diff --git a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerConfig.java b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerConfig.java
+index fc3fe7182aa1..d17c7df39c33 100644
+--- a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerConfig.java
++++ b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerConfig.java
+@@ -43,6 +43,10 @@ public class WorkerConfig extends AbstractConfig {
+             + "than one, though, in case a server is down).";
+     public static final String BOOTSTRAP_SERVERS_DEFAULT = "localhost:9092";
+ 
++    public static final String CONNECT_PREFIX_CONFIG = "connect.prefix";
++    public static final String CONNECT_PREFIX_DOC = "Prefix for sink task consumer group.";
++    public static final String CONNECT_PREFIX_DEFAULT = "connect";
++
+     public static final String KEY_CONVERTER_CLASS_CONFIG = "key.converter";
+     public static final String KEY_CONVERTER_CLASS_DOC =
+             "Converter class used to convert between Kafka Connect format and the serialized form that is written to Kafka." +
+@@ -134,6 +138,8 @@ protected static ConfigDef baseConfigDef() {
+         return new ConfigDef()
+                 .define(BOOTSTRAP_SERVERS_CONFIG, Type.LIST, BOOTSTRAP_SERVERS_DEFAULT,
+                         Importance.HIGH, BOOTSTRAP_SERVERS_DOC)
++                .define(CONNECT_PREFIX_CONFIG, Type.STRING, CONNECT_PREFIX_DEFAULT,
++                        Importance.MEDIUM, CONNECT_PREFIX_DOC)
+                 .define(KEY_CONVERTER_CLASS_CONFIG, Type.CLASS,
+                         Importance.HIGH, KEY_CONVERTER_CLASS_DOC)
+                 .define(VALUE_CONVERTER_CLASS_CONFIG, Type.CLASS,
+diff --git a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerSinkTask.java b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerSinkTask.java
+index b941469246ed..6cebe672e0bd 100644
+--- a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerSinkTask.java
++++ b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/WorkerSinkTask.java
+@@ -367,9 +367,10 @@ private KafkaConsumer<byte[], byte[]> createConsumer() {
+         // and through to the task
+         Map<String, Object> props = new HashMap<>();
+ 
+-        props.put(ConsumerConfig.GROUP_ID_CONFIG, SinkUtils.consumerGroupId(id.connector()));
++        props.put(ConsumerConfig.GROUP_ID_CONFIG,
++            SinkUtils.consumerGroupId(workerConfig.getString(WorkerConfig.CONNECT_PREFIX_CONFIG), id.connector()));
+         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
+-                Utils.join(workerConfig.getList(WorkerConfig.BOOTSTRAP_SERVERS_CONFIG), ","));
++            Utils.join(workerConfig.getList(WorkerConfig.BOOTSTRAP_SERVERS_CONFIG), ","));
+         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArrayDeserializer");
+diff --git a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/distributed/DistributedHerder.java b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/distributed/DistributedHerder.java
+index ce2e72a8ffec..b625ecb1d63a 100644
+--- a/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/distributed/DistributedHerder.java
++++ b/connect/runtime/src/main/java/org/apache/kafka/connect/runtime/distributed/DistributedHerder.java
+@@ -17,12 +17,9 @@
+ 
+ package org.apache.kafka.connect.runtime.distributed;
+ 
+-import org.apache.kafka.common.config.ConfigDef;
+-import org.apache.kafka.common.config.ConfigValue;
+ import org.apache.kafka.common.errors.WakeupException;
+ import org.apache.kafka.common.utils.Time;
+ import org.apache.kafka.common.utils.Utils;
+-import org.apache.kafka.connect.connector.Connector;
+ import org.apache.kafka.connect.connector.ConnectorContext;
+ import org.apache.kafka.connect.errors.AlreadyExistsException;
+ import org.apache.kafka.connect.errors.ConnectException;
+@@ -39,12 +36,10 @@
+ import org.apache.kafka.connect.runtime.rest.entities.ConnectorInfo;
+ import org.apache.kafka.connect.runtime.rest.entities.TaskInfo;
+ import org.apache.kafka.connect.runtime.rest.errors.BadRequestException;
+-import org.apache.kafka.connect.sink.SinkConnector;
+ import org.apache.kafka.connect.storage.ConfigBackingStore;
+ import org.apache.kafka.connect.storage.StatusBackingStore;
+ import org.apache.kafka.connect.util.Callback;
+ import org.apache.kafka.connect.util.ConnectorTaskId;
+-import org.apache.kafka.connect.util.SinkUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -103,7 +98,6 @@ public class DistributedHerder extends AbstractHerder implements Runnable {
+ 
+     private final Time time;
+ 
+-    private final String workerGroupId;
+     private final int workerSyncTimeoutMs;
+     private final int workerUnsyncBackoffMs;
+ 
+@@ -154,7 +148,6 @@ public DistributedHerder(DistributedConfig config,
+         super(worker, workerId, statusBackingStore, configBackingStore);
+ 
+         this.time = time;
+-        this.workerGroupId = config.getString(DistributedConfig.GROUP_ID_CONFIG);
+         this.workerSyncTimeoutMs = config.getInt(DistributedConfig.WORKER_SYNC_TIMEOUT_MS_CONFIG);
+         this.workerUnsyncBackoffMs = config.getInt(DistributedConfig.WORKER_UNSYNC_BACKOFF_MS_CONFIG);
+         this.member = member != null ? member : new WorkerGroupMember(config, restUrl, this.configBackingStore, new RebalanceListener(), time);
+@@ -474,24 +467,6 @@ public Void call() throws Exception {
+         );
+     }
+ 
+-    @Override
+-    protected Map<String, ConfigValue> validateBasicConnectorConfig(Connector connector,
+-                                                                    ConfigDef configDef,
+-                                                                    Map<String, String> config) {
+-        Map<String, ConfigValue> validatedConfig = super.validateBasicConnectorConfig(connector, configDef, config);
+-        if (connector instanceof SinkConnector) {
+-            ConfigValue validatedName = validatedConfig.get(ConnectorConfig.NAME_CONFIG);
+-            String name = (String) validatedName.value();
+-
+-            if (workerGroupId.equals(SinkUtils.consumerGroupId(name))) {
+-                validatedName.addErrorMessage("Consumer group for sink connector named " + name +
+-                        " conflicts with Connect worker group " + workerGroupId);
+-            }
+-        }
+-        return validatedConfig;
+-    }
+-
+-
+     @Override
+     public void putConnectorConfig(final String connName, final Map<String, String> config, final boolean allowReplace,
+                                    final Callback<Created<ConnectorInfo>> callback) {
+diff --git a/connect/runtime/src/main/java/org/apache/kafka/connect/util/SinkUtils.java b/connect/runtime/src/main/java/org/apache/kafka/connect/util/SinkUtils.java
+index cb1ef48e5fd4..d0b7926d708a 100644
+--- a/connect/runtime/src/main/java/org/apache/kafka/connect/util/SinkUtils.java
++++ b/connect/runtime/src/main/java/org/apache/kafka/connect/util/SinkUtils.java
+@@ -20,8 +20,8 @@ public final class SinkUtils {
+ 
+     private SinkUtils() {}
+ 
+-    public static String consumerGroupId(String connector) {
+-        return "connect-" + connector;
++    public static String consumerGroupId(String prefix, String connector) {
++        return prefix + "-" + connector;
+     }
+ 
+ }
+diff --git a/connect/runtime/src/test/java/org/apache/kafka/connect/runtime/distributed/DistributedHerderTest.java b/connect/runtime/src/test/java/org/apache/kafka/connect/runtime/distributed/DistributedHerderTest.java
+index 5be2044b1af3..d0d23f993ee6 100644
+--- a/connect/runtime/src/test/java/org/apache/kafka/connect/runtime/distributed/DistributedHerderTest.java
++++ b/connect/runtime/src/test/java/org/apache/kafka/connect/runtime/distributed/DistributedHerderTest.java
+@@ -415,48 +415,6 @@ public void testCreateConnectorFailedCustomValidation() throws Exception {
+         PowerMock.verifyAll();
+     }
+ 
+-    @Test
+-    public void testConnectorNameConflictsWithWorkerGroupId() throws Exception {
+-        EasyMock.expect(member.memberId()).andStubReturn("leader");
+-        expectRebalance(1, Collections.<String>emptyList(), Collections.<ConnectorTaskId>emptyList());
+-        expectPostRebalanceCatchup(SNAPSHOT);
+-
+-        member.wakeup();
+-        PowerMock.expectLastCall();
+-
+-        Map<String, String> config = new HashMap<>(CONN2_CONFIG);
+-        config.put(ConnectorConfig.NAME_CONFIG, "test-group");
+-
+-        // config validation
+-        ConnectorFactory connectorFactoryMock = PowerMock.createMock(ConnectorFactory.class);
+-        EasyMock.expect(worker.getConnectorFactory()).andStubReturn(connectorFactoryMock);
+-        Connector connectorMock = PowerMock.createMock(SinkConnector.class);
+-        EasyMock.expect(connectorFactoryMock.newConnector(EasyMock.anyString())).andReturn(connectorMock);
+-        EasyMock.expect(connectorMock.config()).andReturn(new ConfigDef());
+-        EasyMock.expect(connectorMock.validate(config)).andReturn(new Config(Collections.<ConfigValue>emptyList()));
+-
+-        // CONN2 creation should fail because the worker group id (connect-test-group) conflicts with
+-        // the consumer group id we would use for this sink
+-
+-        Capture<Throwable> error = EasyMock.newCapture();
+-        putConnectorCallback.onCompletion(EasyMock.capture(error), EasyMock.isNull(Herder.Created.class));
+-        PowerMock.expectLastCall();
+-
+-        member.poll(EasyMock.anyInt());
+-        PowerMock.expectLastCall();
+-        // No immediate action besides this -- change will be picked up via the config log
+-
+-        PowerMock.replayAll();
+-
+-        herder.putConnectorConfig(CONN2, config, false, putConnectorCallback);
+-        herder.tick();
+-
+-        assertTrue(error.hasCaptured());
+-        assertTrue(error.getValue() instanceof BadRequestException);
+-
+-        PowerMock.verifyAll();
+-    }
+-
+     @Test
+     public void testCreateConnectorAlreadyExists() throws Exception {
+         EasyMock.expect(member.memberId()).andStubReturn("leader");

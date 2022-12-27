@@ -1,0 +1,3549 @@
+diff --git a/3rdparty/vta-hw b/3rdparty/vta-hw
+index 57db5a718c74..87ce9acfae55 160000
+--- a/3rdparty/vta-hw
++++ b/3rdparty/vta-hw
+@@ -1 +1 @@
+-Subproject commit 57db5a718c74a788c98120ebbe1230797be698c8
++Subproject commit 87ce9acfae550d1a487746e9d06c2e250076e54c
+diff --git a/python/gen_requirements.py b/python/gen_requirements.py
+index 6869e4829d98..3711a9912cf4 100755
+--- a/python/gen_requirements.py
++++ b/python/gen_requirements.py
+@@ -1,615 +1,616 @@
+-#!/usr/bin/env python3
+-# Licensed to the Apache Software Foundation (ASF) under one
+-# or more contributor license agreements.  See the NOTICE file
+-# distributed with this work for additional information
+-# regarding copyright ownership.  The ASF licenses this file
+-# to you under the Apache License, Version 2.0 (the
+-# "License"); you may not use this file except in compliance
+-# with the License.  You may obtain a copy of the License at
+-#
+-#   http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing,
+-# software distributed under the License is distributed on an
+-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-# KIND, either express or implied.  See the License for the
+-# specific language governing permissions and limitations
+-# under the License.
+-
+-"""TVM Python requriements.txt generator.
+-
+-This script generates a set of requirements.txt files (stored in `./requirements`) that describe
+-TVM's Python dependencies.
+-
+-## Pieces
+-
+-TVM can be roughly broken into these named pieces along the lines of Python dependencies:
+-
+-- "core": A core piece, which is intended to be buildable with very few external dependencies. Users
+-  can use Relay, compile models, and run autotuning with this part.
+-- "importer-<tool>": Model importers, which convert models defined in various other tools (i.e.
+-  TensorFlow, PyTorch, etc) into Relay models.
+-- Extra features (i.e. XGBoost in AutoTVM). These enhance TVM's functionality, but aren't required
+-  for basic operation.
+-
+-## What this tool does
+-
+-From these pieces, this tool builds:
+- - requirements/<name>.txt - Python dependencies for each named piece above, `<name>` is the same as
+-   the quoted piece name.
+- - requirements/all.txt - Consolidated Python dependencies for all pieces, excluding dev below.
+- - requirements/dev.txt - Python dependencies needed to develop TVM, such as lint and test tools.
+-
+-The data representing each piece is contained in the two maps below.
+-"""
+-
+-import argparse
+-import collections
+-import os
+-import re
+-import textwrap
+-import sys
+-import typing
+-
+-
+-RequirementsByPieceType = typing.List[typing.Tuple[str, typing.Tuple[str, typing.List[str]]]]
+-
+-
+-# Maps named TVM piece (see description above) to a list of names of Python packages. Please use
+-# alphabetical order for each package list, and do not add version constraints here!
+-REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
+-    # Base requirements needed to install tvm.
+-    (
+-        "core",
+-        (
+-            "Base requirements needed to install tvm",
+-            [
+-                "attrs",
+-                "cloudpickle",
+-                "decorator",
+-                "numpy",
+-                "psutil",
+-                "scipy",
+-                "synr",
+-                "tornado",
+-            ],
+-        ),
+-    ),
+-    # Relay frontends.
+-    (
+-        "importer-caffe2",
+-        (
+-            "Requirements for the Caffe2 importer",
+-            [
+-                "future",  # Hidden dependency of torch.
+-                "torch",
+-            ],
+-        ),
+-    ),
+-    ("importer-coreml", ("Requirements for the CoreML importer", ["coremltools"])),
+-    ("importer-darknet", ("Requirements for the DarkNet importer", ["opencv-python"])),
+-    (
+-        "importer-keras",
+-        ("Requirements for the Keras importer", ["tensorflow", "tensorflow-estimator"]),
+-    ),
+-    (
+-        "importer-onnx",
+-        (
+-            "Requirements for the ONNX importer",
+-            [
+-                "future",  # Hidden dependency of torch.
+-                "onnx",
+-                "onnxruntime",
+-                "torch",
+-                "torchvision",
+-            ],
+-        ),
+-    ),
+-    (
+-        "importer-pytorch",
+-        (
+-            "Requirements for the PyTorch importer",
+-            [
+-                "future",  # Hidden dependency of torch.
+-                "torch",
+-                "torchvision",
+-            ],
+-        ),
+-    ),
+-    (
+-        "importer-tensorflow",
+-        ("Requirements for the TensorFlow importer", ["tensorflow", "tensorflow-estimator"]),
+-    ),
+-    (
+-        "importer-tflite",
+-        ("Requirements for the TFLite importer", ["tensorflow", "tensorflow-estimator", "tflite"]),
+-    ),
+-    (
+-        "tvmc",
+-        (
+-            "Requirements for the tvmc command-line tool",
+-            [
+-                "future",  # Hidden dependency of torch.
+-                "onnx",
+-                "onnxruntime",
+-                "tensorflow",
+-                "tflite",
+-                "torch",
+-                "torchvision",
+-                "xgboost",
+-            ],
+-        ),
+-    ),
+-    # XGBoost, useful for autotuning on some targets.
+-    (
+-        "xgboost",
+-        (
+-            "Requirements for XGBoost autotuning",
+-            [
+-                "future",  # Hidden dependency of torch.
+-                "torch",
+-                "xgboost",
+-            ],
+-        ),
+-    ),
+-    # Development requirements
+-    (
+-        "dev",
+-        (
+-            "Requirements to develop TVM -- lint, docs, testing, etc.",
+-            [
+-                "astroid",  # pylint requirement, listed so a hard constraint can be included.
+-                "autodocsumm",
+-                "black",
+-                "commonmark",
+-                "cpplint",
+-                "docutils",
+-                "image",
+-                "matplotlib",
+-                "pillow",
+-                "pylint",
+-                "sphinx",
+-                "sphinx_autodoc_annotation",
+-                "sphinx_gallery",
+-                "sphinx_rtd_theme",
+-            ],
+-        ),
+-    ),
+-]
+-
+-ConstraintsType = typing.List[typing.Tuple[str, typing.Union[None, str]]]
+-
+-# Maps a named Python package (which should appear in REQUIREMENTS_BY_PIECE above) to a
+-# semver or pip version constraint. Semver constraints are translated into requirements.txt-friendly
+-# constraints.
+-#
+-# These constraints serve only to record technical reasons why a particular version can't be used.
+-# They are the default install_requires used in setup.py. These can be further narrowed to restrict
+-# dependencies to those tested or used in CI; however, that process is not done here.
+-#
+-# Policy for constraints listed here:
+-# 1. Each package specified in REQUIREMENTS_BY_PIECE must be included here.
+-# 2. If TVM will functionally break against an old version of a dependency, specify a >= relation
+-#    here. Include a comment linking to context or explaining why the constraint is in place.
+-CONSTRAINTS = [
+-    ("astroid", None),
+-    ("attrs", None),
+-    ("autodocsumm", None),
+-    ("black", None),
+-    ("cloudpickle", None),
+-    ("commonmark", ">=0.7.3"),  # From PR #213.
+-    ("coremltools", None),
+-    ("cpplint", None),
+-    ("decorator", None),
+-    ("docutils", None),
+-    ("future", None),
+-    ("image", None),
+-    ("matplotlib", None),
+-    ("numpy", None),
+-    ("onnx", None),
+-    ("onnxruntime", None),
+-    ("opencv-python", None),
+-    ("pillow", None),
+-    ("psutil", None),
+-    ("pylint", None),
+-    ("scipy", None),
+-    ("sphinx", None),
+-    ("sphinx_autodoc_annotation", None),
+-    ("sphinx_gallery", None),
+-    ("sphinx_rtd_theme", None),
+-    ("synr", ">=0.2.1"),  # Requires bugfix commit ee0b12a61c08f01604475f36ff37d4cb110bdc27
+-    ("tensorflow", None),
+-    ("tensorflow-estimator", None),
+-    ("tflite", None),
+-    ("torch", None),
+-    ("torchvision", None),
+-    ("tornado", None),
+-    ("xgboost", ">=1.1.0"),  # From PR #4953.
+-]
+-
+-################################################################################
+-# End of configuration options.
+-################################################################################
+-
+-
+-# Required keys in REQUIREMENTS_BY_PIECE.
+-REQUIRED_PIECES: typing.List[str] = ["core", "dev"]
+-
+-# Regex to validates piece names.
+-PIECE_REGEX: typing.Pattern = re.compile(r"^[a-z0-9][a-z0-9-]*", re.IGNORECASE)
+-
+-# Regex to match a constraint specification. Multiple constraints are not supported.
+-CONSTRAINT_REGEX: typing.Pattern = re.compile(r"(?:\^|\<|(?:~=)|(?:<=)|(?:==)|(?:>=)|\>)[^<>=\^,]+")
+-
+-# Regex for parsing semantic versions. See
+-# https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string
+-SEMVER_REGEX: typing.Pattern = re.compile(
+-    r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
+-)
+-
+-
+-def validate_requirements_by_piece() -> typing.List[str]:
+-    """Validate REQUIREMENTS_BY_PIECE, returning a list of problems.
+-
+-    Returns
+-    -------
+-    list[str] :
+-        A list of strings, each one describing a distinct problem with REQUIREMENTS_BY_PIECE.
+-    """
+-    problems = []
+-
+-    unseen_required_pieces = set(REQUIRED_PIECES)
+-    seen_pieces = set()
+-
+-    # Ensure that core is listed first and dev is listed last.
+-    saw_core = False
+-    saw_dev = False
+-
+-    if not isinstance(REQUIREMENTS_BY_PIECE, (list, tuple)):
+-        problems.append(f"must be list or tuple, see {REQUIREMENTS_BY_PIECE!r}")
+-        return problems
+-
+-    for piece, value in REQUIREMENTS_BY_PIECE:
+-        if not isinstance(piece, str):
+-            problems.append(f"piece {piece!r}: must be str")
+-            continue
+-
+-        if piece in unseen_required_pieces:
+-            unseen_required_pieces.remove(piece)
+-
+-        piece_lower = piece.lower()
+-        if piece_lower in seen_pieces:
+-            problems.append(f"piece {piece}: listed twice")
+-
+-        seen_pieces.add(piece_lower)
+-
+-        if not saw_core and piece != "core":
+-            problems.append(f'piece {piece}: must list after "core" (core must be first)')
+-        elif piece == "core":
+-            saw_core = True
+-
+-        if saw_dev:
+-            problems.append(f'piece {piece}: must list before "dev" (dev must be last)')
+-        elif piece == "dev":
+-            saw_dev = True
+-
+-        if not isinstance(value, (tuple, list)) or len(value) != 2:
+-            problems.append(
+-                f'piece {piece}: should be formatted like ("{piece}", ("<requirements.txt comment>", ["dep1", "dep2", ...])). got: {value!r}'
+-            )
+-            continue
+-
+-        description, deps = value
+-
+-        if not isinstance(description, str):
+-            problems.append(f"piece {piece}: description should be a string, got {description!r}")
+-
+-        if not isinstance(deps, (list, tuple)) or any(not isinstance(d, str) for d in deps):
+-            problems.append(f"piece {piece}: deps should be a list of strings, got {deps!r}")
+-            continue
+-
+-        if list(sorted(deps)) != list(deps):
+-            problems.append(
+-                f"piece {piece}: deps must be sorted. Correct order:\n  {list(sorted(deps))!r}"
+-            )
+-
+-        piece_deps = set()
+-        for d in deps:
+-            if CONSTRAINT_REGEX.search(d):
+-                problems.append(
+-                    f"piece {piece}: dependency {d} should not specify a version. "
+-                    "Add it to CONSTRAINTS instead."
+-                )
+-
+-            if d.lower() in piece_deps:
+-                problems.append(f"piece {piece}: dependency {d} listed twice")
+-
+-            piece_deps.add(d.lower())
+-
+-    extras_pieces = [
+-        k for (k, _) in REQUIREMENTS_BY_PIECE if k not in ("dev", "core") if isinstance(k, str)
+-    ]
+-    sorted_extras_pieces = list(sorted(extras_pieces))
+-    if sorted_extras_pieces != list(extras_pieces):
+-        problems.append(
+-            'pieces other than "core" and "dev" must appear in alphabetical order: '
+-            f"{sorted_extras_pieces}"
+-        )
+-
+-    return problems
+-
+-
+-def parse_semver(
+-    package: str, constraint: str, problems: typing.List[str]
+-) -> typing.Tuple[typing.List[str], int, int]:
+-    """Parse a semantic versioning constraint of the form "^X.[.Y[.Z[...]]]]"
+-
+-    Parameters
+-    ----------
+-    package : str
+-        Name of the package specifying this constraint, for reporting problems.
+-    constraint : str
+-        The semver constraint. Must start with "^"
+-    problems : List[str]
+-        A list of strings describing problems that have occurred validating the configuration.
+-        Problems encountered while validating constraint are appended to this list.
+-
+-    Returns
+-    -------
+-    tuple[list[str], int, int] :
+-        A 3-tuple. The first element is a list containing an entry for each component in the
+-        semver string (components separated by "."). The second element is the index of the
+-        component in the list which must not change to meet the semver constraint. The third element
+-        is an integer, the numeric value of the changing component (this can be non-trivial when
+-        the patch is the changing part but pre-, post-release, or build metadta.
+-
+-        See "Caret requirements" at https://python-poetry.org/docs/versions/.
+-    """
+-    m = SEMVER_REGEX.match(constraint[1:])
+-    if not m:
+-        problems.append(f"{package}: invalid semver constraint {constraint}")
+-        return [], 0, 0
+-
+-    min_ver_parts = [
+-        m.group("major"),
+-        m.group("minor"),
+-        m.group("patch")
+-        + (f"-{m.group('prerelease')}" if m.group("prerelease") else "")
+-        + (f"+{m.group('buildmetadata')}" if m.group("buildmetadata") else ""),
+-    ]
+-
+-    # Major/minor version handling is simple
+-    for i, p in enumerate(min_ver_parts[:2]):
+-        x = int(p.strip())
+-        if x:
+-            return min_ver_parts, i, x
+-
+-    # For patch version, consult only the numeric patch
+-    if m.group("patch"):
+-        patch_int = int(m.group("patch"))
+-        if patch_int or min_ver_parts[2] != m.group("patch"):
+-            return min_ver_parts, 2, patch_int
+-
+-    # All 0's
+-    return min_ver_parts, 0, 0
+-
+-
+-def validate_constraints() -> typing.List[str]:
+-    """Validate CONSTRAINTS, returning a list of problems found.
+-
+-    Returns
+-    -------
+-    list[str] :
+-        A list of strings, each one describing a distinct problem found in CONSTRAINTS.
+-    """
+-    problems = []
+-
+-    if not isinstance(CONSTRAINTS, (list, tuple)):
+-        problems.append(f"must be list or tuple, see: {CONSTRAINTS!r}")
+-
+-    seen_packages = set()
+-    all_deps = set()
+-    for _, (_, deps) in REQUIREMENTS_BY_PIECE:
+-        for d in deps:
+-            all_deps.add(d.lower())
+-
+-    for package, constraint in CONSTRAINTS:
+-        if package in seen_packages:
+-            problems.append(f"{package}: specified twice")
+-        seen_packages.add(package)
+-
+-        if package.lower() not in all_deps:
+-            problems.append(f"{package}: not specified in REQUIREMENTS_BY_PIECE")
+-
+-        if constraint is None:  # None is just a placeholder that allows for comments.
+-            continue
+-
+-        if not CONSTRAINT_REGEX.match(constraint):
+-            problems.append(
+-                f'{package}: constraint "{constraint}" does not look like a valid constraint'
+-            )
+-
+-        if constraint.startswith("^"):
+-            parse_semver(package, constraint, problems)
+-
+-    all_constrained_packages = [p for (p, _) in CONSTRAINTS]
+-    sorted_constrained_packages = list(sorted(all_constrained_packages))
+-    if sorted_constrained_packages != all_constrained_packages:
+-        problems.append(
+-            "CONSTRAINTS entries should be in this sorted order: " f"{sorted_constrained_packages}"
+-        )
+-
+-    return problems
+-
+-
+-class ValidationError(Exception):
+-    """Raised when a validation error occurs."""
+-
+-    @staticmethod
+-    def format_problems(config: str, problems: typing.List[str]) -> str:
+-        """Format a list of problems with a global config variable into human-readable output.
+-
+-        Parameters
+-        ----------
+-        config : str
+-            Name of the global configuration variable of concern. Prepended to the output.
+-        problems: list[str]
+-            A list of strings, each one a distinct problem with that config variable.
+-
+-        Returns
+-        -------
+-        str :
+-            A human-readable string suitable for console, listing the problems as bullet points.
+-        """
+-        formatted = []
+-        for p in problems:
+-            assert isinstance(p, str), f"problems element not a str: {p}"
+-            formatted.append(
+-                "\n".join(
+-                    textwrap.wrap(
+-                        f"{config}: {p}", width=80, initial_indent=" * ", subsequent_indent="   "
+-                    )
+-                )
+-            )
+-
+-        return "\n".join(formatted)
+-
+-    def __init__(self, config: str, problems: typing.List[str]):
+-        """Describes an error that occurs validating one of the global config variables.
+-
+-        Parameters
+-        ----------
+-        config : str
+-            Name of the global configuration variable of concern. Prepended to the output.
+-        problems: list[str]
+-            A list of strings, each one a distinct problem with that config variable.
+-        """
+-        super(ValidationError, self).__init__(self.format_problems(config, problems))
+-        self.problems = problems
+-
+-
+-def validate_or_raise():
+-    problems = validate_requirements_by_piece()
+-    if problems:
+-        raise ValidationError("REQUIREMENTS_BY_PIECE", problems)
+-
+-    problems = validate_constraints()
+-    if problems:
+-        raise ValidationError("CONSTRAINTS", problems)
+-
+-
+-def semver_to_requirements(dep: str, constraint: str, joined_deps: typing.List[str]):
+-    """Convert a SemVer-style constraint to a setuptools-compatible constraint.
+-
+-    Parameters
+-    ----------
+-    dep : str
+-        Name of the PyPI package to depend on.
+-    constraint : str
+-        The SemVer constraint, of the form "^<semver constraint>"
+-    joined_deps : list[str]
+-        A list of strings, each a setuptools-compatible constraint which could be written to
+-        a line in requirements.txt. The converted constraint is appended to this list.
+-    """
+-    problems: typing.List[str] = []
+-    min_ver_parts, fixed_index, fixed_part = parse_semver(dep, constraint, problems)
+-    text_problems = "\n" + "\n".join(f" * {p}" for p in problems)
+-    assert (
+-        not problems
+-    ), f"should not happen: validated semver {constraint} parses with problems:{text_problems}"
+-
+-    max_ver_parts = (
+-        min_ver_parts[:fixed_index]
+-        + [str(fixed_part + 1)]
+-        + ["0" for _ in min_ver_parts[fixed_index + 1 :]]
+-    )
+-    joined_deps.append(f'{dep}>={".".join(min_ver_parts)},<{".".join(max_ver_parts)}')
+-
+-
+-def join_requirements() -> typing.Dict[str, typing.Tuple[str, typing.List[str]]]:
+-    """Validate, then join REQUIRMENTS_BY_PIECE against CONSTRAINTS and return the result.
+-
+-    Returns
+-    -------
+-    An OrderedDict containing REQUIREMENTS_BY_PIECE, except any dependency mentioned in CONSTRAINTS
+-    is replaced by a setuptools-compatible constraint.
+-    """
+-    validate_or_raise()
+-
+-    constraints_map = collections.OrderedDict([(p.lower(), c) for (p, c) in CONSTRAINTS])
+-
+-    to_return = collections.OrderedDict()
+-    all_deps = set()
+-    for piece, (description, deps) in REQUIREMENTS_BY_PIECE:
+-        joined_deps = []
+-        for d in deps:
+-            constraint = constraints_map.get(d.lower())
+-            if constraint is None:
+-                joined_deps.append(d)
+-                continue
+-
+-            if constraint[0] == "^":
+-                semver_to_requirements(d, constraint, joined_deps)
+-            else:
+-                joined_deps.append(f"{d}{constraint}")
+-
+-        if piece != "dev":
+-            all_deps.update(joined_deps)
+-
+-        to_return[piece] = (description, joined_deps)
+-
+-    to_return["all-prod"] = (
+-        "Combined dependencies for all TVM pieces, excluding dev",
+-        list(sorted(all_deps)),
+-    )
+-
+-    return to_return
+-
+-
+-def join_and_write_requirements(args: argparse.Namespace):
+-    try:
+-        joined_deps = join_requirements()
+-    except ValidationError as e:
+-        print(f"ERROR: invalid requirements configuration in {__file__}:", file=sys.stderr)
+-        print(str(e), file=sys.stderr)
+-        sys.exit(2)
+-
+-    if args.lint:
+-        sys.exit(0)
+-
+-    output_dir = os.path.join(os.path.dirname(__file__), "requirements")
+-    if not os.path.exists(output_dir):
+-        os.makedirs(output_dir)
+-    elif not os.path.isdir(output_dir):
+-        print(
+-            f"ERROR: output directory {output_dir} exists but is not a dir. Delete it",
+-            file=sys.stderr,
+-        )
+-        sys.exit(2)
+-
+-    for piece, (description, deps) in joined_deps.items():
+-        with open(os.path.join(output_dir, f"{piece}.txt"), "w") as f:
+-            f.write(
+-                f"# AUTOGENERATED by python/gen_requirements.py{os.linesep}"
+-                f"#{os.linesep}"
+-                f"# {description}{os.linesep}"
+-            )
+-            for d in deps:
+-                f.write(f"{d}{os.linesep}")
+-
+-
+-def parse_args() -> argparse.Namespace:
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument(
+-        "--lint", action="store_true", help="Just lint dependencies, don't generate anything"
+-    )
+-    return parser.parse_args()
+-
+-
+-def main():
+-    args = parse_args()
+-    join_and_write_requirements(args)
+-
+-
+-if __name__ == "__main__":
+-    main()
++#!/usr/bin/env python3
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++"""TVM Python requriements.txt generator.
++
++This script generates a set of requirements.txt files (stored in `./requirements`) that describe
++TVM's Python dependencies.
++
++## Pieces
++
++TVM can be roughly broken into these named pieces along the lines of Python dependencies:
++
++- "core": A core piece, which is intended to be buildable with very few external dependencies. Users
++  can use Relay, compile models, and run autotuning with this part.
++- "importer-<tool>": Model importers, which convert models defined in various other tools (i.e.
++  TensorFlow, PyTorch, etc) into Relay models.
++- Extra features (i.e. XGBoost in AutoTVM). These enhance TVM's functionality, but aren't required
++  for basic operation.
++
++## What this tool does
++
++From these pieces, this tool builds:
++ - requirements/<name>.txt - Python dependencies for each named piece above, `<name>` is the same as
++   the quoted piece name.
++ - requirements/all.txt - Consolidated Python dependencies for all pieces, excluding dev below.
++ - requirements/dev.txt - Python dependencies needed to develop TVM, such as lint and test tools.
++
++The data representing each piece is contained in the two maps below.
++"""
++
++import argparse
++import collections
++import os
++import re
++import textwrap
++import sys
++import typing
++
++
++RequirementsByPieceType = typing.List[typing.Tuple[str, typing.Tuple[str, typing.List[str]]]]
++
++
++# Maps named TVM piece (see description above) to a list of names of Python packages. Please use
++# alphabetical order for each package list, and do not add version constraints here!
++REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
++    # Base requirements needed to install tvm.
++    (
++        "core",
++        (
++            "Base requirements needed to install tvm",
++            [
++                "attrs",
++                "cloudpickle",
++                "decorator",
++                "numpy",
++                "psutil",
++                "scipy",
++                "sklearn",
++                "synr",
++                "tornado",
++            ],
++        ),
++    ),
++    # Relay frontends.
++    (
++        "importer-caffe2",
++        (
++            "Requirements for the Caffe2 importer",
++            [
++                "future",  # Hidden dependency of torch.
++                "torch",
++            ],
++        ),
++    ),
++    ("importer-coreml", ("Requirements for the CoreML importer", ["coremltools"])),
++    ("importer-darknet", ("Requirements for the DarkNet importer", ["opencv-python"])),
++    (
++        "importer-keras",
++        ("Requirements for the Keras importer", ["tensorflow", "tensorflow-estimator"]),
++    ),
++    (
++        "importer-onnx",
++        (
++            "Requirements for the ONNX importer",
++            [
++                "future",  # Hidden dependency of torch.
++                "onnx",
++                "onnxruntime",
++                "torch",
++                "torchvision",
++            ],
++        ),
++    ),
++    (
++        "importer-pytorch",
++        (
++            "Requirements for the PyTorch importer",
++            [
++                "future",  # Hidden dependency of torch.
++                "torch",
++                "torchvision",
++            ],
++        ),
++    ),
++    (
++        "importer-tensorflow",
++        ("Requirements for the TensorFlow importer", ["tensorflow", "tensorflow-estimator"]),
++    ),
++    (
++        "importer-tflite",
++        ("Requirements for the TFLite importer", ["tensorflow", "tensorflow-estimator", "tflite"]),
++    ),
++    (
++        "tvmc",
++        (
++            "Requirements for the tvmc command-line tool",
++            [
++                "future",  # Hidden dependency of torch.
++                "onnx",
++                "onnxruntime",
++                "tensorflow",
++                "tflite",
++                "torch",
++                "torchvision",
++                "xgboost",
++            ],
++        ),
++    ),
++    # XGBoost, useful for autotuning on some targets.
++    (
++        "xgboost",
++        (
++            "Requirements for XGBoost autotuning",
++            [
++                "future",  # Hidden dependency of torch.
++                "torch",
++                "xgboost",
++            ],
++        ),
++    ),
++    # Development requirements
++    (
++        "dev",
++        (
++            "Requirements to develop TVM -- lint, docs, testing, etc.",
++            [
++                "astroid",  # pylint requirement, listed so a hard constraint can be included.
++                "autodocsumm",
++                "black",
++                "commonmark",
++                "cpplint",
++                "docutils",
++                "image",
++                "matplotlib",
++                "pillow",
++                "pylint",
++                "sphinx",
++                "sphinx_autodoc_annotation",
++                "sphinx_gallery",
++                "sphinx_rtd_theme",
++            ],
++        ),
++    ),
++]
++
++ConstraintsType = typing.List[typing.Tuple[str, typing.Union[None, str]]]
++
++# Maps a named Python package (which should appear in REQUIREMENTS_BY_PIECE above) to a
++# semver or pip version constraint. Semver constraints are translated into requirements.txt-friendly
++# constraints.
++#
++# These constraints serve only to record technical reasons why a particular version can't be used.
++# They are the default install_requires used in setup.py. These can be further narrowed to restrict
++# dependencies to those tested or used in CI; however, that process is not done here.
++#
++# Policy for constraints listed here:
++# 1. Each package specified in REQUIREMENTS_BY_PIECE must be included here.
++# 2. If TVM will functionally break against an old version of a dependency, specify a >= relation
++#    here. Include a comment linking to context or explaining why the constraint is in place.
++CONSTRAINTS = [
++    ("astroid", None),
++    ("attrs", None),
++    ("autodocsumm", None),
++    ("black", None),
++    ("cloudpickle", None),
++    ("commonmark", ">=0.7.3"),  # From PR #213.
++    ("coremltools", None),
++    ("cpplint", None),
++    ("decorator", None),
++    ("docutils", None),
++    ("future", None),
++    ("image", None),
++    ("matplotlib", None),
++    ("numpy", None),
++    ("onnx", None),
++    ("onnxruntime", None),
++    ("opencv-python", None),
++    ("pillow", None),
++    ("psutil", None),
++    ("pylint", None),
++    ("scipy", None),
++    ("sphinx", None),
++    ("sphinx_autodoc_annotation", None),
++    ("sphinx_gallery", None),
++    ("sphinx_rtd_theme", None),
++    ("synr", ">=0.2.1"),  # Requires bugfix commit ee0b12a61c08f01604475f36ff37d4cb110bdc27
++    ("tensorflow", None),
++    ("tensorflow-estimator", None),
++    ("tflite", None),
++    ("torch", None),
++    ("torchvision", None),
++    ("tornado", None),
++    ("xgboost", ">=1.1.0"),  # From PR #4953.
++]
++
++################################################################################
++# End of configuration options.
++################################################################################
++
++
++# Required keys in REQUIREMENTS_BY_PIECE.
++REQUIRED_PIECES: typing.List[str] = ["core", "dev"]
++
++# Regex to validates piece names.
++PIECE_REGEX: typing.Pattern = re.compile(r"^[a-z0-9][a-z0-9-]*", re.IGNORECASE)
++
++# Regex to match a constraint specification. Multiple constraints are not supported.
++CONSTRAINT_REGEX: typing.Pattern = re.compile(r"(?:\^|\<|(?:~=)|(?:<=)|(?:==)|(?:>=)|\>)[^<>=\^,]+")
++
++# Regex for parsing semantic versions. See
++# https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string
++SEMVER_REGEX: typing.Pattern = re.compile(
++    r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
++)
++
++
++def validate_requirements_by_piece() -> typing.List[str]:
++    """Validate REQUIREMENTS_BY_PIECE, returning a list of problems.
++
++    Returns
++    -------
++    list[str] :
++        A list of strings, each one describing a distinct problem with REQUIREMENTS_BY_PIECE.
++    """
++    problems = []
++
++    unseen_required_pieces = set(REQUIRED_PIECES)
++    seen_pieces = set()
++
++    # Ensure that core is listed first and dev is listed last.
++    saw_core = False
++    saw_dev = False
++
++    if not isinstance(REQUIREMENTS_BY_PIECE, (list, tuple)):
++        problems.append(f"must be list or tuple, see {REQUIREMENTS_BY_PIECE!r}")
++        return problems
++
++    for piece, value in REQUIREMENTS_BY_PIECE:
++        if not isinstance(piece, str):
++            problems.append(f"piece {piece!r}: must be str")
++            continue
++
++        if piece in unseen_required_pieces:
++            unseen_required_pieces.remove(piece)
++
++        piece_lower = piece.lower()
++        if piece_lower in seen_pieces:
++            problems.append(f"piece {piece}: listed twice")
++
++        seen_pieces.add(piece_lower)
++
++        if not saw_core and piece != "core":
++            problems.append(f'piece {piece}: must list after "core" (core must be first)')
++        elif piece == "core":
++            saw_core = True
++
++        if saw_dev:
++            problems.append(f'piece {piece}: must list before "dev" (dev must be last)')
++        elif piece == "dev":
++            saw_dev = True
++
++        if not isinstance(value, (tuple, list)) or len(value) != 2:
++            problems.append(
++                f'piece {piece}: should be formatted like ("{piece}", ("<requirements.txt comment>", ["dep1", "dep2", ...])). got: {value!r}'
++            )
++            continue
++
++        description, deps = value
++
++        if not isinstance(description, str):
++            problems.append(f"piece {piece}: description should be a string, got {description!r}")
++
++        if not isinstance(deps, (list, tuple)) or any(not isinstance(d, str) for d in deps):
++            problems.append(f"piece {piece}: deps should be a list of strings, got {deps!r}")
++            continue
++
++        if list(sorted(deps)) != list(deps):
++            problems.append(
++                f"piece {piece}: deps must be sorted. Correct order:\n  {list(sorted(deps))!r}"
++            )
++
++        piece_deps = set()
++        for d in deps:
++            if CONSTRAINT_REGEX.search(d):
++                problems.append(
++                    f"piece {piece}: dependency {d} should not specify a version. "
++                    "Add it to CONSTRAINTS instead."
++                )
++
++            if d.lower() in piece_deps:
++                problems.append(f"piece {piece}: dependency {d} listed twice")
++
++            piece_deps.add(d.lower())
++
++    extras_pieces = [
++        k for (k, _) in REQUIREMENTS_BY_PIECE if k not in ("dev", "core") if isinstance(k, str)
++    ]
++    sorted_extras_pieces = list(sorted(extras_pieces))
++    if sorted_extras_pieces != list(extras_pieces):
++        problems.append(
++            'pieces other than "core" and "dev" must appear in alphabetical order: '
++            f"{sorted_extras_pieces}"
++        )
++
++    return problems
++
++
++def parse_semver(
++    package: str, constraint: str, problems: typing.List[str]
++) -> typing.Tuple[typing.List[str], int, int]:
++    """Parse a semantic versioning constraint of the form "^X.[.Y[.Z[...]]]]"
++
++    Parameters
++    ----------
++    package : str
++        Name of the package specifying this constraint, for reporting problems.
++    constraint : str
++        The semver constraint. Must start with "^"
++    problems : List[str]
++        A list of strings describing problems that have occurred validating the configuration.
++        Problems encountered while validating constraint are appended to this list.
++
++    Returns
++    -------
++    tuple[list[str], int, int] :
++        A 3-tuple. The first element is a list containing an entry for each component in the
++        semver string (components separated by "."). The second element is the index of the
++        component in the list which must not change to meet the semver constraint. The third element
++        is an integer, the numeric value of the changing component (this can be non-trivial when
++        the patch is the changing part but pre-, post-release, or build metadta.
++
++        See "Caret requirements" at https://python-poetry.org/docs/versions/.
++    """
++    m = SEMVER_REGEX.match(constraint[1:])
++    if not m:
++        problems.append(f"{package}: invalid semver constraint {constraint}")
++        return [], 0, 0
++
++    min_ver_parts = [
++        m.group("major"),
++        m.group("minor"),
++        m.group("patch")
++        + (f"-{m.group('prerelease')}" if m.group("prerelease") else "")
++        + (f"+{m.group('buildmetadata')}" if m.group("buildmetadata") else ""),
++    ]
++
++    # Major/minor version handling is simple
++    for i, p in enumerate(min_ver_parts[:2]):
++        x = int(p.strip())
++        if x:
++            return min_ver_parts, i, x
++
++    # For patch version, consult only the numeric patch
++    if m.group("patch"):
++        patch_int = int(m.group("patch"))
++        if patch_int or min_ver_parts[2] != m.group("patch"):
++            return min_ver_parts, 2, patch_int
++
++    # All 0's
++    return min_ver_parts, 0, 0
++
++
++def validate_constraints() -> typing.List[str]:
++    """Validate CONSTRAINTS, returning a list of problems found.
++
++    Returns
++    -------
++    list[str] :
++        A list of strings, each one describing a distinct problem found in CONSTRAINTS.
++    """
++    problems = []
++
++    if not isinstance(CONSTRAINTS, (list, tuple)):
++        problems.append(f"must be list or tuple, see: {CONSTRAINTS!r}")
++
++    seen_packages = set()
++    all_deps = set()
++    for _, (_, deps) in REQUIREMENTS_BY_PIECE:
++        for d in deps:
++            all_deps.add(d.lower())
++
++    for package, constraint in CONSTRAINTS:
++        if package in seen_packages:
++            problems.append(f"{package}: specified twice")
++        seen_packages.add(package)
++
++        if package.lower() not in all_deps:
++            problems.append(f"{package}: not specified in REQUIREMENTS_BY_PIECE")
++
++        if constraint is None:  # None is just a placeholder that allows for comments.
++            continue
++
++        if not CONSTRAINT_REGEX.match(constraint):
++            problems.append(
++                f'{package}: constraint "{constraint}" does not look like a valid constraint'
++            )
++
++        if constraint.startswith("^"):
++            parse_semver(package, constraint, problems)
++
++    all_constrained_packages = [p for (p, _) in CONSTRAINTS]
++    sorted_constrained_packages = list(sorted(all_constrained_packages))
++    if sorted_constrained_packages != all_constrained_packages:
++        problems.append(
++            "CONSTRAINTS entries should be in this sorted order: " f"{sorted_constrained_packages}"
++        )
++
++    return problems
++
++
++class ValidationError(Exception):
++    """Raised when a validation error occurs."""
++
++    @staticmethod
++    def format_problems(config: str, problems: typing.List[str]) -> str:
++        """Format a list of problems with a global config variable into human-readable output.
++
++        Parameters
++        ----------
++        config : str
++            Name of the global configuration variable of concern. Prepended to the output.
++        problems: list[str]
++            A list of strings, each one a distinct problem with that config variable.
++
++        Returns
++        -------
++        str :
++            A human-readable string suitable for console, listing the problems as bullet points.
++        """
++        formatted = []
++        for p in problems:
++            assert isinstance(p, str), f"problems element not a str: {p}"
++            formatted.append(
++                "\n".join(
++                    textwrap.wrap(
++                        f"{config}: {p}", width=80, initial_indent=" * ", subsequent_indent="   "
++                    )
++                )
++            )
++
++        return "\n".join(formatted)
++
++    def __init__(self, config: str, problems: typing.List[str]):
++        """Describes an error that occurs validating one of the global config variables.
++
++        Parameters
++        ----------
++        config : str
++            Name of the global configuration variable of concern. Prepended to the output.
++        problems: list[str]
++            A list of strings, each one a distinct problem with that config variable.
++        """
++        super(ValidationError, self).__init__(self.format_problems(config, problems))
++        self.problems = problems
++
++
++def validate_or_raise():
++    problems = validate_requirements_by_piece()
++    if problems:
++        raise ValidationError("REQUIREMENTS_BY_PIECE", problems)
++
++    problems = validate_constraints()
++    if problems:
++        raise ValidationError("CONSTRAINTS", problems)
++
++
++def semver_to_requirements(dep: str, constraint: str, joined_deps: typing.List[str]):
++    """Convert a SemVer-style constraint to a setuptools-compatible constraint.
++
++    Parameters
++    ----------
++    dep : str
++        Name of the PyPI package to depend on.
++    constraint : str
++        The SemVer constraint, of the form "^<semver constraint>"
++    joined_deps : list[str]
++        A list of strings, each a setuptools-compatible constraint which could be written to
++        a line in requirements.txt. The converted constraint is appended to this list.
++    """
++    problems: typing.List[str] = []
++    min_ver_parts, fixed_index, fixed_part = parse_semver(dep, constraint, problems)
++    text_problems = "\n" + "\n".join(f" * {p}" for p in problems)
++    assert (
++        not problems
++    ), f"should not happen: validated semver {constraint} parses with problems:{text_problems}"
++
++    max_ver_parts = (
++        min_ver_parts[:fixed_index]
++        + [str(fixed_part + 1)]
++        + ["0" for _ in min_ver_parts[fixed_index + 1 :]]
++    )
++    joined_deps.append(f'{dep}>={".".join(min_ver_parts)},<{".".join(max_ver_parts)}')
++
++
++def join_requirements() -> typing.Dict[str, typing.Tuple[str, typing.List[str]]]:
++    """Validate, then join REQUIRMENTS_BY_PIECE against CONSTRAINTS and return the result.
++
++    Returns
++    -------
++    An OrderedDict containing REQUIREMENTS_BY_PIECE, except any dependency mentioned in CONSTRAINTS
++    is replaced by a setuptools-compatible constraint.
++    """
++    validate_or_raise()
++
++    constraints_map = collections.OrderedDict([(p.lower(), c) for (p, c) in CONSTRAINTS])
++
++    to_return = collections.OrderedDict()
++    all_deps = set()
++    for piece, (description, deps) in REQUIREMENTS_BY_PIECE:
++        joined_deps = []
++        for d in deps:
++            constraint = constraints_map.get(d.lower())
++            if constraint is None:
++                joined_deps.append(d)
++                continue
++
++            if constraint[0] == "^":
++                semver_to_requirements(d, constraint, joined_deps)
++            else:
++                joined_deps.append(f"{d}{constraint}")
++
++        if piece != "dev":
++            all_deps.update(joined_deps)
++
++        to_return[piece] = (description, joined_deps)
++
++    to_return["all-prod"] = (
++        "Combined dependencies for all TVM pieces, excluding dev",
++        list(sorted(all_deps)),
++    )
++
++    return to_return
++
++
++def join_and_write_requirements(args: argparse.Namespace):
++    try:
++        joined_deps = join_requirements()
++    except ValidationError as e:
++        print(f"ERROR: invalid requirements configuration in {__file__}:", file=sys.stderr)
++        print(str(e), file=sys.stderr)
++        sys.exit(2)
++
++    if args.lint:
++        sys.exit(0)
++
++    output_dir = os.path.join(os.path.dirname(__file__), "requirements")
++    if not os.path.exists(output_dir):
++        os.makedirs(output_dir)
++    elif not os.path.isdir(output_dir):
++        print(
++            f"ERROR: output directory {output_dir} exists but is not a dir. Delete it",
++            file=sys.stderr,
++        )
++        sys.exit(2)
++
++    for piece, (description, deps) in joined_deps.items():
++        with open(os.path.join(output_dir, f"{piece}.txt"), "w") as f:
++            f.write(
++                f"# AUTOGENERATED by python/gen_requirements.py{os.linesep}"
++                f"#{os.linesep}"
++                f"# {description}{os.linesep}"
++            )
++            for d in deps:
++                f.write(f"{d}{os.linesep}")
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--lint", action="store_true", help="Just lint dependencies, don't generate anything"
++    )
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    join_and_write_requirements(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tvm/autotvm/measure/measure_methods.py b/python/tvm/autotvm/measure/measure_methods.py
+index 62fd811dc1ec..2e2c9ab48158 100644
+--- a/python/tvm/autotvm/measure/measure_methods.py
++++ b/python/tvm/autotvm/measure/measure_methods.py
+@@ -1,744 +1,794 @@
+-# Licensed to the Apache Software Foundation (ASF) under one
+-# or more contributor license agreements.  See the NOTICE file
+-# distributed with this work for additional information
+-# regarding copyright ownership.  The ASF licenses this file
+-# to you under the Apache License, Version 2.0 (the
+-# "License"); you may not use this file except in compliance
+-# with the License.  You may obtain a copy of the License at
+-#
+-#   http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing,
+-# software distributed under the License is distributed on an
+-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-# KIND, either express or implied.  See the License for the
+-# specific language governing permissions and limitations
+-# under the License.
+-# pylint: disable=invalid-name,too-many-function-args,too-many-nested-blocks
+-"""
+-Functions that run on executor for measurement.
+-
+-These functions are responsible for building the tvm module, uploading it to
+-remote devices, recording the running time costs, and checking the correctness of the output.
+-"""
+-
+-import contextlib
+-import logging
+-import shutil
+-import os
+-import threading
+-import time
+-import typing
+-from random import getrandbits
+-from collections import namedtuple
+-import tempfile
+-import numpy as np
+-
+-import tvm._ffi
+-import tvm.ir.transform
+-from tvm import nd, rpc as _rpc
+-from tvm.error import TVMError
+-from tvm.driver import build
+-from tvm.contrib import nvcc, ndk, tar
+-
+-from ..utils import get_const_tuple
+-from ..env import AutotvmGlobalScope
+-from ..task.space import InstantiationError
+-
+-from .measure import MeasureResult, MeasureErrorNo, Builder, Runner
+-from .local_executor import LocalExecutor
+-
+-logger = logging.getLogger("autotvm")
+-
+-
+-class BuildResult(namedtuple("BuildResult", ("filename", "arg_info", "error", "time_cost"))):
+-    """
+-    Stores all the necessary inputs for a measurement.
+-
+-    Parameters
+-    ----------
+-    filename : str
+-        The filename of generated library
+-    arg_info : Tuple
+-        The shape and dtype information of tvm tensor arguments
+-    error : Exception
+-        The error happens during compilation.
+-    time_cost : float
+-        The time cost of building
+-    """
+-
+-
+-class LocalBuilder(Builder):
+-    """Run compilation on local machine
+-
+-    Parameters
+-    ----------
+-    timeout: float
+-        The timeout of a compilation
+-    n_parallel: int
+-        The number of tasks run in parallel. "None" will use all cpu cores
+-    build_func: callable or str
+-        If is 'default', use default build function
+-        If is 'ndk', use function for android ndk
+-        If is callable, use it as custom build function, expect lib_format field.
+-    """
+-
+-    def __init__(self, timeout=10, n_parallel=None, build_func="default"):
+-        super(LocalBuilder, self).__init__(timeout, n_parallel)
+-
+-        if isinstance(build_func, str):
+-            if build_func == "default":
+-                build_func = tar.tar
+-            elif build_func == "ndk":
+-                build_func = ndk.create_shared
+-            else:
+-                raise ValueError("Invalid build_func" + build_func)
+-        self.build_func = _WrappedBuildFunc(build_func)
+-        self.executor = LocalExecutor(timeout=timeout)
+-        self.tmp_dir = tempfile.mkdtemp()
+-
+-    def build(self, measure_inputs):
+-        results = []
+-
+-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+-        self.tmp_dir = tempfile.mkdtemp()
+-
+-        for i in range(0, len(measure_inputs), self.n_parallel):
+-            futures = []
+-            for inp in measure_inputs[i : i + self.n_parallel]:
+-                ret = self.executor.submit(self.build_func, inp, self.tmp_dir, **self.build_kwargs)
+-                futures.append(ret)
+-
+-            for future in futures:
+-                res = future.get()
+-
+-                if isinstance(res, Exception):
+-                    # timeout or fleet error, return MeasureResult directly
+-                    results.append(
+-                        MeasureResult(
+-                            (res,), MeasureErrorNo.BUILD_TIMEOUT, self.timeout, time.time()
+-                        )
+-                    )
+-                elif res.error is not None:
+-                    # instantiation error
+-                    if isinstance(res.error, InstantiationError):
+-                        results.append(
+-                            MeasureResult(
+-                                (res.error,),
+-                                MeasureErrorNo.INSTANTIATION_ERROR,
+-                                res.time_cost,
+-                                time.time(),
+-                            )
+-                        )
+-                    else:
+-                        if "InstantiationError" in str(res.error):
+-                            msg = str(res.error)
+-                            try:
+-                                msg = msg.split("\n")[-2].split(": ")[1]
+-                            except Exception:  # pylint: disable=broad-except
+-                                pass
+-                            results.append(
+-                                MeasureResult(
+-                                    (InstantiationError(msg),),
+-                                    MeasureErrorNo.INSTANTIATION_ERROR,
+-                                    res.time_cost,
+-                                    time.time(),
+-                                )
+-                            )
+-                        else:  # tvm error
+-                            results.append(
+-                                MeasureResult(
+-                                    (res.error,),
+-                                    MeasureErrorNo.COMPILE_HOST,
+-                                    res.time_cost,
+-                                    time.time(),
+-                                )
+-                            )
+-                else:
+-                    # return BuildResult
+-                    results.append(res)
+-
+-        return results
+-
+-
+-class RPCRunner(Runner):
+-    """Run generated code on remove devices.
+-    This function will ask a RPC Tracker to get device for measurement.
+-
+-    Parameters
+-    ----------
+-    timeout: float
+-        The timeout of a RPCRunner measurement task
+-    n_parallel: int
+-        The number of tasks run in parallel. "None" will use all cpu cores
+-    key: str
+-        The key of the device registered in the tracker
+-    host: str
+-        The host address of RPC Tracker
+-    port: int
+-        The port of RPC Tracker
+-    number: int
+-        The number of times to run the generated code for taking average.
+-        We call these runs as one `repeat` of measurement.
+-    repeat : int, optional
+-        The number of times to repeat the measurement.
+-        In total, the generated code will be run (1 + number x repeat) times,
+-        where the first "1" is warm up and will be discarded.
+-        The returned result contains `repeat` costs,
+-        each of which is an average of `number` costs.
+-    min_repeat_ms: int, optional
+-        The minimum duration of one `repeat` in milliseconds.
+-        By default, one `repeat` contains `number` runs. If this parameter is set,
+-        the parameters `number` will be dynamically adjusted to meet the
+-        minimum duration requirement of one `repeat`.
+-        i.e., When the run time of one `repeat` falls below this time, the `number` parameter
+-        will be automatically increased.
+-    cooldown_interval: float, optional
+-        The cool down interval between two measurements.
+-    enable_cpu_cache_flush: bool
+-        Whether to flush cache on CPU between repeated measurements.
+-        Flushing cache can make the measured latency of one operator closer to
+-        its actual latency during end-to-end inference.
+-        To make this option effective, the argument `number` should also be set to 1.
+-        This is only has effect on CPU task.
+-    module_loader : ModuleLoader
+-        If given, a context manager that loads the module to be timed into the remote runtime.
+-        If not given, default_module_loader is used.
+-    """
+-
+-    def __init__(
+-        self,
+-        key,
+-        host,
+-        port,
+-        priority=1,
+-        timeout=10,
+-        n_parallel=None,
+-        number=4,
+-        repeat=3,
+-        min_repeat_ms=0,
+-        cooldown_interval=0.1,
+-        enable_cpu_cache_flush=False,
+-        module_loader=None,
+-    ):
+-        super(RPCRunner, self).__init__(timeout, n_parallel)
+-
+-        self.key = key
+-        self.host = host
+-        self.port = port
+-        self.priority = priority
+-        self.timeout = timeout
+-
+-        self.number = number
+-        self.repeat = repeat
+-        self.min_repeat_ms = min_repeat_ms
+-
+-        self.enable_cpu_cache_flush = enable_cpu_cache_flush
+-        self.cooldown_interval = cooldown_interval
+-        self.module_loader = module_loader
+-
+-        self.executor = LocalExecutor(timeout=timeout * (self.n_parallel + 1))
+-
+-    def set_task(self, task):
+-        self.task = task
+-
+-        if check_remote(task.target, self.key, self.host, self.port):
+-            logger.info("Get devices for measurement successfully!")
+-        else:
+-            raise RuntimeError(
+-                "Cannot get remote devices from the tracker. "
+-                "Please check the status of tracker by "
+-                "'python -m tvm.exec.query_rpc_tracker --port [THE PORT YOU USE]' "
+-                "and make sure you have free devices on the queue status."
+-            )
+-
+-    def get_build_kwargs(self):
+-        kwargs = {}
+-        if (
+-            "cuda" in self.task.target.keys
+-            or "opencl" in self.task.target.keys
+-            or "rocm" in self.task.target.keys
+-            or "vulkan" in self.task.target.keys
+-        ):
+-            remote = request_remote(self.key, self.host, self.port)
+-            ctx = remote.context(str(self.task.target), 0)
+-            max_dims = ctx.max_thread_dimensions
+-            kwargs["check_gpu"] = {
+-                "max_shared_memory_per_block": ctx.max_shared_memory_per_block,
+-                "max_threads_per_block": ctx.max_threads_per_block,
+-                "max_thread_x": max_dims[0],
+-                "max_thread_y": max_dims[1],
+-                "max_thread_z": max_dims[2],
+-            }
+-
+-            if "cuda" in self.task.target.keys:
+-                kwargs["cuda_arch"] = "sm_" + "".join(ctx.compute_version.split("."))
+-        if self.task.target.device_name == "micro_dev":
+-            kwargs.setdefault("build_option", {})["tir.disable_vectorize"] = True
+-
+-        return kwargs
+-
+-    def run(self, measure_inputs, build_results):
+-        results = []
+-        remote_args = (self.key, self.host, self.port, self.priority, self.timeout)
+-
+-        for i in range(0, len(measure_inputs), self.n_parallel):
+-            futures = []
+-            for measure_inp, build_res in zip(
+-                measure_inputs[i : i + self.n_parallel], build_results[i : i + self.n_parallel]
+-            ):
+-                module_loader = (
+-                    self.module_loader
+-                    if self.module_loader is not None
+-                    else default_module_loader()
+-                )
+-                ret = self.executor.submit(
+-                    run_through_rpc,
+-                    measure_inp,
+-                    build_res,
+-                    self.number,
+-                    self.repeat,
+-                    self.min_repeat_ms,
+-                    self.cooldown_interval,
+-                    remote_args,
+-                    self.enable_cpu_cache_flush,
+-                    module_loader,
+-                )
+-                futures.append(ret)
+-
+-            for future in futures:
+-                res = future.get()
+-                if isinstance(res, Exception):  # executor error or timeout
+-                    results.append(
+-                        MeasureResult(
+-                            (str(res),), MeasureErrorNo.RUN_TIMEOUT, self.timeout, time.time()
+-                        )
+-                    )
+-                else:
+-                    results.append(res)
+-
+-        return results
+-
+-
+-class LocalRunner(RPCRunner):
+-    """Run generated code on local devices.
+-
+-    Parameters
+-    ----------
+-    timeout: float
+-        The timeout of a compilation
+-    number: int
+-        The number of times to run the generated code for taking average.
+-        We call these runs as one `repeat` of measurement.
+-    repeat : int, optional
+-        The number of times to repeat the measurement.
+-        In total, the generated code will be run (1 + number x repeat) times,
+-        where the first one is warm up and will be discarded.
+-        The returned result contains `repeat` costs,
+-        each of which is an average of `number` costs.
+-    min_repeat_ms: int, optional
+-        The minimum duration of one `repeat` in milliseconds.
+-        By default, one `repeat` contains `number` runs. If this parameter is set,
+-        the parameters `number` will be dynamically adjusted to meet the
+-        minimum duration requirement of one `repeat`.
+-        i.e., When the run time of one `repeat` falls below this time, the `number` parameter
+-        will be automatically increased.
+-    cooldown_interval: float, optional
+-        The cool down interval between two measurements.
+-    enable_cpu_cache_flush: bool
+-        Whether to flush cache on CPU between repeated measurements.
+-        Flushing cache can make the measured latency of one operator closer to
+-        its actual latency during end-to-end inference.
+-        To make this option effective, the argument `number` should also be set to 1.
+-        This is only has effect on CPU task.
+-    Note
+-    ----
+-    This is a "fake" local mode. We start a silent rpc tracker and rpc server
+-    for the user. In this way we reuse timeout/isolation mechanism in RPC infrastructure.
+-    """
+-
+-    def __init__(
+-        self,
+-        timeout=10,
+-        number=4,
+-        repeat=3,
+-        min_repeat_ms=0,
+-        cooldown_interval=0.1,
+-        enable_cpu_cache_flush=False,
+-        module_loader=None,
+-    ):
+-        super(LocalRunner, self).__init__(
+-            "",
+-            None,
+-            None,
+-            0,
+-            timeout=timeout,
+-            n_parallel=1,
+-            number=number,
+-            repeat=repeat,
+-            min_repeat_ms=min_repeat_ms,
+-            cooldown_interval=cooldown_interval,
+-            enable_cpu_cache_flush=enable_cpu_cache_flush,
+-            module_loader=module_loader,
+-        )
+-        self.tracker = None
+-        self.server = None
+-
+-    def set_task(self, task):
+-        # pylint: disable=import-outside-toplevel
+-        from ...rpc.tracker import Tracker
+-        from ...rpc.server import Server
+-
+-        self.task = task
+-        tracker = Tracker("0.0.0.0", port=9000, port_end=10000, silent=True)
+-        device_key = "$local$device$%d" % tracker.port
+-        server = Server(
+-            "0.0.0.0",
+-            port=9000,
+-            port_end=10000,
+-            key=device_key,
+-            use_popen=True,
+-            silent=True,
+-            tracker_addr=(tracker.host, tracker.port),
+-        )
+-        self.key = device_key
+-        self.host = tracker.host
+-        self.port = tracker.port
+-
+-        super(LocalRunner, self).set_task(task)
+-        return server, tracker
+-
+-
+-def _build_func_common(measure_input, check_gpu=None, cuda_arch=None, build_option=None):
+-    """Common part for building a configuration"""
+-    target, task, config = measure_input
+-    with target:
+-        s, args = task.instantiate(config)
+-
+-        # check invalidity of template and code hash consistency
+-        if not config.valid():
+-            raise InstantiationError(config.errors)
+-
+-        opts = build_option or {}
+-        if check_gpu:  # Add verify pass to filter out invalid configs in advance.
+-            opts["tir.add_lower_pass"] = [(2, gpu_verify_pass(**check_gpu))]
+-        if cuda_arch:
+-            set_cuda_target_arch(cuda_arch)
+-
+-        # if target is vta, we need to use vta build
+-        if (
+-            hasattr(measure_input.target, "device_name")
+-            and measure_input.target.device_name == "vta"
+-        ):
+-            # pylint: disable=import-outside-toplevel
+-            import vta
+-
+-            func = vta.build(s, args, target_host=task.target_host)
+-        else:
+-            with tvm.ir.transform.PassContext(config=opts):
+-                func = build(s, args, target_host=task.target_host)
+-    return func, tuple((get_const_tuple(x.shape), x.dtype) for x in args)
+-
+-
+-class _WrappedBuildFunc:
+-    """
+-    Wrap build_func to a function that can be used in measure.
+-
+-    Note: this is a class instead of a closure so that it can be pickled when
+-    using multiprocessing.
+-
+-    Parameters
+-    ----------
+-    build_func : The compilation function
+-        We expect fcompile to contain an attr "output_format"
+-
+-    Returns
+-    -------
+-    wrapped_build_func : callable
+-        The wrapped build function
+-    """
+-
+-    def __init__(self, build_func):
+-        if not hasattr(build_func, "output_format"):
+-            raise AttributeError("Expect build_func to have the attribute output_format.")
+-        self.build_func = build_func
+-
+-    def __call__(self, measure_input, tmp_dir, **kwargs):
+-        """
+-        Wrapped build func.
+-
+-        Parameters
+-        ----------
+-        measure_input: MeasureInput
+-            The input of measurement
+-
+-        tmp_dir: str
+-            The path of temporary directory to export generated library
+-        """
+-        tic = time.time()
+-        try:
+-            filename = os.path.join(
+-                tmp_dir, "tmp_func_%0x.%s" % (getrandbits(64), self.build_func.output_format)
+-            )
+-            # TODO(tvm-team) consider linline _build_func_common
+-            func, arg_info = _build_func_common(measure_input, **kwargs)
+-            func.export_library(filename, self.build_func)
+-        except Exception as e:  # pylint: disable=broad-except
+-            return BuildResult(None, None, e, time.time() - tic)
+-        return BuildResult(filename, arg_info, None, time.time() - tic)
+-
+-
+-ModuleLoader = typing.Callable[
+-    [dict, dict], typing.ContextManager[typing.Tuple[tvm.rpc.RPCSession, tvm.runtime.Module]]
+-]
+-
+-
+-def run_through_rpc(
+-    measure_input,
+-    build_result,
+-    number,
+-    repeat,
+-    min_repeat_ms,
+-    cooldown_interval,
+-    remote_kwargs,
+-    enable_cpu_cache_flush=False,
+-    module_loader=None,
+-):
+-    """Run a generated library through rpc
+-
+-    Parameters
+-    ----------
+-    measure_input: MeasureInput
+-        The raw measure input
+-    build_result: BuildResult
+-        The result returned from Builder. This contains the path to the generated library.
+-    number: int
+-        The number of times to run the generated code for taking average.
+-        We call these runs as one `repeat` of measurement.
+-    repeat : int, optional
+-        The number of times to repeat the measurement.
+-        In total, the generated code will be run (1 + number x repeat) times,
+-        where the first one is warm up and will be discarded.
+-        The returned result contains `repeat` costs,
+-        each of which is an average of `number` costs.
+-    min_repeat_ms: int, optional
+-        The minimum duration of one `repeat` in milliseconds.
+-        By default, one `repeat` contains `number` runs. If this parameter is set,
+-        the parameters `number` will be dynamically adjusted to meet the
+-        minimum duration requirement of one `repeat`.
+-        i.e., When the run time of one `repeat` falls below this time, the `number` parameter
+-        will be automatically increased.
+-    cooldown_interval: float
+-        The cool down interval between two measurements
+-    remote_kwargs: dict
+-        Passed to module_loader(). Ultimately, keyword args to request_remote().
+-    enable_cpu_cache_flush: bool
+-        Whether to flush cache on CPU between repeated measurements.
+-        Flushing cache can make the measured latency of one operator closer to
+-        its actual latency during end-to-end inference.
+-        To make this option effective, the argument `number` should also be set to 1.
+-        This is only has effect on CPU task.
+-    module_loader: ModuleLoader
+-        A function that returns a ContextManager used to establish and teardown the remote session.
+-    """
+-    if isinstance(build_result, MeasureResult):
+-        return build_result
+-
+-    tic = time.time()
+-    errno = MeasureErrorNo.NO_ERROR
+-    try:
+-        # upload built module
+-        with module_loader(remote_kwargs, build_result) as (remote, mod):
+-            ctx = remote.context(str(measure_input.target), 0)
+-
+-            # Limitation:
+-            # We can not get PackFunction directly in the remote mode as it is wrapped
+-            # under the std::function. We could lift the restriction later once we fold
+-            # the PackedFunc as an object. Currently, we pass function name to work
+-            # around it.
+-            f_prepare = "cache_flush_cpu_non_first_arg" if enable_cpu_cache_flush else ""
+-            time_f = mod.time_evaluator(
+-                mod.entry_name,
+-                ctx,
+-                number=number,
+-                repeat=repeat,
+-                min_repeat_ms=min_repeat_ms,
+-                f_preproc=f_prepare,
+-            )
+-
+-            try:
+-                random_fill = remote.get_function("tvm.contrib.random.random_fill")
+-            except AttributeError:
+-                raise AttributeError(
+-                    "Please make sure USE_RANDOM is ON in the config.cmake " "on the remote devices"
+-                )
+-            args = [nd.array(np.zeros(x[0], dtype=x[1]), ctx=ctx) for x in build_result.arg_info]
+-            if "scatter" not in measure_input.task.name:
+-                # the index tensor of scatter op cannot be randomly initialized
+-                for arg in args:
+-                    random_fill(arg)
+-            ctx.sync()
+-
+-            costs = time_f(*args).results
+-
+-        if len(costs) > 2:  # remove largest and smallest value to reduce variance
+-            costs = list(costs)
+-            costs.sort()
+-            costs = tuple(costs[1:-1])
+-    except TVMError as exc:
+-        msg = str(exc)
+-        if "Stack trace returned" in msg:
+-            msg = msg[: msg.index("Stack trace returned")]
+-        if "CUDA Source" in msg:
+-            msg = msg[: msg.index("CUDA Source")]
+-        costs = (RuntimeError(msg[:1024]),)
+-        errno = MeasureErrorNo.RUNTIME_DEVICE
+-    tstamp = time.time()
+-    time.sleep(cooldown_interval)
+-    return MeasureResult(costs, errno, tstamp - tic + build_result.time_cost, tstamp)
+-
+-
+-def default_module_loader(pre_load_function=None):
+-    """Returns a default function that can be passed as module_loader to run_through_rpc.
+-
+-    Parameters
+-    ----------
+-    pre_load_function : Optional[Function[tvm.rpc.Session, tvm.runtime.Module]]
+-        Invoked after a session is established and before the default code-loading RPC calls are
+-        issued. Allows performing pre-upload actions, e.g. resetting the remote runtime environment.
+-
+-    Returns
+-    -------
+-    ModuleLoader :
+-        A function that can be passed as module_loader to run_through_rpc.
+-    """
+-
+-    @contextlib.contextmanager
+-    def default_module_loader_mgr(remote_kwargs, build_result):
+-        remote = request_remote(**remote_kwargs)
+-        if pre_load_function is not None:
+-            pre_load_function(remote, build_result)
+-
+-        remote.upload(build_result.filename)
+-        try:
+-            yield remote, remote.load_module(os.path.split(build_result.filename)[1])
+-
+-        finally:
+-            # clean up remote files
+-            remote.remove(build_result.filename)
+-            remote.remove(os.path.splitext(build_result.filename)[0] + ".so")
+-            remote.remove("")
+-
+-    return default_module_loader_mgr
+-
+-
+-def request_remote(device_key, host=None, port=None, priority=1, timeout=60):
+-    """Request a remote session
+-
+-    Parameters
+-    ----------
+-    device_key: string
+-        The device key of registered device in tracker
+-    host: host, optional
+-        The host address of rpc tracker.
+-        If is none, will use environment variable "TVM_TRACKER_HOST"
+-    port: int, optional
+-        The port of rpc tracker.
+-        If is none, will use environment variable "TVM_TRACKER_PORT"
+-    priority: int, optional
+-        The priority of this request, larger is more prior
+-    timeout: float, optional
+-        The timeout of this session (units: second)
+-
+-    Returns
+-    ------
+-    session: RPCSession
+-    """
+-    # connect to the tracker
+-    host = host or os.environ["TVM_TRACKER_HOST"]
+-    port = port or int(os.environ["TVM_TRACKER_PORT"])
+-
+-    tracker = _rpc.connect_tracker(host, port)
+-    remote = tracker.request(device_key, priority=priority, session_timeout=timeout)
+-    return remote
+-
+-
+-def check_remote(target, device_key, host=None, port=None, priority=100, timeout=10):
+-    """
+-    Check the availability of a remote device
+-
+-    Parameters
+-    ----------
+-    target: Target
+-        The wanted compilation target
+-    device_key: string
+-        device key of registered device in tracker
+-    host: host, optional
+-        The host address of rpc tracker.
+-        If is none, will use environment variable "TVM_TRACKER_HOST"
+-    port: int, optional
+-        The port address of rpc tracker.
+-        If is none, will use environment variable "TVM_TRACKER_PORT"
+-    priority: int, optional
+-        The priority of this request, larger is more prior
+-    timeout: float, optional
+-        The timeout of this check (units: seconds).
+-
+-    Returns
+-    -------
+-    available: bool
+-        True if can find available device
+-    """
+-
+-    def _check():
+-        remote = request_remote(device_key, host, port, priority)
+-        ctx = remote.context(str(target))
+-        while not ctx.exist:  # wait until we get an available device
+-            pass
+-
+-    t = threading.Thread(
+-        target=_check,
+-    )
+-    t.start()
+-    t.join(timeout)
+-    return not t.is_alive()
+-
+-
+-@tvm._ffi.register_func
+-def tvm_callback_cuda_compile(code):
+-    """use nvcc to generate ptx code for better optimization"""
+-    curr_cuda_target_arch = AutotvmGlobalScope.current.cuda_target_arch
+-    # e.g., target arch could be [
+-    #   "-gencode", "arch=compute_52,code=sm_52",
+-    #   "-gencode", "arch=compute_70,code=sm_70"
+-    # ]
+-    target = "fatbin" if isinstance(curr_cuda_target_arch, list) else "ptx"
+-    ptx = nvcc.compile_cuda(code, target=target, arch=AutotvmGlobalScope.current.cuda_target_arch)
+-    return ptx
+-
+-
+-def set_cuda_target_arch(arch):
+-    """set target architecture of nvcc compiler
+-
+-    Parameters
+-    ----------
+-    arch: str or list
+-        The argument of nvcc -arch. (e.g. "sm_51", "sm_62")
+-        it can also be a count of gencode arguments pass to nvcc command line,
+-        e.g., ["-gencode", "arch=compute_52,code=sm_52", "-gencode", "arch=compute_70,code=sm_70"]
+-    """
+-    AutotvmGlobalScope.current.cuda_target_arch = arch
+-
+-
+-def gpu_verify_pass(**kwargs):
+-    """Verify the validity of a gpu kernel.
+-    This pass will check memory usage and number of threads per block.
+-    """
+-
+-    def verify_pass(f, *_):
+-        valid = tvm.tir.analysis.verify_gpu_code(f, kwargs)
+-        if not valid:
+-            raise InstantiationError("Skipped because of invalid gpu kernel")
+-        return f
+-
+-    return tvm.tir.transform.prim_func_pass(verify_pass, opt_level=0)
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++# pylint: disable=invalid-name,too-many-function-args,too-many-nested-blocks
++"""
++Functions that run on executor for measurement.
++
++These functions are responsible for building the tvm module, uploading it to
++remote devices, recording the running time costs, and checking the correctness of the output.
++"""
++
++import contextlib
++import logging
++import shutil
++import os
++import threading
++import time
++import typing
++from random import getrandbits
++from collections import namedtuple
++import tempfile
++import numpy as np
++
++import tvm._ffi
++import tvm.ir.transform
++from tvm import nd, rpc as _rpc
++from tvm.error import TVMError
++from tvm.driver import build
++from tvm.contrib import nvcc, ndk, tar
++
++from ..utils import get_const_tuple
++from ..env import AutotvmGlobalScope
++from ..task.space import InstantiationError
++
++from .measure import MeasureResult, MeasureErrorNo, Builder, Runner
++from .local_executor import LocalExecutor
++
++logger = logging.getLogger("autotvm")
++
++
++class BuildResult(namedtuple("BuildResult", ("filename", "arg_info", "error", "time_cost"))):
++    """
++    Stores all the necessary inputs for a measurement.
++
++    Parameters
++    ----------
++    filename : str
++        The filename of generated library
++    arg_info : Tuple
++        The shape and dtype information of tvm tensor arguments
++    error : Exception
++        The error happens during compilation.
++    time_cost : float
++        The time cost of building
++    """
++
++
++class LocalBuilder(Builder):
++    """Run compilation on local machine
++
++    Parameters
++    ----------
++    timeout: float
++        The timeout of a compilation
++    n_parallel: int
++        The number of tasks run in parallel. "None" will use all cpu cores
++    build_func: callable or str
++        If is 'default', use default build function
++        If is 'ndk', use function for android ndk
++        If is callable, use it as custom build function, expect lib_format field.
++    """
++
++    def __init__(self, timeout=10, n_parallel=None, build_func="default"):
++        super(LocalBuilder, self).__init__(timeout, n_parallel)
++
++        if isinstance(build_func, str):
++            if build_func == "default":
++                build_func = tar.tar
++            elif build_func == "ndk":
++                build_func = ndk.create_shared
++            else:
++                raise ValueError("Invalid build_func" + build_func)
++        self.build_func = _WrappedBuildFunc(build_func)
++        self.executor = LocalExecutor(timeout=timeout)
++        self.tmp_dir = tempfile.mkdtemp()
++
++    def build(self, measure_inputs):
++        results = []
++
++        shutil.rmtree(self.tmp_dir, ignore_errors=True)
++        self.tmp_dir = tempfile.mkdtemp()
++
++        for i in range(0, len(measure_inputs), self.n_parallel):
++            futures = []
++            for inp in measure_inputs[i : i + self.n_parallel]:
++                ret = self.executor.submit(self.build_func, inp, self.tmp_dir, **self.build_kwargs)
++                futures.append(ret)
++
++            for future in futures:
++                res = future.get()
++
++                if isinstance(res, Exception):
++                    # timeout or fleet error, return MeasureResult directly
++                    results.append(
++                        MeasureResult(
++                            (res,), MeasureErrorNo.BUILD_TIMEOUT, self.timeout, time.time()
++                        )
++                    )
++                elif res.error is not None:
++                    # instantiation error
++                    if isinstance(res.error, InstantiationError):
++                        results.append(
++                            MeasureResult(
++                                (res.error,),
++                                MeasureErrorNo.INSTANTIATION_ERROR,
++                                res.time_cost,
++                                time.time(),
++                            )
++                        )
++                    else:
++                        if "InstantiationError" in str(res.error):
++                            msg = str(res.error)
++                            try:
++                                msg = msg.split("\n")[-2].split(": ")[1]
++                            except Exception:  # pylint: disable=broad-except
++                                pass
++                            results.append(
++                                MeasureResult(
++                                    (InstantiationError(msg),),
++                                    MeasureErrorNo.INSTANTIATION_ERROR,
++                                    res.time_cost,
++                                    time.time(),
++                                )
++                            )
++                        else:  # tvm error
++                            results.append(
++                                MeasureResult(
++                                    (res.error,),
++                                    MeasureErrorNo.COMPILE_HOST,
++                                    res.time_cost,
++                                    time.time(),
++                                )
++                            )
++                else:
++                    # return BuildResult
++                    results.append(res)
++
++        return results
++
++
++class RPCRunner(Runner):
++    """Run generated code on remove devices.
++    This function will ask a RPC Tracker to get device for measurement.
++
++    Parameters
++    ----------
++    timeout: float
++        The timeout of a RPCRunner measurement task
++    n_parallel: int
++        The number of tasks run in parallel. "None" will use all cpu cores
++    key: str
++        The key of the device registered in the tracker
++    host: str
++        The host address of RPC Tracker
++    port: int
++        The port of RPC Tracker
++    number: int
++        The number of times to run the generated code for taking average.
++        We call these runs as one `repeat` of measurement.
++    repeat : int, optional
++        The number of times to repeat the measurement.
++        In total, the generated code will be run (1 + number x repeat) times,
++        where the first "1" is warm up and will be discarded.
++        The returned result contains `repeat` costs,
++        each of which is an average of `number` costs.
++    min_repeat_ms: int, optional
++        The minimum duration of one `repeat` in milliseconds.
++        By default, one `repeat` contains `number` runs. If this parameter is set,
++        the parameters `number` will be dynamically adjusted to meet the
++        minimum duration requirement of one `repeat`.
++        i.e., When the run time of one `repeat` falls below this time, the `number` parameter
++        will be automatically increased.
++    cooldown_interval: float, optional
++        The cool down interval between two measurements.
++    enable_cpu_cache_flush: bool
++        Whether to flush cache on CPU between repeated measurements.
++        Flushing cache can make the measured latency of one operator closer to
++        its actual latency during end-to-end inference.
++        To make this option effective, the argument `number` should also be set to 1.
++        This is only has effect on CPU task.
++    module_loader : ModuleLoader
++        If given, a context manager that loads the module to be timed into the remote runtime.
++        If not given, default_module_loader is used.
++    max_converge_coef: float/None, optional
++        Whether to enable adaptive evaluator, which will early stop the evaluation
++        when the coefficient of variation among micro-batches
++        is smaller than this threshold value. When set none, disable this feature
++    """
++
++    def __init__(
++        self,
++        key,
++        host,
++        port,
++        priority=1,
++        timeout=10,
++        n_parallel=None,
++        number=4,
++        repeat=3,
++        min_repeat_ms=0,
++        cooldown_interval=0.1,
++        enable_cpu_cache_flush=False,
++        module_loader=None,
++        max_converge_coef=None,
++    ):
++        super(RPCRunner, self).__init__(timeout, n_parallel)
++
++        self.key = key
++        self.host = host
++        self.port = port
++        self.priority = priority
++        self.timeout = timeout
++
++        self.number = number
++        self.repeat = repeat
++        self.min_repeat_ms = min_repeat_ms
++
++        self.enable_cpu_cache_flush = enable_cpu_cache_flush
++        self.cooldown_interval = cooldown_interval
++        self.module_loader = module_loader
++        self.max_converge_coef = max_converge_coef
++
++        self.executor = LocalExecutor(timeout=timeout * (self.n_parallel + 1))
++
++    def set_task(self, task):
++        self.task = task
++
++        if check_remote(task.target, self.key, self.host, self.port):
++            logger.info("Get devices for measurement successfully!")
++        else:
++            raise RuntimeError(
++                "Cannot get remote devices from the tracker. "
++                "Please check the status of tracker by "
++                "'python -m tvm.exec.query_rpc_tracker --port [THE PORT YOU USE]' "
++                "and make sure you have free devices on the queue status."
++            )
++
++    def get_build_kwargs(self):
++        kwargs = {}
++        if (
++            "cuda" in self.task.target.keys
++            or "opencl" in self.task.target.keys
++            or "rocm" in self.task.target.keys
++            or "vulkan" in self.task.target.keys
++        ):
++            remote = request_remote(self.key, self.host, self.port)
++            ctx = remote.context(str(self.task.target), 0)
++            max_dims = ctx.max_thread_dimensions
++            kwargs["check_gpu"] = {
++                "max_shared_memory_per_block": ctx.max_shared_memory_per_block,
++                "max_threads_per_block": ctx.max_threads_per_block,
++                "max_thread_x": max_dims[0],
++                "max_thread_y": max_dims[1],
++                "max_thread_z": max_dims[2],
++            }
++
++            if "cuda" in self.task.target.keys:
++                kwargs["cuda_arch"] = "sm_" + "".join(ctx.compute_version.split("."))
++        if self.task.target.device_name == "micro_dev":
++            kwargs.setdefault("build_option", {})["tir.disable_vectorize"] = True
++
++        return kwargs
++
++    def run(self, measure_inputs, build_results):
++        results = []
++        # remote_args = (self.key, self.host, self.port, self.priority, self.timeout)
++        remote_args = {
++            "device_key": self.key,
++            "host": self.host,
++            "port": self.port,
++            "priority": self.priority,
++            "timeout": self.timeout,
++        }  # device_key, host=None, port=None, priority=1, timeout=60):
++
++        for i in range(0, len(measure_inputs), self.n_parallel):
++            futures = []
++            for measure_inp, build_res in zip(
++                measure_inputs[i : i + self.n_parallel], build_results[i : i + self.n_parallel]
++            ):
++                module_loader = (
++                    self.module_loader
++                    if self.module_loader is not None
++                    else default_module_loader()
++                )
++                ret = self.executor.submit(
++                    run_through_rpc,
++                    measure_inp,
++                    build_res,
++                    self.number,
++                    self.repeat,
++                    self.min_repeat_ms,
++                    self.cooldown_interval,
++                    remote_args,
++                    self.enable_cpu_cache_flush,
++                    module_loader,
++                    self.max_converge_coef,
++                )
++                futures.append(ret)
++
++            for future in futures:
++                res = future.get()
++                if isinstance(res, Exception):  # executor error or timeout
++                    results.append(
++                        MeasureResult(
++                            (str(res),), MeasureErrorNo.RUN_TIMEOUT, self.timeout, time.time()
++                        )
++                    )
++                else:
++                    results.append(res)
++
++        return results
++
++
++class LocalRunner(RPCRunner):
++    """Run generated code on local devices.
++
++    Parameters
++    ----------
++    timeout: float
++        The timeout of a compilation
++    number: int
++        The number of times to run the generated code for taking average.
++        We call these runs as one `repeat` of measurement.
++    repeat : int, optional
++        The number of times to repeat the measurement.
++        In total, the generated code will be run (1 + number x repeat) times,
++        where the first one is warm up and will be discarded.
++        The returned result contains `repeat` costs,
++        each of which is an average of `number` costs.
++    min_repeat_ms: int, optional
++        The minimum duration of one `repeat` in milliseconds.
++        By default, one `repeat` contains `number` runs. If this parameter is set,
++        the parameters `number` will be dynamically adjusted to meet the
++        minimum duration requirement of one `repeat`.
++        i.e., When the run time of one `repeat` falls below this time, the `number` parameter
++        will be automatically increased.
++    cooldown_interval: float, optional
++        The cool down interval between two measurements.
++    enable_cpu_cache_flush: bool
++        Whether to flush cache on CPU between repeated measurements.
++        Flushing cache can make the measured latency of one operator closer to
++        its actual latency during end-to-end inference.
++        To make this option effective, the argument `number` should also be set to 1.
++        This is only has effect on CPU task.
++    max_converge_coef: float/None, optional
++        Whether to enable adaptive evaluator, which will early stop the evaluation
++        when the coefficient of variation among micro-batches
++        is smaller than this threshold value. When set none, disable this feature
++    Note
++    ----
++    This is a "fake" local mode. We start a silent rpc tracker and rpc server
++    for the user. In this way we reuse timeout/isolation mechanism in RPC infrastructure.
++    """
++
++    def __init__(
++        self,
++        timeout=10,
++        number=4,
++        repeat=3,
++        min_repeat_ms=0,
++        cooldown_interval=0.1,
++        enable_cpu_cache_flush=False,
++        module_loader=None,
++        max_converge_coef=None,
++    ):
++        super(LocalRunner, self).__init__(
++            "",
++            None,
++            None,
++            0,
++            timeout=timeout,
++            n_parallel=1,
++            number=number,
++            repeat=repeat,
++            min_repeat_ms=min_repeat_ms,
++            cooldown_interval=cooldown_interval,
++            enable_cpu_cache_flush=enable_cpu_cache_flush,
++            module_loader=module_loader,
++            max_converge_coef=max_converge_coef,
++        )
++        self.tracker = None
++        self.server = None
++
++    def set_task(self, task):
++        # pylint: disable=import-outside-toplevel
++        from ...rpc.tracker import Tracker
++        from ...rpc.server import Server
++
++        self.task = task
++        tracker = Tracker("0.0.0.0", port=9000, port_end=10000, silent=True)
++        device_key = "$local$device$%d" % tracker.port
++        server = Server(
++            "0.0.0.0",
++            port=9000,
++            port_end=10000,
++            key=device_key,
++            use_popen=True,
++            silent=True,
++            tracker_addr=(tracker.host, tracker.port),
++        )
++        self.key = device_key
++        self.host = tracker.host
++        self.port = tracker.port
++
++        super(LocalRunner, self).set_task(task)
++        return server, tracker
++
++
++def _build_func_common(measure_input, check_gpu=None, cuda_arch=None, build_option=None):
++    """Common part for building a configuration"""
++    target, task, config = measure_input
++    with target:
++        s, args = task.instantiate(config)
++
++        # check invalidity of template and code hash consistency
++        if not config.valid():
++            raise InstantiationError(config.errors)
++
++        opts = build_option or {}
++        if check_gpu:  # Add verify pass to filter out invalid configs in advance.
++            opts["tir.add_lower_pass"] = [(2, gpu_verify_pass(**check_gpu))]
++        if cuda_arch:
++            set_cuda_target_arch(cuda_arch)
++
++        # if target is vta, we need to use vta build
++        if (
++            hasattr(measure_input.target, "device_name")
++            and measure_input.target.device_name == "vta"
++        ):
++            # pylint: disable=import-outside-toplevel
++            import vta
++
++            func = vta.build(s, args, target_host=task.target_host)
++        else:
++            with tvm.ir.transform.PassContext(config=opts):
++                func = build(s, args, target_host=task.target_host)
++    return func, tuple((get_const_tuple(x.shape), x.dtype) for x in args)
++
++
++class _WrappedBuildFunc:
++    """
++    Wrap build_func to a function that can be used in measure.
++
++    Note: this is a class instead of a closure so that it can be pickled when
++    using multiprocessing.
++
++    Parameters
++    ----------
++    build_func : The compilation function
++        We expect fcompile to contain an attr "output_format"
++
++    Returns
++    -------
++    wrapped_build_func : callable
++        The wrapped build function
++    """
++
++    def __init__(self, build_func):
++        if not hasattr(build_func, "output_format"):
++            raise AttributeError("Expect build_func to have the attribute output_format.")
++        self.build_func = build_func
++
++    def __call__(self, measure_input, tmp_dir, **kwargs):
++        """
++        Wrapped build func.
++
++        Parameters
++        ----------
++        measure_input: MeasureInput
++            The input of measurement
++
++        tmp_dir: str
++            The path of temporary directory to export generated library
++        """
++        tic = time.time()
++        try:
++            filename = os.path.join(
++                tmp_dir, "tmp_func_%0x.%s" % (getrandbits(64), self.build_func.output_format)
++            )
++            # TODO(tvm-team) consider linline _build_func_common
++            func, arg_info = _build_func_common(measure_input, **kwargs)
++            func.export_library(filename, self.build_func)
++        except Exception as e:  # pylint: disable=broad-except
++            return BuildResult(None, None, e, time.time() - tic)
++        return BuildResult(filename, arg_info, None, time.time() - tic)
++
++
++ModuleLoader = typing.Callable[
++    [dict, dict], typing.ContextManager[typing.Tuple[tvm.rpc.RPCSession, tvm.runtime.Module]]
++]
++
++
++def run_through_rpc(
++    measure_input,
++    build_result,
++    number,
++    repeat,
++    min_repeat_ms,
++    cooldown_interval,
++    remote_kwargs,
++    enable_cpu_cache_flush=False,
++    module_loader=None,
++    max_converge_coef=None,
++):
++    """Run a generated library through rpc
++
++    Parameters
++    ----------
++    measure_input: MeasureInput
++        The raw measure input
++    build_result: BuildResult
++        The result returned from Builder. This contains the path to the generated library.
++    number: int
++        The number of times to run the generated code for taking average.
++        We call these runs as one `repeat` of measurement.
++    repeat : int, optional
++        The number of times to repeat the measurement.
++        In total, the generated code will be run (1 + number x repeat) times,
++        where the first one is warm up and will be discarded.
++        The returned result contains `repeat` costs,
++        each of which is an average of `number` costs.
++    min_repeat_ms: int, optional
++        The minimum duration of one `repeat` in milliseconds.
++        By default, one `repeat` contains `number` runs. If this parameter is set,
++        the parameters `number` will be dynamically adjusted to meet the
++        minimum duration requirement of one `repeat`.
++        i.e., When the run time of one `repeat` falls below this time, the `number` parameter
++        will be automatically increased.
++    cooldown_interval: float
++        The cool down interval between two measurements
++    remote_kwargs: dict
++        Passed to module_loader(). Ultimately, keyword args to request_remote().
++    enable_cpu_cache_flush: bool
++        Whether to flush cache on CPU between repeated measurements.
++        Flushing cache can make the measured latency of one operator closer to
++        its actual latency during end-to-end inference.
++        To make this option effective, the argument `number` should also be set to 1.
++        This is only has effect on CPU task.
++    module_loader: ModuleLoader
++        A function that returns a ContextManager used to establish and teardown the remote session.
++    max_converge_coef: float/None, optional
++        Whether to enable adaptive evaluator, which will early stop the evaluation
++        when the coefficient of variation among micro-batches
++        is smaller than this threshold value. When set none, disable this feature
++    """
++    if isinstance(build_result, MeasureResult):
++        return build_result
++
++    tic = time.time()
++    errno = MeasureErrorNo.NO_ERROR
++    try:
++        # upload built module
++        with module_loader(remote_kwargs, build_result) as (remote, mod):
++            ctx = remote.context(str(measure_input.target), 0)
++
++            f_prepare = "cache_flush_cpu_non_first_arg" if enable_cpu_cache_flush else ""
++
++            try:
++                random_fill = remote.get_function("tvm.contrib.random.random_fill")
++            except AttributeError:
++                raise AttributeError(
++                    "Please make sure USE_RANDOM is ON in the config.cmake " "on the remote devices"
++                )
++            args = [nd.array(np.zeros(x[0], dtype=x[1]), ctx=ctx) for x in build_result.arg_info]
++            if "scatter" not in measure_input.task.name:
++                # the index tensor of scatter op cannot be randomly initialized
++                for arg in args:
++                    random_fill(arg)
++            ctx.sync()
++            # Use max_converge_coef to get the measured costs
++            costs = []
++            if max_converge_coef:
++                micro_batch_size = 50
++                # Partition the evaluation into micro-batches
++                cur_number = 0
++                batc_pfms = []
++                flop = measure_input.task.flop
++                while cur_number < number * repeat:
++                    cur_number += micro_batch_size
++                    time_f = mod.time_evaluator(
++                        mod.entry_name,
++                        ctx,
++                        number=number,
++                        repeat=repeat,
++                        min_repeat_ms=min_repeat_ms,
++                        f_preproc=f_prepare,
++                    )
++                    cost = np.mean(time_f(*args).results)
++                    costs.append(cost)
++                    batc_pfms.append(flop / cost)
++                    # Calculate the cofficient of variation with current all micro-batches
++                    cv = np.std(batc_pfms) / np.mean(batc_pfms)
++                    if cur_number > micro_batch_size * 2 and cv < max_converge_coef:
++                        break
++            else:
++                # Limitation:
++                # We can not get PackFunction directly in the remote mode as it is wrapped
++                # under the std::function. We could lift the restriction later once we fold
++                # the PackedFunc as an object. Currently, we pass function name to work
++                # around it.
++                time_f = mod.time_evaluator(
++                    mod.entry_name,
++                    ctx,
++                    number=number,
++                    repeat=repeat,
++                    min_repeat_ms=min_repeat_ms,
++                    f_preproc=f_prepare,
++                )
++                costs = time_f(*args).results
++
++        if len(costs) > 2:  # remove largest and smallest value to reduce variance
++            costs = list(costs)
++            costs.sort()
++            costs = tuple(costs[1:-1])
++    except TVMError as exc:
++        msg = str(exc)
++        if "Stack trace returned" in msg:
++            msg = msg[: msg.index("Stack trace returned")]
++        if "CUDA Source" in msg:
++            msg = msg[: msg.index("CUDA Source")]
++        costs = (RuntimeError(msg[:1024]),)
++        errno = MeasureErrorNo.RUNTIME_DEVICE
++    tstamp = time.time()
++    time.sleep(cooldown_interval)
++    return MeasureResult(costs, errno, tstamp - tic + build_result.time_cost, tstamp)
++
++
++def default_module_loader(pre_load_function=None):
++    """Returns a default function that can be passed as module_loader to run_through_rpc.
++
++    Parameters
++    ----------
++    pre_load_function : Optional[Function[tvm.rpc.Session, tvm.runtime.Module]]
++        Invoked after a session is established and before the default code-loading RPC calls are
++        issued. Allows performing pre-upload actions, e.g. resetting the remote runtime environment.
++
++    Returns
++    -------
++    ModuleLoader :
++        A function that can be passed as module_loader to run_through_rpc.
++    """
++
++    @contextlib.contextmanager
++    def default_module_loader_mgr(remote_kwargs, build_result):
++        remote = request_remote(**remote_kwargs)
++        if pre_load_function is not None:
++            pre_load_function(remote, build_result)
++
++        remote.upload(build_result.filename)
++        try:
++            yield remote, remote.load_module(os.path.split(build_result.filename)[1])
++
++        finally:
++            # clean up remote files
++            remote.remove(build_result.filename)
++            remote.remove(os.path.splitext(build_result.filename)[0] + ".so")
++            remote.remove("")
++
++    return default_module_loader_mgr
++
++
++def request_remote(device_key, host=None, port=None, priority=1, timeout=60):
++    """Request a remote session
++
++    Parameters
++    ----------
++    device_key: string
++        The device key of registered device in tracker
++    host: host, optional
++        The host address of rpc tracker.
++        If is none, will use environment variable "TVM_TRACKER_HOST"
++    port: int, optional
++        The port of rpc tracker.
++        If is none, will use environment variable "TVM_TRACKER_PORT"
++    priority: int, optional
++        The priority of this request, larger is more prior
++    timeout: float, optional
++        The timeout of this session (units: second)
++
++    Returns
++    ------
++    session: RPCSession
++    """
++    # connect to the tracker
++    host = host or os.environ["TVM_TRACKER_HOST"]
++    port = port or int(os.environ["TVM_TRACKER_PORT"])
++
++    tracker = _rpc.connect_tracker(host, port)
++    remote = tracker.request(device_key, priority=priority, session_timeout=timeout)
++    return remote
++
++
++def check_remote(target, device_key, host=None, port=None, priority=100, timeout=10):
++    """
++    Check the availability of a remote device
++
++    Parameters
++    ----------
++    target: Target
++        The wanted compilation target
++    device_key: string
++        device key of registered device in tracker
++    host: host, optional
++        The host address of rpc tracker.
++        If is none, will use environment variable "TVM_TRACKER_HOST"
++    port: int, optional
++        The port address of rpc tracker.
++        If is none, will use environment variable "TVM_TRACKER_PORT"
++    priority: int, optional
++        The priority of this request, larger is more prior
++    timeout: float, optional
++        The timeout of this check (units: seconds).
++
++    Returns
++    -------
++    available: bool
++        True if can find available device
++    """
++
++    def _check():
++        remote = request_remote(device_key, host, port, priority)
++        ctx = remote.context(str(target))
++        while not ctx.exist:  # wait until we get an available device
++            pass
++
++    t = threading.Thread(
++        target=_check,
++    )
++    t.start()
++    t.join(timeout)
++    return not t.is_alive()
++
++
++@tvm._ffi.register_func
++def tvm_callback_cuda_compile(code):
++    """use nvcc to generate ptx code for better optimization"""
++    curr_cuda_target_arch = AutotvmGlobalScope.current.cuda_target_arch
++    # e.g., target arch could be [
++    #   "-gencode", "arch=compute_52,code=sm_52",
++    #   "-gencode", "arch=compute_70,code=sm_70"
++    # ]
++    target = "fatbin" if isinstance(curr_cuda_target_arch, list) else "ptx"
++    ptx = nvcc.compile_cuda(code, target=target, arch=AutotvmGlobalScope.current.cuda_target_arch)
++    return ptx
++
++
++def set_cuda_target_arch(arch):
++    """set target architecture of nvcc compiler
++
++    Parameters
++    ----------
++    arch: str or list
++        The argument of nvcc -arch. (e.g. "sm_51", "sm_62")
++        it can also be a count of gencode arguments pass to nvcc command line,
++        e.g., ["-gencode", "arch=compute_52,code=sm_52", "-gencode", "arch=compute_70,code=sm_70"]
++    """
++    AutotvmGlobalScope.current.cuda_target_arch = arch
++
++
++def gpu_verify_pass(**kwargs):
++    """Verify the validity of a gpu kernel.
++    This pass will check memory usage and number of threads per block.
++    """
++
++    def verify_pass(f, *_):
++        valid = tvm.tir.analysis.verify_gpu_code(f, kwargs)
++        if not valid:
++            raise InstantiationError("Skipped because of invalid gpu kernel")
++        return f
++
++    return tvm.tir.transform.prim_func_pass(verify_pass, opt_level=0)
+diff --git a/python/tvm/autotvm/tuner/__init__.py b/python/tvm/autotvm/tuner/__init__.py
+index 7ffe9a2294c5..26d71d6d0fb6 100644
+--- a/python/tvm/autotvm/tuner/__init__.py
++++ b/python/tvm/autotvm/tuner/__init__.py
+@@ -28,3 +28,4 @@
+ from .index_based_tuner import GridSearchTuner, RandomTuner
+ from .ga_tuner import GATuner
+ from .xgboost_tuner import XGBTuner
++from .rfei_tuner import RFEITuner
+diff --git a/python/tvm/autotvm/tuner/model_based_tuner.py b/python/tvm/autotvm/tuner/model_based_tuner.py
+index 4d163391bf71..98f79f5a6a9d 100644
+--- a/python/tvm/autotvm/tuner/model_based_tuner.py
++++ b/python/tvm/autotvm/tuner/model_based_tuner.py
+@@ -25,6 +25,7 @@
+ 
+ from .tuner import Tuner
+ from ..env import GLOBAL_SCOPE
++from ..utils import sample_ints
+ 
+ 
+ class FeatureCache(object):
+@@ -193,9 +194,19 @@ class ModelBasedTuner(Tuner):
+         If is not None, the tuner will first select
+         top-(plan_size * diversity_filter_ratio) candidates according to the cost model
+         and then pick plan_size of them according to the diversity metric.
++    uncertainty_aware: bool, optional
++        Whether to dynamically control the EE balance during the search
+     """
+ 
+-    def __init__(self, task, cost_model, model_optimizer, plan_size, diversity_filter_ratio=None):
++    def __init__(
++        self,
++        task,
++        cost_model,
++        model_optimizer,
++        plan_size,
++        diversity_filter_ratio=None,
++        uncertainty_aware=False,
++    ):
+         super(ModelBasedTuner, self).__init__(task)
+ 
+         # space
+@@ -226,6 +237,9 @@ def __init__(self, task, cost_model, model_optimizer, plan_size, diversity_filte
+         self.flops_max = 0.0
+         self.train_ct = 0
+ 
++        self.uncertainty_aware = uncertainty_aware
++        self.dynamic_ep = 0.05
++
+     def next_batch(self, batch_size):
+         ret = []
+ 
+@@ -240,9 +254,9 @@ def next_batch(self, batch_size):
+                     break
+                 self.trial_pt += 1
+ 
+-            if self.trial_pt >= len(self.trials) - int(0.05 * self.plan_size):
++            if self.trial_pt >= len(self.trials) - int(self.dynamic_ep * self.plan_size):
+                 # if the trial list is empty or
+-                # the tuner is doing the last 5% trials (e-greedy), choose randomly
++                # the tuner is doing the last <dynamic_ep> trials (e-greedy), choose randomly
+                 index = np.random.randint(len(self.space))
+                 while index in self.visited:
+                     index = np.random.randint(len(self.space))
+@@ -281,6 +295,11 @@ def update(self, inputs, results):
+                     self.cost_model, self.plan_size, self.visited
+                 )
+ 
++            # Update the dynamic_ep which controls the EE balance
++            if self.uncertainty_aware:
++                samples = np.array(sample_ints(0, len(self.space), 20))
++                _, prediction_variation = self.cost_model._prediction_variation(samples)
++                self.dynamic_ep = min(1, prediction_variation / self.best_flops)
+             self.trials = maximums
+             self.trial_pt = 0
+             self.train_ct += 1
+diff --git a/python/tvm/autotvm/tuner/rf_cost_model.py b/python/tvm/autotvm/tuner/rf_cost_model.py
+new file mode 100644
+index 000000000000..bd1602ec8344
+--- /dev/null
++++ b/python/tvm/autotvm/tuner/rf_cost_model.py
+@@ -0,0 +1,403 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++# pylint: disable=invalid-name
++"""RandomForestRegressor+ExpectedImprovement as a cost model"""
++
++import multiprocessing
++import logging
++import time
++
++import numpy as np
++from sklearn.ensemble import RandomForestRegressor
++from scipy.stats import norm
++from .. import feature
++from .model_based_tuner import CostModel, FeatureCache
++
++logger = logging.getLogger("autotvm")
++
++
++class RFEICostModel(CostModel):
++    """RandomForestRegressor+ExpectedImprovement as a cost model
++
++    Parameters
++    ----------
++    task: Task
++        The tuning task
++    feature_type: str, optional
++        If is 'itervar', use features extracted from IterVar (loop variable).
++        If is 'knob', use flatten ConfigEntity directly.
++        If is 'curve', use sampled curve feature (relation feature).
++
++        Note on choosing feature type:
++        For single task tuning, 'itervar' and 'knob' are good.
++                                'itervar' is more accurate but 'knob' is much faster.
++                                There are some constraints on 'itervar', if you meet
++                                problems with feature extraction when using 'itervar',
++                                you can switch to 'knob'.
++
++        For cross-shape tuning (e.g. many convolutions with different shapes),
++                               'itervar' and 'curve' has better transferability,
++                               'knob' is faster.
++        For cross-device or cross-operator tuning, you can use 'curve' only.
++    loss_type: str
++        If is 'reg', use regression loss to train cost model.
++                     The cost model predicts the normalized flops.
++        If is 'rank', use pairwise rank loss to train cost model.
++                     The cost model predicts relative rank score.
++    num_threads: int, optional
++        The number of threads.
++    log_interval: int, optional
++        If is not none, the cost model will print training log every `log_interval` iterations.
++    upper_model: RFEICostModel, optional
++        The upper model used in transfer learning
++    n_estimators: int, optional
++        The number of estimators of the RandomForestRegressor
++    random_state: int, optional
++        The random state of initializing the RandomForestRegressor
++    max_features: int, optional
++        The max features of the RandomForestRegressor
++    """
++
++    def __init__(
++        self,
++        task,
++        feature_type,
++        num_threads=None,
++        log_interval=25,
++        upper_model=None,
++        n_estimators=10,
++        random_state=2,
++        max_features=10,
++    ):
++        super(RFEICostModel, self).__init__()
++
++        self.task = task
++        self.target = task.target
++        self.space = task.config_space
++        self.prior = RandomForestRegressor(
++            n_estimators=n_estimators, random_state=random_state, max_features=max_features
++        )
++        self.fea_type = feature_type
++        self.num_threads = num_threads
++        self.log_interval = log_interval
++
++        if feature_type == "itervar":
++            self.feature_extract_func = _extract_itervar_feature_index
++        elif feature_type == "knob":
++            self.feature_extract_func = _extract_knob_feature_index
++        elif feature_type == "curve":
++            self.feature_extract_func = _extract_curve_feature_index
++        else:
++            raise RuntimeError("Invalid feature type " + feature_type)
++
++        if upper_model:  # share a same feature cache with upper model
++            self.feature_cache = upper_model.feature_cache
++        else:
++            self.feature_cache = FeatureCache()
++        self.upper_model = upper_model
++        self.feature_extra_ct = 0
++        self.best_flops = 0.0
++        self.pool = None
++        self.base_model = None
++
++        self._sample_size = 0
++        self._reset_pool(self.space, self.target, self.task)
++
++    def _reset_pool(self, space, target, task):
++        """reset processing pool for feature extraction"""
++
++        if self.upper_model:  # base model will reuse upper model's pool,
++            self.upper_model._reset_pool(space, target, task)
++            return
++
++        self._close_pool()
++
++        # Use global variable to pass common arguments. This is only used when
++        # new processes are started with fork. We have to set the globals
++        # before we create the pool, so that processes in the pool get the
++        # correct globals.
++        global _extract_space, _extract_target, _extract_task
++        _extract_space = space
++        _extract_target = target
++        _extract_task = task
++        self.pool = multiprocessing.Pool(self.num_threads)
++
++    def _close_pool(self):
++        if self.pool:
++            self.pool.terminate()
++            self.pool.join()
++            self.pool = None
++
++    def _get_pool(self):
++        if self.upper_model:
++            return self.upper_model._get_pool()
++        return self.pool
++
++    def _base_model_discount(self):
++        return 1.0 / (2 ** (self._sample_size / 64.0))
++
++    def fit(self, xs, ys, plan_size):
++        tic = time.time()
++        self._reset_pool(self.space, self.target, self.task)
++        x_train = self._get_feature(xs)
++        y_train = np.array(ys)
++        y_max = np.max(y_train)
++        self.best_flops = max(ys)
++        y_train = y_train / max(y_max, 1e-8)
++
++        valid_index = y_train > 1e-6
++
++        self._sample_size = len(x_train)
++        self.prior.fit(x_train, ys)
++
++        logger.debug(
++            "RFEI train: %.2f\tobs: %d\terror: %d\tn_cache: %d",
++            time.time() - tic,
++            len(xs),
++            len(xs) - np.sum(valid_index),
++            self.feature_cache.size(self.fea_type),
++        )
++
++    def fit_log(self, records, plan_size):
++        tic = time.time()
++
++        # filter data, only pick the data with a same task
++        data = []
++        for inp, res in records:
++            if inp.task.name == self.task.name:
++                data.append((inp, res))
++
++        logger.debug("RFEI load %d entries from history log file", len(data))
++
++        # extract feature
++        self._reset_pool(self.space, self.target, self.task)
++        pool = self._get_pool()
++        if self.fea_type == "itervar":
++            feature_extract_func = _extract_itervar_feature_log
++        elif self.fea_type == "knob":
++            feature_extract_func = _extract_knob_feature_log
++        elif self.fea_type == "curve":
++            feature_extract_func = _extract_curve_feature_log
++        else:
++            raise RuntimeError("Invalid feature type: " + self.fea_type)
++        res = pool.map(feature_extract_func, data)
++
++        # filter out feature with different shapes
++        fea_len = len(self._get_feature([0])[0])
++
++        xs, ys = [], []
++        for x, y in res:
++            if len(x) == fea_len:
++                xs.append(x)
++                ys.append(y)
++
++        if len(xs) < 500:  # no enough samples
++            return False
++
++        xs, ys = [], []
++        for x, y in res:
++            if len(x) == fea_len:
++                xs.append(x)
++                ys.append(y)
++
++        if len(xs) < 500:  # no enough samples
++            return False
++
++        xs, ys = np.array(xs), np.array(ys)
++
++        self.best_flops = max(ys)
++        self.prior.fit(xs, ys)
++
++        logger.debug("RFEI train: %.2f\tobs: %d", time.time() - tic, len(xs))
++
++        return True
++
++    def predict(self, xs, output_margin=False):
++        predicts, _ = self._prediction_variation(xs)
++        return predicts
++
++    def _prediction_variation(self, x_to_predict):
++        """Use Bayesian Optimization to predict the y and get the prediction_variation"""
++        feas = self._get_feature(x_to_predict)
++        preds = np.array([tree.predict(feas) for tree in self.prior]).T.tolist()
++        eis = []
++        variances = []
++        for pred in preds:
++            mu = np.mean(pred)
++            sigma = pred.std()
++            best_flops = self.best_flops
++            variances.append(sigma)
++            with np.errstate(divide="ignore"):
++                Z = (mu - best_flops) / sigma
++                ei = (mu - best_flops) * norm.cdf(Z) + sigma * norm.pdf(Z)
++                if sigma == 0.0:
++                    ei = max(0.0, mu - best_flops)
++            eis.append(ei)
++        prediction_variation = sum(variances) / len(variances)
++        return np.array(eis), prediction_variation
++
++    def load_basemodel(self, base_model):
++        self.base_model = base_model
++        self.base_model._close_pool()
++        self.base_model.upper_model = self
++
++    def spawn_base_model(self):
++        return RFEICostModel(self.task, self.fea_type, self.num_threads, self.log_interval, self)
++
++    def _get_feature(self, indexes):
++        """get features for indexes, run extraction if we do not have cache for them"""
++        # free feature cache
++        if self.feature_cache.size(self.fea_type) >= 100000:
++            self.feature_cache.clear(self.fea_type)
++        fea_cache = self.feature_cache.get(self.fea_type)
++        indexes = np.array(indexes)
++        need_extract = [x for x in indexes if x not in fea_cache]
++        if need_extract:
++            pool = self._get_pool()
++            # If we are forking, we can pass arguments in globals for better performance
++            if multiprocessing.get_start_method(False) == "fork":
++                feas = pool.map(self.feature_extract_func, need_extract)
++            else:
++                args = [(self.space.get(x), self.target, self.task) for x in need_extract]
++                feas = pool.map(self.feature_extract_func, args)
++            for i, fea in zip(need_extract, feas):
++                fea_cache[i] = fea
++
++        feature_len = None
++        for idx in indexes:
++            if fea_cache[idx] is not None:
++                feature_len = fea_cache[idx].shape[-1]
++                break
++
++        ret = np.empty((len(indexes), feature_len), dtype=np.float32)
++        for i, ii in enumerate(indexes):
++            t = fea_cache[ii]
++            ret[i, :] = t if t is not None else 0
++        return ret
++
++    def __del__(self):
++        self._close_pool()
++
++
++# Global variables for passing arguments to extract functions.
++_extract_space = None
++_extract_target = None
++_extract_task = None
++
++
++def _extract_itervar_feature_index(args):
++    """extract iteration var feature for an index in extract_space"""
++    try:
++        if multiprocessing.get_start_method(False) == "fork":
++            config = _extract_space.get(args)
++            with _extract_target:
++                sch, fargs = _extract_task.instantiate(config)
++        else:
++            config, target, task = args
++            with target:
++                sch, fargs = task.instantiate(config)
++        fea = feature.get_itervar_feature_flatten(sch, fargs, take_log=True)
++        fea = np.concatenate((fea, list(config.get_other_option().values())))
++        return fea
++    except Exception:  # pylint: disable=broad-except
++        return None
++
++
++def _extract_itervar_feature_log(arg):
++    """extract iteration var feature for log items"""
++    try:
++        inp, res = arg
++        config = inp.config
++        with inp.target:
++            sch, args = inp.task.instantiate(config)
++        fea = feature.get_itervar_feature_flatten(sch, args, take_log=True)
++        x = np.concatenate((fea, list(config.get_other_option().values())))
++
++        if res.error_no == 0:
++            y = inp.task.flop / np.mean(res.costs)
++        else:
++            y = 0.0
++        return x, y
++    except Exception:  # pylint: disable=broad-except
++        return None
++
++
++def _extract_knob_feature_index(args):
++    """extract knob feature for an index in extract_space"""
++    try:
++        if multiprocessing.get_start_method(False) == "fork":
++            config = _extract_space.get(args)
++        else:
++            config = args[0]
++        return config.get_flatten_feature()
++    except Exception:  # pylint: disable=broad-except
++        return None
++
++
++def _extract_knob_feature_log(arg):
++    """extract knob feature for log items"""
++    try:
++        inp, res = arg
++        config = inp.config
++        x = config.get_flatten_feature()
++
++        if res.error_no == 0:
++            with inp.target:  # necessary, for calculating flops of this task
++                inp.task.instantiate(config)
++            y = inp.task.flop / np.mean(res.costs)
++        else:
++            y = 0.0
++        return x, y
++    except Exception:  # pylint: disable=broad-except
++        return None
++
++
++def _extract_curve_feature_index(args):
++    """extract sampled curve feature for an index in extract_space"""
++    try:
++        if multiprocessing.get_start_method(False) == "fork":
++            config = _extract_space.get(args)
++            with _extract_target:
++                sch, fargs = _extract_task.instantiate(config)
++        else:
++            config, target, task = args
++            with target:
++                sch, fargs = task.instantiate(config)
++        fea = feature.get_buffer_curve_sample_flatten(sch, fargs, sample_n=20)
++        fea = np.concatenate((fea, list(config.get_other_option().values())))
++        return np.array(fea)
++    except Exception:  # pylint: disable=broad-except
++        return None
++
++
++def _extract_curve_feature_log(arg):
++    """extract sampled curve feature for log items"""
++    try:
++        inp, res = arg
++        config = inp.config
++        with inp.target:
++            sch, args = inp.task.instantiate(config)
++        fea = feature.get_buffer_curve_sample_flatten(sch, args, sample_n=20)
++        x = np.concatenate((fea, list(config.get_other_option().values())))
++
++        if res.error_no == 0:
++            y = inp.task.flop / np.mean(res.costs)
++        else:
++            y = 0.0
++        return x, y
++    except Exception:  # pylint: disable=broad-except
++        return None
+diff --git a/python/tvm/autotvm/tuner/rfei_tuner.py b/python/tvm/autotvm/tuner/rfei_tuner.py
+new file mode 100644
+index 000000000000..ea2c2c0d1d25
+--- /dev/null
++++ b/python/tvm/autotvm/tuner/rfei_tuner.py
+@@ -0,0 +1,99 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++"""Tuner that uses RandomForestRegressor+ExpectedImprovement as cost model"""
++
++from .model_based_tuner import ModelOptimizer, ModelBasedTuner
++from .sa_model_optimizer import SimulatedAnnealingOptimizer
++from .rf_cost_model import RFEICostModel
++
++
++class RFEITuner(ModelBasedTuner):
++    """Tuner that uses RandomForestRegressor+ExpectedImprovement as cost model
++
++    Parameters
++    ----------
++    task: Task
++        The tuning task
++    plan_size: int
++        The size of a plan. After `plan_size` trials, the tuner will refit a new cost model
++        and do planing for the next `plan_size` trials.
++    feature_type: str, optional
++        If is 'itervar', use features extracted from IterVar (loop variable).
++        If is 'knob', use flatten ConfigEntity directly.
++        If is 'curve', use sampled curve feature (relation feature).
++
++        Note on choosing feature type:
++        For single task tuning, 'itervar' and 'knob' are good.
++        'itervar' is more accurate but 'knob' is much faster.
++        There are some constraints on 'itervar', if you meet
++        problems with feature extraction when using 'itervar',
++        you can switch to 'knob'.
++
++        For cross-shape tuning (e.g. many convolutions with different shapes),
++        'itervar' and 'curve' has better transferability,
++        'knob' is faster.
++
++        For cross-device or cross-operator tuning, you can use 'curve' only.
++    num_threads: int, optional
++        The number of threads.
++    optimizer: str or ModelOptimizer, optional
++        If is 'sa', use a default simulated annealing optimizer.
++        Otherwise it should be a ModelOptimizer object.
++    diversity_filter_ratio: int or float, optional
++        If is not None, the tuner will first select
++        top-(plan_size * diversity_filter_ratio) candidates according to the cost model
++        and then pick batch_size of them according to the diversity metric.
++    log_interval: int, optional
++        The verbose level.
++        If is 0, output nothing.
++        Otherwise, output debug information every `verbose` iterations.
++    uncertainty_aware: bool, optional
++        If it is false, disable the dynamic uncertainty-aware searching process.
++    """
++
++    def __init__(
++        self,
++        task,
++        plan_size=32,
++        feature_type="itervar",
++        num_threads=None,
++        optimizer="sa",
++        diversity_filter_ratio=None,
++        log_interval=50,
++        uncertainty_aware=True,
++    ):
++
++        cost_model = RFEICostModel(
++            task, feature_type=feature_type, num_threads=num_threads, log_interval=log_interval // 2
++        )
++        if optimizer == "sa":
++            optimizer = SimulatedAnnealingOptimizer(
++                task, log_interval=log_interval, parallel_size=plan_size * 2
++            )
++        else:
++            assert isinstance(optimizer, ModelOptimizer), (
++                "Optimizer must be " "a supported name string" "or a ModelOptimizer object."
++            )
++        super(RFEITuner, self).__init__(
++            task, cost_model, optimizer, plan_size, diversity_filter_ratio, uncertainty_aware
++        )
++
++    def tune(self, *args, **kwargs):  # pylint: disable=arguments-differ
++        super(RFEITuner, self).tune(*args, **kwargs)
++
++        # manually close pool to avoid multiprocessing issues
++        self.cost_model._close_pool()
+diff --git a/python/tvm/autotvm/tuner/xgboost_tuner.py b/python/tvm/autotvm/tuner/xgboost_tuner.py
+index 2f4d0ee88ce9..9dec54c2d5f7 100644
+--- a/python/tvm/autotvm/tuner/xgboost_tuner.py
++++ b/python/tvm/autotvm/tuner/xgboost_tuner.py
+@@ -55,7 +55,9 @@ class XGBTuner(ModelBasedTuner):
+         The cost model predicts relative rank score.
+ 
+     num_threads: int, optional
+-        The number of threads.  optimizer: str or ModelOptimizer, optional
++        The number of threads.
++
++    optimizer: str or ModelOptimizer, optional
+         If is 'sa', use a default simulated annealing optimizer.
+         Otherwise it should be a ModelOptimizer object.
+ 
+diff --git a/tests/python/unittest/test_autotvm_measure.py b/tests/python/unittest/test_autotvm_measure.py
+index 9db9f18fa377..8a7cf346859d 100644
+--- a/tests/python/unittest/test_autotvm_measure.py
++++ b/tests/python/unittest/test_autotvm_measure.py
+@@ -1,67 +1,86 @@
+-# Licensed to the Apache Software Foundation (ASF) under one
+-# or more contributor license agreements.  See the NOTICE file
+-# distributed with this work for additional information
+-# regarding copyright ownership.  The ASF licenses this file
+-# to you under the Apache License, Version 2.0 (the
+-# "License"); you may not use this file except in compliance
+-# with the License.  You may obtain a copy of the License at
+-#
+-#   http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing,
+-# software distributed under the License is distributed on an
+-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-# KIND, either express or implied.  See the License for the
+-# specific language governing permissions and limitations
+-# under the License.
+-"""Test builder and runner"""
+-import logging
+-import multiprocessing
+-import time
+-
+-import numpy as np
+-
+-import tvm
+-from tvm import te
+-from test_autotvm_common import DummyRunner, bad_matmul, get_sample_task
+-from tvm import autotvm
+-from tvm.autotvm.measure.measure import MeasureErrorNo, MeasureResult
+-
+-
+-def test_task_tuner_without_measurement():
+-    """test task and tuner without measurement"""
+-    task, _ = get_sample_task()
+-
+-    measure_option = autotvm.measure_option(builder=autotvm.LocalBuilder(), runner=DummyRunner())
+-
+-    logging.info("%s", task.config_space)
+-
+-    for tuner_class in [
+-        autotvm.tuner.RandomTuner,
+-        autotvm.tuner.GridSearchTuner,
+-        autotvm.tuner.GATuner,
+-        autotvm.tuner.XGBTuner,
+-    ]:
+-        tuner = tuner_class(task)
+-        tuner.tune(n_trial=10, measure_option=measure_option)
+-        assert tuner.best_flops > 1
+-
+-
+-def task_tuner_spawn():
+-    assert multiprocessing.get_start_method(False) == "spawn"
+-    test_task_tuner_without_measurement()
+-
+-
+-def test_task_tuner_without_measurement_spawn():
+-    # Subprocesses inherit the spawn method of their parents
+-    ctx = multiprocessing.get_context("spawn")
+-    p = ctx.Process(target=task_tuner_spawn)
+-    p.start()
+-    p.join()
+-
+-
+-if __name__ == "__main__":
+-    logging.basicConfig(level=logging.INFO)
+-
+-    test_task_tuner_without_measurement()
+-    test_task_tuner_without_measurement_spawn()
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++"""Test builder and runner"""
++import logging
++import multiprocessing
++import time
++
++import numpy as np
++
++import tvm
++from tvm import te
++from test_autotvm_common import DummyRunner, bad_matmul, get_sample_task
++from tvm import autotvm
++from tvm.autotvm.measure.measure import MeasureErrorNo, MeasureResult
++
++
++def test_task_tuner_without_measurement():
++    """test task and tuner without measurement"""
++    task, _ = get_sample_task()
++
++    measure_option = autotvm.measure_option(builder=autotvm.LocalBuilder(), runner=DummyRunner())
++
++    logging.info("%s", task.config_space)
++
++    for tuner_class in [
++        autotvm.tuner.RandomTuner,
++        autotvm.tuner.GridSearchTuner,
++        autotvm.tuner.GATuner,
++        autotvm.tuner.XGBTuner,
++        autotvm.tuner.RFEITuner,
++    ]:
++        tuner = tuner_class(task)
++        tuner.tune(n_trial=10, measure_option=measure_option)
++        assert tuner.best_flops > 1
++
++
++def task_tuner_spawn():
++    assert multiprocessing.get_start_method(False) == "spawn"
++    test_task_tuner_without_measurement()
++
++
++def test_task_tuner_without_measurement_spawn():
++    # Subprocesses inherit the spawn method of their parents
++    ctx = multiprocessing.get_context("spawn")
++    p = ctx.Process(target=task_tuner_spawn)
++    p.start()
++    p.join()
++
++
++def test_adatune():
++    # Test Adatune with RFEITuner, and set the max_converge_coef as 0.1
++    task, _ = get_sample_task()
++
++    measure_option = autotvm.measure_option(
++        builder=autotvm.LocalBuilder(),
++        runner=autotvm.LocalRunner(number=500, repeat=1, max_converge_coef=0.1),
++    )
++
++    logging.info("%s", task.config_space)
++    from tvm.autotvm.tuner import RFEITuner
++
++    tuner = RFEITuner(task)
++    tuner.tune(n_trial=10, measure_option=measure_option)
++    assert tuner.best_flops > 1
++
++
++if __name__ == "__main__":
++    logging.basicConfig(level=logging.INFO)
++
++    test_task_tuner_without_measurement()
++    test_task_tuner_without_measurement_spawn()
++    test_adatune()
