@@ -1,0 +1,352 @@
+diff --git a/docs/sql-keywords.md b/docs/sql-keywords.md
+index c55e589aa8c3f..4ea1754618cd4 100644
+--- a/docs/sql-keywords.md
++++ b/docs/sql-keywords.md
+@@ -280,6 +280,7 @@ Below is a list of all the keywords in Spark SQL.
+   <tr><td>UNKNOWN</td><td>reserved</td><td>non-reserved</td><td>reserved</td></tr>
+   <tr><td>UNLOCK</td><td>non-reserved</td><td>non-reserved</td><td>non-reserved</td></tr>
+   <tr><td>UNSET</td><td>non-reserved</td><td>non-reserved</td><td>non-reserved</td></tr>
++  <tr><td>UPDATE</td><td>non-reserved</td><td>non-reserved</td><td>reserved</td></tr>
+   <tr><td>USE</td><td>non-reserved</td><td>non-reserved</td><td>non-reserved</td></tr>
+   <tr><td>USER</td><td>reserved</td><td>non-reserved</td><td>reserved</td></tr>
+   <tr><td>USING</td><td>reserved</td><td>strict-non-reserved</td><td>reserved</td></tr>
+diff --git a/sql/catalyst/src/main/antlr4/org/apache/spark/sql/catalyst/parser/SqlBase.g4 b/sql/catalyst/src/main/antlr4/org/apache/spark/sql/catalyst/parser/SqlBase.g4
+index 20be8e539cf58..642e140668761 100644
+--- a/sql/catalyst/src/main/antlr4/org/apache/spark/sql/catalyst/parser/SqlBase.g4
++++ b/sql/catalyst/src/main/antlr4/org/apache/spark/sql/catalyst/parser/SqlBase.g4
+@@ -217,6 +217,7 @@ statement
+     | SET .*?                                                          #setConfiguration
+     | RESET                                                            #resetConfiguration
+     | DELETE FROM multipartIdentifier tableAlias whereClause?          #deleteFromTable
++    | UPDATE multipartIdentifier tableAlias setClause whereClause?     #updateTable
+     | unsupportedHiveNativeCommands .*?                                #failNativeCommand
+     ;
+ 
+@@ -476,6 +477,14 @@ selectClause
+     : SELECT (hints+=hint)* setQuantifier? namedExpressionSeq
+     ;
+ 
++setClause
++    : SET assign (',' assign)*
++    ;
++
++assign
++    : key=multipartIdentifier EQ value=expression
++    ;
++
+ whereClause
+     : WHERE booleanExpression
+     ;
+@@ -1085,6 +1094,7 @@ ansiNonReserved
+     | UNCACHE
+     | UNLOCK
+     | UNSET
++    | UPDATE
+     | USE
+     | VALUES
+     | VIEW
+@@ -1355,6 +1365,7 @@ nonReserved
+     | UNKNOWN
+     | UNLOCK
+     | UNSET
++    | UPDATE
+     | USE
+     | USER
+     | VALUES
+@@ -1622,6 +1633,7 @@ UNIQUE: 'UNIQUE';
+ UNKNOWN: 'UNKNOWN';
+ UNLOCK: 'UNLOCK';
+ UNSET: 'UNSET';
++UPDATE: 'UPDATE';
+ USE: 'USE';
+ USER: 'USER';
+ USING: 'USING';
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/parser/AstBuilder.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/parser/AstBuilder.scala
+index c334d09b691ea..f457a2e103bc0 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/parser/AstBuilder.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/parser/AstBuilder.scala
+@@ -36,7 +36,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{First, Last}
+ import org.apache.spark.sql.catalyst.parser.SqlBaseParser._
+ import org.apache.spark.sql.catalyst.plans._
+ import org.apache.spark.sql.catalyst.plans.logical._
+-import org.apache.spark.sql.catalyst.plans.logical.sql.{AlterTableAddColumnsStatement, AlterTableAlterColumnStatement, AlterTableDropColumnsStatement, AlterTableRenameColumnStatement, AlterTableSetLocationStatement, AlterTableSetPropertiesStatement, AlterTableUnsetPropertiesStatement, AlterViewSetPropertiesStatement, AlterViewUnsetPropertiesStatement, CreateTableAsSelectStatement, CreateTableStatement, DeleteFromStatement, DescribeColumnStatement, DescribeTableStatement, DropTableStatement, DropViewStatement, InsertIntoStatement, QualifiedColType, ReplaceTableAsSelectStatement, ReplaceTableStatement, ShowNamespacesStatement, ShowTablesStatement}
++import org.apache.spark.sql.catalyst.plans.logical.sql.{AlterTableAddColumnsStatement, AlterTableAlterColumnStatement, AlterTableDropColumnsStatement, AlterTableRenameColumnStatement, AlterTableSetLocationStatement, AlterTableSetPropertiesStatement, AlterTableUnsetPropertiesStatement, AlterViewSetPropertiesStatement, AlterViewUnsetPropertiesStatement, CreateTableAsSelectStatement, CreateTableStatement, DeleteFromStatement, DescribeColumnStatement, DescribeTableStatement, DropTableStatement, DropViewStatement, InsertIntoStatement, QualifiedColType, ReplaceTableAsSelectStatement, ReplaceTableStatement, ShowNamespacesStatement, ShowTablesStatement, UpdateTableStatement}
+ import org.apache.spark.sql.catalyst.util.DateTimeUtils.{getZoneId, stringToDate, stringToTimestamp}
+ import org.apache.spark.sql.connector.expressions.{ApplyTransform, BucketTransform, DaysTransform, Expression => V2Expression, FieldReference, HoursTransform, IdentityTransform, LiteralValue, MonthsTransform, Transform, YearsTransform}
+ import org.apache.spark.sql.internal.SQLConf
+@@ -361,6 +361,36 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging
+     DeleteFromStatement(tableId, tableAlias, predicate)
+   }
+ 
++  override def visitUpdateTable(ctx: UpdateTableContext): LogicalPlan = withOrigin(ctx) {
++    val tableId = visitMultipartIdentifier(ctx.multipartIdentifier)
++    val tableAlias = if (ctx.tableAlias() != null) {
++      val ident = ctx.tableAlias().strictIdentifier()
++      // We do not allow columns aliases after table alias.
++      if (ctx.tableAlias().identifierList() != null) {
++        throw new ParseException("Columns aliases is not allowed in UPDATE.",
++          ctx.tableAlias().identifierList())
++      }
++      if (ident != null) Some(ident.getText) else None
++    } else {
++      None
++    }
++    val (attrs, values) = ctx.setClause().assign().asScala.map {
++      kv => visitMultipartIdentifier(kv.key) -> expression(kv.value)
++    }.unzip
++    val predicate = if (ctx.whereClause() != null) {
++      Some(expression(ctx.whereClause().booleanExpression()))
++    } else {
++      None
++    }
++
++    UpdateTableStatement(
++      tableId,
++      tableAlias,
++      attrs,
++      values,
++      predicate)
++  }
++
+   /**
+    * Create a partition specification map.
+    */
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/sql/UpdateTableStatement.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/sql/UpdateTableStatement.scala
+new file mode 100644
+index 0000000000000..954374c15b932
+--- /dev/null
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/sql/UpdateTableStatement.scala
+@@ -0,0 +1,27 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.catalyst.plans.logical.sql
++
++import org.apache.spark.sql.catalyst.expressions.Expression
++
++case class UpdateTableStatement(
++    tableName: Seq[String],
++    tableAlias: Option[String],
++    attrs: Seq[Seq[String]],
++    values: Seq[Expression],
++    condition: Option[Expression]) extends ParsedStatement
+diff --git a/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/parser/DDLParserSuite.scala b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/parser/DDLParserSuite.scala
+index be781081b0112..1dfc9b58504a5 100644
+--- a/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/parser/DDLParserSuite.scala
++++ b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/parser/DDLParserSuite.scala
+@@ -24,7 +24,7 @@ import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, UnresolvedAttribute
+ import org.apache.spark.sql.catalyst.catalog.BucketSpec
+ import org.apache.spark.sql.catalyst.expressions.{EqualTo, Literal}
+ import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project}
+-import org.apache.spark.sql.catalyst.plans.logical.sql.{AlterTableAddColumnsStatement, AlterTableAlterColumnStatement, AlterTableDropColumnsStatement, AlterTableRenameColumnStatement, AlterTableSetLocationStatement, AlterTableSetPropertiesStatement, AlterTableUnsetPropertiesStatement, AlterViewSetPropertiesStatement, AlterViewUnsetPropertiesStatement, CreateTableAsSelectStatement, CreateTableStatement, DeleteFromStatement, DescribeColumnStatement, DescribeTableStatement, DropTableStatement, DropViewStatement, InsertIntoStatement, QualifiedColType, ReplaceTableAsSelectStatement, ReplaceTableStatement, ShowNamespacesStatement, ShowTablesStatement}
++import org.apache.spark.sql.catalyst.plans.logical.sql.{AlterTableAddColumnsStatement, AlterTableAlterColumnStatement, AlterTableDropColumnsStatement, AlterTableRenameColumnStatement, AlterTableSetLocationStatement, AlterTableSetPropertiesStatement, AlterTableUnsetPropertiesStatement, AlterViewSetPropertiesStatement, AlterViewUnsetPropertiesStatement, CreateTableAsSelectStatement, CreateTableStatement, DeleteFromStatement, DescribeColumnStatement, DescribeTableStatement, DropTableStatement, DropViewStatement, InsertIntoStatement, QualifiedColType, ReplaceTableAsSelectStatement, ReplaceTableStatement, ShowNamespacesStatement, ShowTablesStatement, UpdateTableStatement}
+ import org.apache.spark.sql.connector.expressions.{ApplyTransform, BucketTransform, DaysTransform, FieldReference, HoursTransform, IdentityTransform, LiteralValue, MonthsTransform, Transform, YearsTransform}
+ import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructType, TimestampType}
+ import org.apache.spark.unsafe.types.UTF8String
+@@ -789,6 +789,48 @@ class DDLParserSuite extends AnalysisTest {
+     assert(exc.getMessage.contains("Columns aliases is not allowed in DELETE."))
+   }
+ 
++  test("update table: basic") {
++    parseCompare(
++      """
++        |UPDATE testcat.ns1.ns2.tbl
++        |SET t.a='Robert', t.b=32
++      """.stripMargin,
++      UpdateTableStatement(
++        Seq("testcat", "ns1", "ns2", "tbl"),
++        None,
++        Seq(Seq("t", "a"), Seq("t", "b")),
++        Seq(Literal("Robert"), Literal(32)),
++        None))
++  }
++
++  test("update table: with alias and where clause") {
++    parseCompare(
++      """
++        |UPDATE testcat.ns1.ns2.tbl AS t
++        |SET t.a='Robert', t.b=32
++        |WHERE t.c=2
++      """.stripMargin,
++      UpdateTableStatement(
++        Seq("testcat", "ns1", "ns2", "tbl"),
++        Some("t"),
++        Seq(Seq("t", "a"), Seq("t", "b")),
++        Seq(Literal("Robert"), Literal(32)),
++        Some(EqualTo(UnresolvedAttribute("t.c"), Literal(2)))))
++  }
++
++  test("update table: columns aliases is not allowed") {
++    val exc = intercept[ParseException] {
++      parsePlan(
++        """
++          |UPDATE testcat.ns1.ns2.tbl AS t(a,b,c,d)
++          |SET b='Robert', c=32
++          |WHERE d=2
++        """.stripMargin)
++    }
++
++    assert(exc.getMessage.contains("Columns aliases is not allowed in UPDATE."))
++  }
++
+   test("show tables") {
+     comparePlans(
+       parsePlan("SHOW TABLES"),
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DataSourceResolution.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DataSourceResolution.scala
+index b9b8e069d5237..dfa5a68661289 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DataSourceResolution.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DataSourceResolution.scala
+@@ -24,7 +24,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
+ import org.apache.spark.sql.catalyst.analysis.{CastSupport, UnresolvedRelation}
+ import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogTable, CatalogTableType, CatalogUtils}
+ import org.apache.spark.sql.catalyst.plans.logical.{CreateTableAsSelect, CreateV2Table, DeleteFromTable, DropTable, LogicalPlan, ReplaceTable, ReplaceTableAsSelect, ShowNamespaces, ShowTables, SubqueryAlias}
+-import org.apache.spark.sql.catalyst.plans.logical.sql.{AlterTableAddColumnsStatement, AlterTableSetLocationStatement, AlterTableSetPropertiesStatement, AlterTableUnsetPropertiesStatement, AlterViewSetPropertiesStatement, AlterViewUnsetPropertiesStatement, CreateTableAsSelectStatement, CreateTableStatement, DeleteFromStatement, DescribeColumnStatement, DescribeTableStatement, DropTableStatement, DropViewStatement, QualifiedColType, ReplaceTableAsSelectStatement, ReplaceTableStatement, ShowNamespacesStatement, ShowTablesStatement}
++import org.apache.spark.sql.catalyst.plans.logical.sql.{AlterTableAddColumnsStatement, AlterTableSetLocationStatement, AlterTableSetPropertiesStatement, AlterTableUnsetPropertiesStatement, AlterViewSetPropertiesStatement, AlterViewUnsetPropertiesStatement, CreateTableAsSelectStatement, CreateTableStatement, DeleteFromStatement, DescribeColumnStatement, DescribeTableStatement, DropTableStatement, DropViewStatement, QualifiedColType, ReplaceTableAsSelectStatement, ReplaceTableStatement, ShowNamespacesStatement, ShowTablesStatement, UpdateTableStatement}
+ import org.apache.spark.sql.catalyst.rules.Rule
+ import org.apache.spark.sql.connector.catalog.{CatalogManager, Identifier, LookupCatalog, TableCatalog}
+ import org.apache.spark.sql.connector.expressions.Transform
+@@ -187,6 +187,9 @@ case class DataSourceResolution(
+             s"No v2 catalog is available for ${namespace.quoted}")
+       }
+ 
++    case update: UpdateTableStatement =>
++      throw new AnalysisException(s"Update table is not supported temporarily.")
++
+     case ShowTablesStatement(None, pattern) =>
+       defaultCatalog match {
+         case Some(catalog) =>
+diff --git a/sql/core/src/test/resources/sql-tests/results/pgSQL/comments.sql.out b/sql/core/src/test/resources/sql-tests/results/pgSQL/comments.sql.out
+index fbd32fc909076..5e8383e794579 100644
+--- a/sql/core/src/test/resources/sql-tests/results/pgSQL/comments.sql.out
++++ b/sql/core/src/test/resources/sql-tests/results/pgSQL/comments.sql.out
+@@ -42,7 +42,7 @@ struct<>
+ -- !query 4 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ /* This is an example of SQL which should not execute:
+@@ -58,7 +58,7 @@ struct<>
+ -- !query 5 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-extraneous input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++extraneous input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ */
+@@ -74,7 +74,7 @@ struct<>
+ -- !query 6 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ /*
+@@ -92,7 +92,7 @@ struct<>
+ -- !query 7 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-mismatched input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++mismatched input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ */
+@@ -114,7 +114,7 @@ struct<>
+ -- !query 8 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-extraneous input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++extraneous input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ */
+@@ -134,7 +134,7 @@ struct<>
+ -- !query 9 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ /* Second level of nesting...
+@@ -150,7 +150,7 @@ struct<>
+ -- !query 10 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++mismatched input '/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ /* Third level of nesting...
+@@ -170,7 +170,7 @@ struct<>
+ -- !query 11 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-mismatched input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
++mismatched input '*/' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 0)
+ 
+ == SQL ==
+ */
+@@ -189,7 +189,7 @@ struct<>
+ -- !query 12 output
+ org.apache.spark.sql.catalyst.parser.ParseException
+ 
+-mismatched input '<EOF>' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'USE', 'VALUES', 'WITH'}(line 1, pos 37)
++mismatched input '<EOF>' expecting {'(', 'ADD', 'ALTER', 'ANALYZE', 'CACHE', 'CLEAR', 'COMMIT', 'CREATE', 'DELETE', 'DESC', 'DESCRIBE', 'DFS', 'DROP', 'EXPLAIN', 'EXPORT', 'FROM', 'GRANT', 'IMPORT', 'INSERT', 'LIST', 'LOAD', 'LOCK', 'MAP', 'MSCK', 'REDUCE', 'REFRESH', 'REPLACE', 'RESET', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SHOW', 'START', 'TABLE', 'TRUNCATE', 'UNCACHE', 'UNLOCK', 'UPDATE', 'USE', 'VALUES', 'WITH'}(line 1, pos 37)
+ 
+ == SQL ==
+ /* and this is the end of the file */
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/connector/DataSourceV2SQLSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/connector/DataSourceV2SQLSuite.scala
+index 9eb8e5b3b73fc..7fde00fe9a419 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/connector/DataSourceV2SQLSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/connector/DataSourceV2SQLSuite.scala
+@@ -1049,6 +1049,31 @@ class DataSourceV2SQLSuite
+     }
+   }
+ 
++  test("Update: basic - update all") {
++    val t = "testcat.ns1.ns2.tbl"
++    withTable(t) {
++      sql(
++        s"""
++           |CREATE TABLE $t (id bigint, name string, age int, p int)
++           |USING foo
++           |PARTITIONED BY (id, p)
++         """.stripMargin)
++      sql(
++        s"""
++           |INSERT INTO $t
++           |VALUES (1L, 'Herry', 26, 1),
++           |(2L, 'Jack', 31, 2),
++           |(3L, 'Lisa', 28, 3),
++           |(4L, 'Frank', 33, 3)
++         """.stripMargin)
++    }
++    val errMsg = "Update table is not supported temporarily"
++    testCreateAnalysisError(
++      s"UPDATE $t SET name='Robert', age=32",
++      errMsg
++    )
++  }
++
+   private def testCreateAnalysisError(sqlStatement: String, expectedError: String): Unit = {
+     val errMsg = intercept[AnalysisException] {
+       sql(sqlStatement)

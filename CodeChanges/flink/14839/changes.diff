@@ -1,0 +1,3738 @@
+diff --git a/flink-dstl/flink-dstl-dfs/pom.xml b/flink-dstl/flink-dstl-dfs/pom.xml
+new file mode 100644
+index 0000000000000..8ace593a4cc8e
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/pom.xml
+@@ -0,0 +1,87 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++Licensed to the Apache Software Foundation (ASF) under one
++or more contributor license agreements.  See the NOTICE file
++distributed with this work for additional information
++regarding copyright ownership.  The ASF licenses this file
++to you under the Apache License, Version 2.0 (the
++"License"); you may not use this file except in compliance
++with the License.  You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing,
++software distributed under the License is distributed on an
++"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++KIND, either express or implied.  See the License for the
++specific language governing permissions and limitations
++under the License.
++
++-->
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++		 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++		 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
++
++	<modelVersion>4.0.0</modelVersion>
++
++	<parent>
++		<groupId>org.apache.flink</groupId>
++		<artifactId>flink-dstl</artifactId>
++		<version>1.14-SNAPSHOT</version>
++		<relativePath>..</relativePath>
++	</parent>
++
++	<artifactId>flink-dstl-dfs_${scala.binary.version}</artifactId>
++	<name>Flink : DSTL : DFS</name>
++
++	<packaging>jar</packaging>
++
++	<dependencies>
++
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-core</artifactId>
++			<version>${project.version}</version>
++			<scope>provided</scope>
++		</dependency>
++
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-runtime_${scala.binary.version}</artifactId>
++			<version>${project.version}</version>
++			<type>test-jar</type>
++		</dependency>
++
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-runtime_${scala.binary.version}</artifactId>
++			<version>${project.version}</version>
++			<type>jar</type>
++		</dependency>
++
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-streaming-java_${scala.binary.version}</artifactId>
++			<version>${project.version}</version>
++		</dependency>
++
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-streaming-java_${scala.binary.version}</artifactId>
++			<version>${project.version}</version>
++			<type>test-jar</type>
++		</dependency>
++
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-shaded-guava</artifactId>
++		</dependency>
++
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-test-utils-junit</artifactId>
++		</dependency>
++
++	</dependencies>
++
++</project>
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/BatchingStateChangeUploader.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/BatchingStateChangeUploader.java
+new file mode 100644
+index 0000000000000..066544151c635
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/BatchingStateChangeUploader.java
+@@ -0,0 +1,177 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import javax.annotation.Nullable;
++import javax.annotation.concurrent.GuardedBy;
++import javax.annotation.concurrent.ThreadSafe;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.LinkedList;
++import java.util.Queue;
++import java.util.concurrent.CancellationException;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
++
++import static java.lang.Thread.holdsLock;
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++import static java.util.concurrent.TimeUnit.SECONDS;
++import static org.apache.flink.util.ExceptionUtils.findThrowable;
++import static org.apache.flink.util.Preconditions.checkState;
++
++/**
++ * A {@link StateChangeUploader} that waits for some configured amount of time before passing the
++ * accumulated state changes to the actual store.
++ */
++@ThreadSafe
++class BatchingStateChangeUploader implements StateChangeUploader {
++    private static final Logger LOG = LoggerFactory.getLogger(BatchingStateChangeUploader.class);
++
++    private final RetryingExecutor retryingExecutor;
++    private final RetryPolicy retryPolicy;
++    private final StateChangeUploader delegate;
++    private final ScheduledExecutorService scheduler;
++    private final long scheduleDelayMs;
++    private final long sizeThresholdBytes;
++
++    @GuardedBy("scheduled")
++    private final Queue<StateChangeSetUpload> scheduled;
++
++    @GuardedBy("scheduled")
++    private long scheduledSizeInBytes;
++
++    @Nullable
++    @GuardedBy("scheduled")
++    private ScheduledFuture<?> scheduledFuture;
++
++    private volatile Throwable error;
++
++    BatchingStateChangeUploader(
++            long persistDelayMs,
++            long sizeThresholdBytes,
++            RetryPolicy retryPolicy,
++            StateChangeUploader delegate) {
++        this(
++                persistDelayMs,
++                sizeThresholdBytes,
++                retryPolicy,
++                delegate,
++                SchedulerFactory.create(1, "ChangelogRetryScheduler", LOG),
++                new RetryingExecutor());
++    }
++
++    BatchingStateChangeUploader(
++            long persistDelayMs,
++            long sizeThresholdBytes,
++            RetryPolicy retryPolicy,
++            StateChangeUploader delegate,
++            ScheduledExecutorService scheduler,
++            RetryingExecutor retryingExecutor) {
++        this.scheduleDelayMs = persistDelayMs;
++        this.scheduled = new LinkedList<>();
++        this.scheduler = scheduler;
++        this.retryPolicy = retryPolicy;
++        this.retryingExecutor = retryingExecutor;
++        this.sizeThresholdBytes = sizeThresholdBytes;
++        this.delegate = delegate;
++    }
++
++    @Override
++    public void upload(Collection<StateChangeSetUpload> changeSets) {
++        if (error != null) {
++            LOG.debug("don't persist {} changesets, already failed", changeSets.size());
++            changeSets.forEach(cs -> cs.fail(error));
++            return;
++        }
++        LOG.debug("persist {} changeSets", changeSets.size());
++        try {
++            synchronized (scheduled) {
++                for (StateChangeSetUpload upload : changeSets) {
++                    scheduled.add(upload);
++                    scheduledSizeInBytes += upload.getSize();
++                }
++                scheduleUploadIfNeeded();
++            }
++        } catch (Exception e) {
++            changeSets.forEach(cs -> cs.fail(e));
++            throw e;
++        }
++    }
++
++    private void scheduleUploadIfNeeded() {
++        checkState(holdsLock(scheduled));
++        if (scheduleDelayMs == 0 || scheduledSizeInBytes >= sizeThresholdBytes) {
++            if (scheduledFuture != null) {
++                scheduledFuture.cancel(false);
++                scheduledFuture = null;
++            }
++            drainAndSave();
++        } else if (scheduledFuture == null) {
++            scheduledFuture = scheduler.schedule(this::drainAndSave, scheduleDelayMs, MILLISECONDS);
++        }
++    }
++
++    private void drainAndSave() {
++        Collection<StateChangeSetUpload> changeSets;
++        synchronized (scheduled) {
++            changeSets = new ArrayList<>(scheduled);
++            scheduled.clear();
++            scheduledSizeInBytes = 0;
++            scheduledFuture = null;
++        }
++        try {
++            if (error != null) {
++                changeSets.forEach(changeSet -> changeSet.fail(error));
++                return;
++            }
++            retryingExecutor.execute(retryPolicy, () -> delegate.upload(changeSets));
++        } catch (Throwable t) {
++            changeSets.forEach(changeSet -> changeSet.fail(t));
++            if (findThrowable(t, IOException.class).isPresent()) {
++                LOG.warn("Caught IO exception while uploading", t);
++            } else {
++                error = t;
++                throw t;
++            }
++        }
++    }
++
++    @Override
++    public void close() throws Exception {
++        LOG.debug("close");
++        scheduler.shutdownNow();
++        if (!scheduler.awaitTermination(1, SECONDS)) {
++            LOG.warn("Unable to cleanly shutdown scheduler in 1s");
++        }
++        ArrayList<StateChangeSetUpload> drained;
++        synchronized (scheduled) {
++            drained = new ArrayList<>(scheduled);
++            scheduled.clear();
++            scheduledSizeInBytes = 0;
++        }
++        CancellationException ce = new CancellationException();
++        drained.forEach(upload -> upload.fail(ce));
++        retryingExecutor.close();
++        delegate.close();
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogCleaner.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogCleaner.java
+new file mode 100644
+index 0000000000000..cd78eeb82270a
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogCleaner.java
+@@ -0,0 +1,47 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.annotation.Internal;
++import org.apache.flink.configuration.ReadableConfig;
++import org.apache.flink.util.ExceptionUtils;
++
++import static org.apache.flink.changelog.fs.FsStateChangelogOptions.NUM_THREADS_CLEANUP;
++
++/**
++ * Cleans up the state NOT owned by JM. Currently, this is only non-reported to JM or aborted by JM.
++ */
++@Internal
++public interface FsStateChangelogCleaner {
++
++    void cleanupAsync(StoreResult storeResult);
++
++    FsStateChangelogCleaner NO_OP = storeResult -> {};
++    FsStateChangelogCleaner DIRECT =
++            storeResult -> {
++                try {
++                    storeResult.getStreamStateHandle().discardState();
++                } catch (Exception e) {
++                    ExceptionUtils.rethrow(e);
++                }
++            };
++
++    static FsStateChangelogCleaner fromConfig(ReadableConfig config) {
++        return new FsStateChangelogCleanerImpl(config.get(NUM_THREADS_CLEANUP));
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogCleanerImpl.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogCleanerImpl.java
+new file mode 100644
+index 0000000000000..595023445b685
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogCleanerImpl.java
+@@ -0,0 +1,66 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.concurrent.Executor;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++
++class FsStateChangelogCleanerImpl implements FsStateChangelogCleaner {
++    private static final Logger LOG = LoggerFactory.getLogger(FsStateChangelogCleanerImpl.class);
++    private static final int MAX_TASKS_PER_THREAD = 100;
++
++    private final Executor executor;
++
++    public FsStateChangelogCleanerImpl(int nThreads) {
++        // Use a fixed-size thread pool with a bounded queue so that cleanupAsync back pressures
++        // callers if the cleanup doesn't keep up.
++        // In all cases except abort this are uploader threads; while on abort this is the task
++        // thread.
++        this(
++                new ThreadPoolExecutor(
++                        nThreads,
++                        nThreads,
++                        0L,
++                        TimeUnit.MILLISECONDS,
++                        new LinkedBlockingQueue<>(nThreads * MAX_TASKS_PER_THREAD),
++                        (ThreadFactory) Thread::new));
++    }
++
++    public FsStateChangelogCleanerImpl(Executor executor) {
++        this.executor = executor;
++    }
++
++    @Override
++    public void cleanupAsync(StoreResult storeResult) {
++        LOG.debug("cleanup async store result: {}", storeResult);
++        executor.execute(
++                () -> {
++                    try {
++                        storeResult.getStreamStateHandle().discardState();
++                    } catch (Exception e) {
++                        LOG.warn("unable to discard {}", storeResult);
++                    }
++                });
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogOptions.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogOptions.java
+new file mode 100644
+index 0000000000000..d3a8146ee24ec
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogOptions.java
+@@ -0,0 +1,119 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.annotation.Experimental;
++import org.apache.flink.configuration.ConfigOption;
++import org.apache.flink.configuration.ConfigOptions;
++import org.apache.flink.configuration.MemorySize;
++
++import java.time.Duration;
++
++import static org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions.CHECKPOINTING_TIMEOUT;
++
++/** {@link ConfigOptions} for {@link FsStateChangelogStorage}. */
++@Experimental
++public class FsStateChangelogOptions {
++    public static final ConfigOption<String> BASE_PATH =
++            ConfigOptions.key("dstl.dfs.base-path")
++                    .stringType()
++                    .noDefaultValue()
++                    .withDescription("Base path to store changelog files.");
++    public static final ConfigOption<Boolean> COMPRESSION_ENABLED =
++            ConfigOptions.key("dstl.dfs.compression.enabled")
++                    .booleanType()
++                    .defaultValue(false)
++                    .withDescription("Whether to enable compression when serializing changelog.");
++    public static final ConfigOption<MemorySize> PREEMPTIVE_PERSIST_THRESHOLD =
++            ConfigOptions.key("dstl.dfs.preemptive-persist-threshold")
++                    .memoryType()
++                    .defaultValue(MemorySize.parse("5Mb"))
++                    .withDescription(
++                            "Size threshold for state changes of a single operator "
++                                    + "beyond which they are persisted pre-emptively without waiting for a checkpoint. "
++                                    + " Improves checkpointing time by allowing quasi-continuous uploading of state changes "
++                                    + "(as opposed to uploading all accumulated changes on checkpoint).");
++    public static final ConfigOption<Duration> PERSIST_DELAY =
++            ConfigOptions.key("dstl.dfs.batch.persist-delay")
++                    .durationType()
++                    .defaultValue(Duration.ofMillis(10))
++                    .withDescription(
++                            "Delay before persisting changelog after receiving persist request (on checkpoint). "
++                                    + "Minimizes the number of files and requests "
++                                    + "if multiple operators (backends) or sub-tasks are using the same store. "
++                                    + "Correspondingly increases checkpoint time (async phase).");
++    public static final ConfigOption<MemorySize> PERSIST_SIZE_THRESHOLD =
++            ConfigOptions.key("dstl.dfs.batch.persist-size-threshold")
++                    .memoryType()
++                    .defaultValue(MemorySize.parse("10Mb"))
++                    .withDescription(
++                            "Size threshold for state changes that were requested to be persisted but are waiting for "
++                                    + PERSIST_DELAY.key()
++                                    + " (from all operators). "
++                                    + ". Once reached, accumulated changes are persisted immediately. "
++                                    + "This is different from "
++                                    + PREEMPTIVE_PERSIST_THRESHOLD.key()
++                                    + " as it happens AFTER the checkpoint and potentially for state changes of multiple operators.");
++    public static final ConfigOption<String> RETRY_POLICY =
++            ConfigOptions.key("dstl.dfs.upload.retry-policy")
++                    .stringType()
++                    .defaultValue("fixed")
++                    .withDescription(
++                            "Retry policy for the failed uploads (in particular, timed out). Valid values: none, fixed.");
++    public static final ConfigOption<Duration> UPLOAD_TIMEOUT =
++            ConfigOptions.key("dstl.dfs.upload.timeout")
++                    .durationType()
++                    .defaultValue(Duration.ofSeconds(1))
++                    .withDescription(
++                            "Time threshold beyond which an upload is considered timed out. "
++                                    + "If a new attempt is made but this upload succeeds earlier then this upload result will be used. "
++                                    + "May improve upload times if tail latencies of upload requests are significantly high. "
++                                    + "Only takes effect if "
++                                    + RETRY_POLICY.key()
++                                    + " is fixed. "
++                                    + "Please note that timeout * max_attempts should be less than "
++                                    + CHECKPOINTING_TIMEOUT.key());
++    public static final ConfigOption<Integer> RETRY_MAX_ATTEMPTS =
++            ConfigOptions.key("dstl.dfs.upload.max-attempts")
++                    .intType()
++                    .defaultValue(3)
++                    .withDescription(
++                            "Maximum number of attempts (including the initial one) to peform a particular upload. "
++                                    + "Only takes effect if "
++                                    + RETRY_POLICY.key()
++                                    + " is fixed.");
++    public static final ConfigOption<Duration> RETRY_DELAY_AFTER_FAILURE =
++            ConfigOptions.key("dstl.dfs.upload.next-attempt-delay")
++                    .durationType()
++                    .defaultValue(Duration.ofMillis(500))
++                    .withDescription(
++                            "Delay before the next attempt (if the failure was not caused by a timeout).");
++    public static final ConfigOption<MemorySize> UPLOAD_BUFFER_SIZE =
++            ConfigOptions.key("dstl.dfs.upload.buffer-size")
++                    .memoryType()
++                    .defaultValue(MemorySize.parse("1Mb"))
++                    .withDescription("Buffer size used when uploading change sets");
++    public static final ConfigOption<Integer> NUM_THREADS_CLEANUP =
++            ConfigOptions.key("dstl.dfs.num-threads-cleanup")
++                    .intType()
++                    .defaultValue(5)
++                    .withDescription(
++                            "Number of threads to use to perform cleanup in case an upload is discarded "
++                                    + "(and not cleaned up by JM). "
++                                    + "If the cleanup doesn't keep up then task might be back-pressured.");
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogStorage.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogStorage.java
+new file mode 100644
+index 0000000000000..63c2bdda08088
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogStorage.java
+@@ -0,0 +1,134 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.annotation.Experimental;
++import org.apache.flink.configuration.Configuration;
++import org.apache.flink.configuration.ReadableConfig;
++import org.apache.flink.core.fs.Path;
++import org.apache.flink.runtime.state.KeyGroupRange;
++import org.apache.flink.runtime.state.changelog.ChangelogStateHandleStreamImpl;
++import org.apache.flink.runtime.state.changelog.StateChangelogHandleReader;
++import org.apache.flink.runtime.state.changelog.StateChangelogHandleStreamHandleReader;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
++import org.apache.flink.util.ExceptionUtils;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++import java.io.Serializable;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static org.apache.flink.changelog.fs.FsStateChangelogOptions.PREEMPTIVE_PERSIST_THRESHOLD;
++import static org.apache.flink.util.Preconditions.checkState;
++
++/** Filesystem-based implementation of {@link StateChangelogStorage}. */
++@Experimental
++public class FsStateChangelogStorage
++        implements StateChangelogStorage<ChangelogStateHandleStreamImpl>, Serializable {
++    private static final Logger LOG = LoggerFactory.getLogger(FsStateChangelogStorage.class);
++    private static final long serialVersionUID = 1L;
++
++    /**
++     * The log id is only needed on write to separate changes from different backends (i.e.
++     * operators) in the resulting file.
++     */
++    private transient AtomicInteger logIdGenerator = new AtomicInteger(0);
++
++    private transient volatile StateChangeUploader uploader;
++    private transient volatile FsStateChangelogCleaner cleaner;
++    private volatile ReadableConfig config; // todo: make final after FLINK-21804
++
++    /**
++     * Creates a non-initialized factory to load via SPI. {@link #configure(ReadableConfig)} must be
++     * called before use.
++     */
++    @SuppressWarnings("unused")
++    public FsStateChangelogStorage() {}
++
++    @Override
++    public void configure(ReadableConfig config) {
++        if (uploader != null) {
++            checkState(config == this.config, "reconfiguration attempt");
++            return;
++        }
++        try {
++            cleaner = FsStateChangelogCleaner.fromConfig(config);
++            uploader = StateChangeUploader.fromConfig(config, cleaner);
++            logIdGenerator = new AtomicInteger(0);
++        } catch (IOException e) {
++            ExceptionUtils.rethrow(e);
++        }
++        this.config = config;
++    }
++
++    /**
++     * Creates {@link FsStateChangelogStorage client} that uses a simple {@link
++     * StateChangeFsUploader} (i.e without any batching or retrying other than on FS level).
++     */
++    public FsStateChangelogStorage(
++            Path basePath, boolean compression, int bufferSize, FsStateChangelogCleaner cleaner)
++            throws IOException {
++        this(
++                new StateChangeFsUploader(
++                        basePath, basePath.getFileSystem(), compression, bufferSize, cleaner),
++                cleaner);
++    }
++
++    /**
++     * Creates {@link FsStateChangelogStorage client} that uses a given {@link StateChangeUploader}.
++     */
++    public FsStateChangelogStorage(StateChangeUploader uploader, FsStateChangelogCleaner cleaner) {
++        this.uploader = uploader;
++        this.cleaner = cleaner;
++        this.config = new Configuration();
++    }
++
++    @Override
++    public FsStateChangelogWriter createWriter(String operatorID, KeyGroupRange keyGroupRange) {
++        checkState(config != null);
++        if (uploader == null) {
++            synchronized (this) {
++                if (uploader == null) {
++                    configure(config);
++                }
++            }
++        }
++        UUID logId = new UUID(0, logIdGenerator.getAndIncrement());
++        LOG.info("createWriter for operator {}/{}: {}", operatorID, keyGroupRange, logId);
++        return new FsStateChangelogWriter(
++                logId,
++                keyGroupRange,
++                uploader,
++                config.get(PREEMPTIVE_PERSIST_THRESHOLD).getBytes());
++    }
++
++    @Override
++    public StateChangelogHandleReader<ChangelogStateHandleStreamImpl> createReader() {
++        return new StateChangelogHandleStreamHandleReader(new StateChangeFormat());
++    }
++
++    @Override
++    public void close() throws Exception {
++        if (uploader != null) {
++            uploader.close();
++        }
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogWriter.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogWriter.java
+new file mode 100644
+index 0000000000000..dd53deda852be
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/FsStateChangelogWriter.java
+@@ -0,0 +1,275 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.annotation.VisibleForTesting;
++import org.apache.flink.api.java.tuple.Tuple2;
++import org.apache.flink.runtime.state.KeyGroupRange;
++import org.apache.flink.runtime.state.StreamStateHandle;
++import org.apache.flink.runtime.state.changelog.ChangelogStateHandleStreamImpl;
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++import org.apache.flink.runtime.state.changelog.StateChange;
++import org.apache.flink.runtime.state.changelog.StateChangelogWriter;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import javax.annotation.concurrent.NotThreadSafe;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Comparator;
++import java.util.List;
++import java.util.NavigableMap;
++import java.util.TreeMap;
++import java.util.UUID;
++import java.util.concurrent.CompletableFuture;
++
++import static java.util.stream.Collectors.toList;
++import static org.apache.flink.changelog.fs.StateChangeSet.Status.CONFIRMED;
++import static org.apache.flink.changelog.fs.StateChangeSet.Status.PENDING;
++import static org.apache.flink.util.Preconditions.checkArgument;
++import static org.apache.flink.util.Preconditions.checkNotNull;
++import static org.apache.flink.util.Preconditions.checkState;
++import static org.apache.flink.util.concurrent.FutureUtils.combineAll;
++
++@NotThreadSafe
++class FsStateChangelogWriter implements StateChangelogWriter<ChangelogStateHandleStreamImpl> {
++    private static final Logger LOG = LoggerFactory.getLogger(FsStateChangelogWriter.class);
++    private static final SequenceNumber INITIAL_SQN = SequenceNumber.of(0L);
++
++    private final UUID logId;
++    private final KeyGroupRange keyGroupRange;
++    private final StateChangeUploader store;
++    private final NavigableMap<SequenceNumber, StateChangeSet> changeSets = new TreeMap<>();
++    private final long appendPersistThreshold;
++    private List<StateChange> activeChangeSet = new ArrayList<>(); // todo: group by
++    private SequenceNumber activeSequenceNumber = INITIAL_SQN;
++    private boolean closed;
++    private long accumulatedBytes;
++    private SequenceNumber nextAutoFlushFrom = activeSequenceNumber;
++
++    FsStateChangelogWriter(
++            UUID logId,
++            KeyGroupRange keyGroupRange,
++            StateChangeUploader store,
++            long appendPersistThreshold) {
++        this.logId = logId;
++        this.keyGroupRange = keyGroupRange;
++        this.store = store;
++        this.appendPersistThreshold = appendPersistThreshold;
++    }
++
++    @Override
++    public void append(int keyGroup, byte[] value) throws IOException {
++        LOG.trace("append to {}: keyGroup={} {} bytes", logId, keyGroup, value.length);
++        checkState(!closed, "%s is closed", logId);
++        activeChangeSet.add(new StateChange(keyGroup, value));
++        accumulatedBytes += value.length;
++        if (accumulatedBytes >= appendPersistThreshold) {
++            LOG.debug(
++                    "pre-emptively flush {}Mb of appended changes to the common store",
++                    accumulatedBytes / 1024 / 1024);
++            persistInternal(nextAutoFlushFrom, true);
++            // considerations:
++            // 0. can actually degrade performance by amplifying number of requests
++            // 1. which range to persist?
++            // 2. how to deal with retries/aborts?
++        }
++    }
++
++    @Override
++    public SequenceNumber initialSequenceNumber() {
++        return INITIAL_SQN;
++    }
++
++    @Override
++    public SequenceNumber lastAppendedSequenceNumber() {
++        LOG.trace("query {} sqn: {}", logId, activeSequenceNumber);
++        SequenceNumber tmp = activeSequenceNumber;
++        rollover();
++        return tmp;
++    }
++
++    @Override
++    public CompletableFuture<ChangelogStateHandleStreamImpl> persist(SequenceNumber from)
++            throws IOException {
++        LOG.debug(
++                "persist {} starting from sqn {} (incl.), active sqn: {}",
++                logId,
++                from,
++                activeSequenceNumber);
++        checkNotNull(from);
++        // with pre-flushes, backend will have an old sqn
++        checkArgument(
++                from.equals(INITIAL_SQN)
++                        || activeSequenceNumber.next().equals(from)
++                        || changeSets.containsKey(from),
++                "sequence number %s to persist from not in range (%s:%s/%s)",
++                from,
++                changeSets.isEmpty() ? null : changeSets.firstKey(),
++                changeSets.isEmpty() ? null : changeSets.lastKey(),
++                activeSequenceNumber.next());
++
++        Collection<StateChangeSetUpload> uploads = persistInternal(from, false);
++        return combineAll(
++                        uploads.stream()
++                                .map(StateChangeSetUpload::getStoreResultFuture)
++                                .collect(toList()))
++                .thenApply(this::buildHandle);
++    }
++
++    private Collection<StateChangeSetUpload> persistInternal(
++            SequenceNumber from, boolean isPreUpload) throws IOException {
++        rollover();
++        nextAutoFlushFrom = activeSequenceNumber;
++        Collected collected = collect(from, isPreUpload);
++        if (!collected.toUpload.isEmpty()) {
++            store.upload(collected.toUpload);
++        }
++        accumulatedBytes = 0; // not always correct, but best effort
++        return collected.toReturn;
++    }
++
++    private Collected collect(SequenceNumber from, boolean isPreUpload) {
++        Collected result = new Collected();
++        changeSets
++                .tailMap(from, true)
++                .values()
++                .forEach(changeSet -> decideToCollect(changeSet, result, isPreUpload));
++        result.toReturn.addAll(result.toUpload);
++        LOG.debug("collected {}", result);
++        return result;
++    }
++
++    @SuppressWarnings("StatementWithEmptyBody")
++    private void decideToCollect(StateChangeSet changeSet, Collected result, boolean isPreUpload) {
++        if (changeSet.getStatus() == CONFIRMED) {
++            result.toReturn.add(changeSet.getCurrentUpload());
++        } else if (changeSet.getStatus() == PENDING) {
++            changeSet.startUpload();
++            if (!isPreUpload) {
++                changeSet.associateUploadWithCheckpoint();
++            }
++            result.toUpload.add(changeSet.getCurrentUpload());
++        } else if (isPreUpload) {
++            // an upload was already started - and we don't want to re-upload now
++        } else if (changeSet.isUploadAssociatedWithCheckpoint()) {
++            // re-upload changes sent to JM as it can decide to discard them.
++            // also re-upload any scheduled/uploading/uploaded changes even if they were not sent to
++            // the JM yet - this can happen in the meantime from the future callback
++            LOG.trace("re-upload {}", changeSet);
++            changeSet.startUpload();
++            result.toUpload.add(changeSet.getCurrentUpload());
++        } else {
++            // an upload was started pre-emptively - grab the result and force future callers to
++            // re-upload
++            changeSet.associateUploadWithCheckpoint();
++            result.toReturn.add(changeSet.getCurrentUpload());
++        }
++    }
++
++    @Override
++    public void close() {
++        LOG.debug("close {}", logId);
++        checkState(!closed);
++        closed = true;
++        activeChangeSet.clear();
++        changeSets.values().forEach(StateChangeSet::setCancelled);
++        changeSets.clear();
++        // the store is closed from the owning FsStateChangelogClient
++    }
++
++    @Override
++    public void confirm(SequenceNumber from, SequenceNumber to) {
++        LOG.debug("confirm range {}..{} (inc./excl.) for {}", from, to, logId);
++        changeSets
++                .subMap(from, true, to, false)
++                .forEach((sequenceNumber, stateChangeSet) -> stateChangeSet.setConfirmed());
++    }
++
++    @Override
++    public void reset(SequenceNumber from, SequenceNumber to) {
++        LOG.debug("reset range {}..{} (inc./excl.) for {}", from, to, logId);
++        changeSets
++                .subMap(from, true, to, false)
++                .values()
++                .forEach(StateChangeSet::discardCurrentUpload);
++    }
++
++    @Override
++    public void truncate(SequenceNumber to) {
++        LOG.debug("truncate {} to sqn {} (excl.)", logId, to);
++        if (to.compareTo(activeSequenceNumber) > 0) {
++            // can happen if client calls truncate(prevSqn.next())
++            rollover();
++        }
++        NavigableMap<SequenceNumber, StateChangeSet> headMap = changeSets.headMap(to, false);
++        headMap.values().forEach(StateChangeSet::setTruncated);
++        headMap.clear();
++    }
++
++    private void rollover() {
++        if (activeChangeSet.isEmpty()) {
++            return;
++        }
++        activeSequenceNumber = activeSequenceNumber.next();
++        LOG.debug("bump active sqn to {}", activeSequenceNumber);
++        changeSets.put(
++                activeSequenceNumber,
++                new StateChangeSet(logId, activeSequenceNumber, activeChangeSet, PENDING));
++        activeChangeSet = new ArrayList<>();
++    }
++
++    private ChangelogStateHandleStreamImpl buildHandle(Collection<StoreResult> results) {
++        List<Tuple2<StreamStateHandle, Long>> sorted =
++                results.stream()
++                        // can't assume order across different handles because of retries and aborts
++                        .sorted(Comparator.comparing(StoreResult::getSequenceNumber))
++                        .map(
++                                storeResult ->
++                                        Tuple2.of(
++                                                storeResult.getStreamStateHandle(),
++                                                storeResult.getOffset()))
++                        .collect(toList());
++        // todo: replace confirmed handles with placeholders (depends on ownership)
++        long size = results.stream().mapToLong(StoreResult::getSize).sum();
++        return new ChangelogStateHandleStreamImpl(sorted, keyGroupRange, size);
++    }
++
++    @VisibleForTesting
++    SequenceNumber lastAppendedSqnUnsafe() {
++        return activeSequenceNumber;
++    }
++
++    private static class Collected {
++        private final Collection<StateChangeSetUpload> toUpload = new ArrayList<>();
++        private final Collection<StateChangeSetUpload> toReturn = new ArrayList<>();
++
++        @Override
++        public String toString() {
++            return String.format(
++                    "changes to upload: %d (%dMb), to return total: %d (%dMb)",
++                    toUpload.size(),
++                    toUpload.stream().mapToLong(StateChangeSetUpload::getSize).sum() / 1024 / 1024,
++                    toReturn.size(),
++                    toReturn.stream().mapToLong(StateChangeSetUpload::getSize).sum() / 1024 / 1024);
++        }
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/OutputStreamWithPos.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/OutputStreamWithPos.java
+new file mode 100644
+index 0000000000000..b6be3a766a302
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/OutputStreamWithPos.java
+@@ -0,0 +1,62 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import java.io.IOException;
++import java.io.OutputStream;
++
++class OutputStreamWithPos extends OutputStream {
++    private final OutputStream outputStream;
++    private long pos;
++
++    public OutputStreamWithPos(OutputStream outputStream) {
++        this.outputStream = outputStream;
++    }
++
++    @Override
++    public void write(int b) throws IOException {
++        outputStream.write(b);
++        pos++;
++    }
++
++    @Override
++    public void write(byte[] b) throws IOException {
++        outputStream.write(b);
++        pos += b.length;
++    }
++
++    @Override
++    public void write(byte[] b, int off, int len) throws IOException {
++        outputStream.write(b, off, len);
++        pos += len;
++    }
++
++    @Override
++    public void flush() throws IOException {
++        outputStream.flush();
++    }
++
++    @Override
++    public void close() throws IOException {
++        outputStream.close();
++    }
++
++    public long getPos() {
++        return pos;
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/RetryPolicy.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/RetryPolicy.java
+new file mode 100644
+index 0000000000000..0dafd10e99deb
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/RetryPolicy.java
+@@ -0,0 +1,129 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.annotation.Internal;
++import org.apache.flink.configuration.IllegalConfigurationException;
++import org.apache.flink.configuration.ReadableConfig;
++
++import java.io.IOException;
++import java.util.concurrent.TimeoutException;
++
++/** Retry policy to use by {@link RetryingExecutor}. */
++@Internal
++public interface RetryPolicy {
++    static RetryPolicy fromConfig(ReadableConfig config) {
++        switch (config.get(FsStateChangelogOptions.RETRY_POLICY)) {
++            case "fixed":
++                return fixed(
++                        config.get(FsStateChangelogOptions.RETRY_MAX_ATTEMPTS),
++                        config.get(FsStateChangelogOptions.UPLOAD_TIMEOUT).toMillis(),
++                        config.get(FsStateChangelogOptions.RETRY_DELAY_AFTER_FAILURE).toMillis());
++            case "none":
++                return NONE;
++            default:
++                throw new IllegalConfigurationException(
++                        "Unknown retry policy: "
++                                + config.get(FsStateChangelogOptions.RETRY_POLICY));
++        }
++    }
++
++    /** @return timeout in millis. Zero or negative means no timeout. */
++    long timeoutFor(int attempt);
++
++    /**
++     * @return delay in millis before the next attempt. Negative means no retry, zero means no
++     *     delay.
++     */
++    long retryAfter(int failedAttempt, Exception exception);
++
++    int maxAttempts();
++
++    RetryPolicy NONE =
++            new RetryPolicy() {
++                @Override
++                public long timeoutFor(int attempt) {
++                    return -1L;
++                }
++
++                @Override
++                public long retryAfter(int failedAttempt, Exception exception) {
++                    return -1L;
++                }
++
++                @Override
++                public int maxAttempts() {
++                    return 1;
++                }
++
++                public String toString() {
++                    return "none";
++                }
++            };
++
++    static RetryPolicy fixed(int maxAttempts, long timeout, long delayAfterFailure) {
++        return new FixedRetryPolicy(maxAttempts, timeout, delayAfterFailure);
++    }
++
++    /** {@link RetryPolicy} with fixed timeout, delay and max attempts. */
++    class FixedRetryPolicy implements RetryPolicy {
++
++        private final long timeout;
++        private final int maxAttempts;
++        private final long delayAfterFailure;
++
++        FixedRetryPolicy(int maxAttempts, long timeout, long delayAfterFailure) {
++            this.maxAttempts = maxAttempts;
++            this.timeout = timeout;
++            this.delayAfterFailure = delayAfterFailure;
++        }
++
++        @Override
++        public long timeoutFor(int attempt) {
++            return timeout;
++        }
++
++        @Override
++        public long retryAfter(int attempt, Exception exception) {
++            if (attempt >= maxAttempts) {
++                return -1L;
++            } else if (exception instanceof TimeoutException) {
++                return 0L;
++            } else if (exception instanceof IOException) {
++                return delayAfterFailure;
++            } else {
++                return -1L;
++            }
++        }
++
++        @Override
++        public int maxAttempts() {
++            return maxAttempts;
++        }
++
++        @Override
++        public String toString() {
++            return "timeout="
++                    + timeout
++                    + ", maxAttempts="
++                    + maxAttempts
++                    + ", delay="
++                    + delayAfterFailure;
++        }
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/RetryingExecutor.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/RetryingExecutor.java
+new file mode 100644
+index 0000000000000..989e629e32aea
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/RetryingExecutor.java
+@@ -0,0 +1,149 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.util.function.RunnableWithException;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.Optional;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++
++/**
++ * A {@link RunnableWithException} executor that schedules a next attempt upon timeout based on
++ * {@link RetryPolicy}. Aimed to curb tail latencies
++ */
++class RetryingExecutor implements AutoCloseable {
++    private static final Logger LOG = LoggerFactory.getLogger(RetryingExecutor.class);
++
++    private final ScheduledExecutorService scheduler;
++
++    RetryingExecutor() {
++        this(
++                SchedulerFactory.create(
++                        Integer.parseInt(System.getProperty("ChangelogRetryScheduler", "5")),
++                        "ChangelogRetryScheduler",
++                        LOG));
++    }
++
++    RetryingExecutor(ScheduledExecutorService scheduler) {
++        this.scheduler = scheduler;
++    }
++
++    void execute(RetryPolicy retryPolicy, RunnableWithException action) {
++        LOG.debug("execute with retryPolicy: {}", retryPolicy);
++        RetriableTask task = new RetriableTask(action, retryPolicy, scheduler);
++        scheduler.submit(task);
++    }
++
++    @Override
++    public void close() throws Exception {
++        LOG.debug("close");
++        scheduler.shutdownNow();
++        if (!scheduler.awaitTermination(1, TimeUnit.SECONDS)) {
++            LOG.warn("Unable to cleanly shutdown executorService in 1s");
++        }
++    }
++
++    private static final class RetriableTask implements Runnable {
++        private final RunnableWithException runnable;
++        private final ScheduledExecutorService executorService;
++        private final int current;
++        private final RetryPolicy retryPolicy;
++        private final AtomicBoolean actionCompleted;
++        private final AtomicBoolean attemptCompleted = new AtomicBoolean(false);
++
++        RetriableTask(
++                RunnableWithException runnable,
++                RetryPolicy retryPolicy,
++                ScheduledExecutorService executorService) {
++            this(1, new AtomicBoolean(false), runnable, retryPolicy, executorService);
++        }
++
++        private RetriableTask(
++                int current,
++                AtomicBoolean actionCompleted,
++                RunnableWithException runnable,
++                RetryPolicy retryPolicy,
++                ScheduledExecutorService executorService) {
++            this.current = current;
++            this.runnable = runnable;
++            this.retryPolicy = retryPolicy;
++            this.executorService = executorService;
++            this.actionCompleted = actionCompleted;
++        }
++
++        @Override
++        public void run() {
++            if (!actionCompleted.get()) {
++                Optional<ScheduledFuture<?>> timeoutFuture = scheduleTimeout();
++                try {
++                    runnable.run();
++                    actionCompleted.set(true);
++                    attemptCompleted.set(true);
++                } catch (Exception e) {
++                    handleError(e);
++                } finally {
++                    timeoutFuture.ifPresent(f -> f.cancel(true));
++                }
++            }
++        }
++
++        private void handleError(Exception e) {
++            LOG.trace("execution attempt {} failed: {}", current, e.getMessage());
++            // prevent double completion in case of a timeout and another failure
++            boolean attemptTransition = attemptCompleted.compareAndSet(false, true);
++            if (attemptTransition && !actionCompleted.get()) {
++                long nextAttemptDelay = retryPolicy.retryAfter(current, e);
++                if (nextAttemptDelay == 0L) {
++                    executorService.submit(next());
++                } else if (nextAttemptDelay > 0L) {
++                    executorService.schedule(next(), nextAttemptDelay, MILLISECONDS);
++                } else {
++                    actionCompleted.set(true);
++                }
++            }
++        }
++
++        private RetriableTask next() {
++            return new RetriableTask(
++                    current + 1, actionCompleted, runnable, retryPolicy, executorService);
++        }
++
++        private Optional<ScheduledFuture<?>> scheduleTimeout() {
++            long timeout = retryPolicy.timeoutFor(current);
++            return timeout <= 0
++                    ? Optional.empty()
++                    : Optional.of(
++                            executorService.schedule(
++                                    () -> handleError(fmtError(timeout)), timeout, MILLISECONDS));
++        }
++
++        private TimeoutException fmtError(long timeout) {
++            return new TimeoutException(
++                    String.format("Attempt %d timed out after %dms", current, timeout));
++        }
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/SchedulerFactory.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/SchedulerFactory.java
+new file mode 100644
+index 0000000000000..725912380cf5c
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/SchedulerFactory.java
+@@ -0,0 +1,61 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.slf4j.Logger;
++
++import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.ScheduledThreadPoolExecutor;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static org.apache.flink.util.FatalExitExceptionHandler.INSTANCE;
++
++class SchedulerFactory {
++    private SchedulerFactory() {}
++
++    /**
++     * Create a {@link ScheduledThreadPoolExecutor} using the provided corePoolSize. The following
++     * behaviour is configured:
++     *
++     * <ul>
++     *   <li>rejected executions are logged if the executor is {@link
++     *       java.util.concurrent.ThreadPoolExecutor#isShutdown shutdown}
++     *   <li>otherwise, {@link RejectedExecutionException} is thrown
++     *   <li>any uncaught exception fails the JVM (using {@link
++     *       org.apache.flink.runtime.util.FatalExitExceptionHandler FatalExitExceptionHandler})
++     * </ul>
++     */
++    public static ScheduledThreadPoolExecutor create(int corePoolSize, String name, Logger log) {
++        AtomicInteger cnt = new AtomicInteger(0);
++        return new ScheduledThreadPoolExecutor(
++                corePoolSize,
++                runnable -> {
++                    Thread thread = new Thread(runnable);
++                    thread.setName(name + "-" + cnt.incrementAndGet());
++                    thread.setUncaughtExceptionHandler(INSTANCE);
++                    return thread;
++                },
++                (ignored, executor) -> {
++                    if (executor.isShutdown()) {
++                        throw new RejectedExecutionException();
++                    } else {
++                        log.debug("Execution rejected because shutdown is in progress");
++                    }
++                });
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeFormat.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeFormat.java
+new file mode 100644
+index 0000000000000..e82d74bd1fb6b
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeFormat.java
+@@ -0,0 +1,163 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.annotation.Internal;
++import org.apache.flink.core.fs.FSDataInputStream;
++import org.apache.flink.core.memory.DataInputViewStreamWrapper;
++import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
++import org.apache.flink.runtime.state.SnappyStreamCompressionDecorator;
++import org.apache.flink.runtime.state.StreamStateHandle;
++import org.apache.flink.runtime.state.changelog.StateChange;
++import org.apache.flink.runtime.state.changelog.StateChangelogHandleStreamHandleReader;
++import org.apache.flink.util.CloseableIterator;
++import org.apache.flink.util.ExceptionUtils;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.BufferedInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.NoSuchElementException;
++import java.util.TreeMap;
++import java.util.stream.Collectors;
++
++import static java.util.Comparator.comparing;
++import static org.apache.flink.util.Preconditions.checkState;
++
++/** Serialization format for state changes. */
++@Internal
++public class StateChangeFormat
++        implements StateChangelogHandleStreamHandleReader.StateChangeIterator {
++    private static final Logger LOG = LoggerFactory.getLogger(StateChangeFormat.class);
++
++    Map<StateChangeSetUpload, Long> write(
++            OutputStreamWithPos os, Collection<StateChangeSetUpload> changeSets)
++            throws IOException {
++        List<StateChangeSetUpload> sorted = new ArrayList<>(changeSets);
++        // using sorting instead of bucketing for simplicity
++        sorted.sort(
++                comparing(StateChangeSetUpload::getLogId)
++                        .thenComparing(StateChangeSetUpload::getSequenceNumber));
++        DataOutputViewStreamWrapper dataOutput = new DataOutputViewStreamWrapper(os);
++        Map<StateChangeSetUpload, Long> pendingResults = new HashMap<>();
++        for (StateChangeSetUpload upload : sorted) {
++            if (upload.startUpload()) {
++                pendingResults.put(upload, os.getPos());
++                writeChangeSet(dataOutput, upload.getChanges());
++            } else {
++                LOG.info("Can't upload {} because of the concurrent status update", upload);
++            }
++        }
++        return pendingResults;
++    }
++
++    private void writeChangeSet(DataOutputViewStreamWrapper output, List<StateChange> changes)
++            throws IOException {
++        // write in groups to output kg id only once
++        Map<Integer, List<StateChange>> byKeyGroup =
++                changes.stream().collect(Collectors.groupingBy(StateChange::getKeyGroup));
++        // sort groups to output metadata first (see StateChangeLoggerImpl.COMMON_KEY_GROUP)
++        Map<Integer, List<StateChange>> sorted = new TreeMap<>(byKeyGroup);
++        output.writeInt(sorted.size());
++        for (Map.Entry<Integer, List<StateChange>> entry : sorted.entrySet()) {
++            output.writeInt(entry.getValue().size());
++            output.writeInt(entry.getKey());
++            for (StateChange stateChange : entry.getValue()) {
++                output.writeInt(stateChange.getChange().length);
++                output.write(stateChange.getChange());
++            }
++        }
++    }
++
++    @Override
++    public CloseableIterator<StateChange> read(StreamStateHandle handle, long offset)
++            throws IOException {
++        FSDataInputStream stream = handle.openInputStream();
++        DataInputViewStreamWrapper input = wrap(stream);
++        if (stream.getPos() != offset) {
++            LOG.debug("seek from {} to {}", stream.getPos(), offset);
++            input.skipBytesToRead((int) offset);
++        }
++        return new CloseableIterator<StateChange>() {
++            int numUnreadGroups = input.readInt();
++            int numLeftInGroup = numUnreadGroups-- == 0 ? 0 : input.readInt();
++            int keyGroup = numLeftInGroup == 0 ? 0 : input.readInt();
++
++            @Override
++            public boolean hasNext() {
++                advance();
++                return numLeftInGroup > 0;
++            }
++
++            private void advance() {
++                if (numLeftInGroup == 0 && numUnreadGroups > 0) {
++                    numUnreadGroups--;
++                    try {
++                        numLeftInGroup = input.readInt();
++                        keyGroup = input.readInt();
++                    } catch (IOException e) {
++                        ExceptionUtils.rethrow(e);
++                    }
++                }
++            }
++
++            @Override
++            public StateChange next() {
++                advance();
++                if (numLeftInGroup == 0) {
++                    throw new NoSuchElementException();
++                }
++                numLeftInGroup--;
++                try {
++                    return readChange();
++                } catch (IOException e) {
++                    throw new RuntimeException(e);
++                }
++            }
++
++            private StateChange readChange() throws IOException {
++                int size = input.readInt();
++                byte[] bytes = new byte[size];
++                checkState(size == input.read(bytes));
++                return new StateChange(keyGroup, bytes);
++            }
++
++            @Override
++            public void close() throws Exception {
++                LOG.trace("close {}", stream);
++                stream.close();
++            }
++        };
++    }
++
++    private DataInputViewStreamWrapper wrap(InputStream stream) throws IOException {
++        stream = new BufferedInputStream(stream);
++        boolean compressed = stream.read() == 1;
++        return new DataInputViewStreamWrapper(
++                compressed
++                        ? SnappyStreamCompressionDecorator.INSTANCE.decorateWithCompression(stream)
++                        : stream);
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeFsUploader.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeFsUploader.java
+new file mode 100644
+index 0000000000000..9834ceca73c12
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeFsUploader.java
+@@ -0,0 +1,137 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.core.fs.FSDataOutputStream;
++import org.apache.flink.core.fs.FileSystem;
++import org.apache.flink.core.fs.Path;
++import org.apache.flink.runtime.state.SnappyStreamCompressionDecorator;
++import org.apache.flink.runtime.state.StreamCompressionDecorator;
++import org.apache.flink.runtime.state.StreamStateHandle;
++import org.apache.flink.runtime.state.UncompressedStreamCompressionDecorator;
++import org.apache.flink.runtime.state.filesystem.FileStateHandle;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.BufferedOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.Collection;
++import java.util.Map;
++import java.util.UUID;
++
++import static org.apache.flink.core.fs.FileSystem.WriteMode.NO_OVERWRITE;
++
++class StateChangeFsUploader implements StateChangeUploader {
++    private static final Logger LOG = LoggerFactory.getLogger(StateChangeFsUploader.class);
++
++    private final Path basePath;
++    private final FileSystem fileSystem;
++    private final StateChangeFormat format;
++    private final boolean compression;
++    private final int bufferSize;
++    private final FsStateChangelogCleaner cleaner;
++
++    public StateChangeFsUploader(
++            Path basePath,
++            FileSystem fileSystem,
++            boolean compression,
++            int bufferSize,
++            FsStateChangelogCleaner cleaner) {
++        this.basePath = basePath;
++        this.fileSystem = fileSystem;
++        this.format = new StateChangeFormat();
++        this.compression = compression;
++        this.bufferSize = bufferSize;
++        this.cleaner = cleaner;
++    }
++
++    @Override
++    public void upload(Collection<StateChangeSetUpload> changeSets) throws IOException {
++        final String fileName = generateFileName();
++        LOG.debug("upload {} changesets to {}", changeSets.size(), fileName);
++        Path path = new Path(basePath, fileName);
++
++        FSDataOutputStream fsStream = fileSystem.create(path, NO_OVERWRITE);
++        try {
++            fsStream.write(compression ? 1 : 0);
++            OutputStreamWithPos stream = wrap(fsStream);
++            upload(changeSets, path, stream);
++        } catch (IOException e) {
++            fsStream.close(); // normally, the stream in closed in upload
++            changeSets.forEach(cs -> cs.fail(e));
++            handleError(path, e);
++        }
++    }
++
++    private OutputStreamWithPos wrap(FSDataOutputStream fsStream) throws IOException {
++        StreamCompressionDecorator instance =
++                compression
++                        ? SnappyStreamCompressionDecorator.INSTANCE
++                        : UncompressedStreamCompressionDecorator.INSTANCE;
++        OutputStream compressed =
++                compression ? instance.decorateWithCompression(fsStream) : fsStream;
++        return new OutputStreamWithPos(new BufferedOutputStream(compressed, bufferSize));
++    }
++
++    private void handleError(Path path, IOException e) throws IOException {
++        try {
++            fileSystem.delete(path, true);
++        } catch (IOException cleanupError) {
++            LOG.warn("unable to delete after failure: " + path, cleanupError);
++            e.addSuppressed(cleanupError);
++        }
++        throw e;
++    }
++
++    private void upload(
++            Collection<StateChangeSetUpload> changeSets, Path path, OutputStreamWithPos os)
++            throws IOException {
++        final Map<StateChangeSetUpload, Long> offsets = format.write(os, changeSets);
++        if (offsets.isEmpty()) {
++            LOG.info(
++                    "nothing to upload (cancelled concurrently), cancelling upload {} {}",
++                    changeSets.size(),
++                    path);
++            os.close();
++            fileSystem.delete(path, true);
++        } else {
++            final long size = os.getPos();
++            os.close();
++            final StreamStateHandle handle = new FileStateHandle(path, size);
++            offsets.forEach(
++                    (upload, offset) ->
++                            upload.complete(
++                                    new StoreResult(
++                                            handle,
++                                            offset,
++                                            upload.getSequenceNumber(),
++                                            upload.getSize()),
++                                    cleaner));
++            LOG.debug("uploaded to {}", handle);
++        }
++    }
++
++    private String generateFileName() {
++        return UUID.randomUUID().toString();
++    }
++
++    @Override
++    public void close() {}
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeSet.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeSet.java
+new file mode 100644
+index 0000000000000..d4354dabe6f0b
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeSet.java
+@@ -0,0 +1,192 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++import org.apache.flink.runtime.state.changelog.StateChange;
++
++import javax.annotation.Nullable;
++import javax.annotation.concurrent.NotThreadSafe;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.UUID;
++
++import static java.util.Comparator.comparingInt;
++import static java.util.EnumSet.noneOf;
++import static java.util.EnumSet.of;
++import static org.apache.flink.changelog.fs.StateChangeSet.Status.CANCELLED;
++import static org.apache.flink.changelog.fs.StateChangeSet.Status.CONFIRMED;
++import static org.apache.flink.changelog.fs.StateChangeSet.Status.MATERIALIZED;
++import static org.apache.flink.changelog.fs.StateChangeSet.Status.UPLOAD_STARTED;
++import static org.apache.flink.util.Preconditions.checkState;
++
++/**
++ * A set of changes made to some state(s) by a single state backend during a single checkpoint.
++ * There can be zero or more change sets for a single checkpoint.
++ */
++@NotThreadSafe
++class StateChangeSet {
++    private final UUID logId;
++    private final List<StateChange> changes;
++    private final SequenceNumber sequenceNumber;
++    private Status status;
++    @Nullable private StateChangeSetUpload currentUpload;
++    private boolean isUploadAssociatedWithCheckpoint;
++    private final long size;
++
++    public StateChangeSet(
++            UUID logId, SequenceNumber sequenceNumber, List<StateChange> changes, Status status) {
++        this.logId = logId;
++        List<StateChange> copy = new ArrayList<>(changes);
++        copy.sort(comparingInt(StateChange::getKeyGroup));
++        this.changes = copy;
++        this.sequenceNumber = sequenceNumber;
++        this.status = status;
++        this.size = sizeOf(changes);
++    }
++
++    public List<StateChange> getChanges() {
++        return changes;
++    }
++
++    public long getSize() {
++        return size;
++    }
++
++    private static long sizeOf(List<StateChange> changes) {
++        long size = 0;
++        for (StateChange change : changes) {
++            size += change.getChange().length;
++        }
++        return size;
++    }
++
++    void startUpload() {
++        setStatusOrFail(UPLOAD_STARTED);
++        if (currentUpload != null) {
++            currentUpload.cancel();
++        }
++        currentUpload = new StateChangeSetUpload(changes, size, logId, sequenceNumber);
++    }
++
++    private void setStatusOrFail(Status newStatus) {
++        checkState(setStatus(newStatus), "can't transition from %s to %s", status, newStatus);
++    }
++
++    void setConfirmed() {
++        setStatusOrFail(CONFIRMED);
++        changes.clear();
++    }
++
++    void setTruncated() {
++        setStatus(MATERIALIZED);
++        changes.clear();
++        // don't discard any current upload as it can still be relevant for the ongoing checkpoint
++    }
++
++    void setCancelled() {
++        setStatus(CANCELLED);
++        changes.clear();
++        discardCurrentUpload();
++    }
++
++    public void discardCurrentUpload() {
++        if (currentUpload != null) {
++            currentUpload.cancel();
++            currentUpload = null;
++        }
++    }
++
++    private boolean setStatus(Status newStatus) {
++        return transition(newStatus);
++    }
++
++    private boolean transition(Status newStatus) {
++        if (status.canTransitionTo(newStatus)) {
++            status = newStatus;
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++    public Status getStatus() {
++        return status;
++    }
++
++    public void associateUploadWithCheckpoint() {
++        isUploadAssociatedWithCheckpoint = true;
++    }
++
++    public boolean isUploadAssociatedWithCheckpoint() {
++        return isUploadAssociatedWithCheckpoint;
++    }
++
++    public StateChangeSetUpload getCurrentUpload() {
++        return currentUpload;
++    }
++
++    enum Status {
++        /**
++         * Changes are in memory but not persisted yet (or at least without a guarantee). Will be
++         * moved to UPLOAD_STARTED upon trigger checkpoint RPC, checkpoint barrier or reaching some
++         * threshold.
++         */
++        PENDING,
++        /**
++         * Changes are scheduled for upload or being uploaded. From now on, any materialization
++         * event is ignored for this object to prevent any potential waiting checkpoints from
++         * becoming invalid.
++         */
++        UPLOAD_STARTED,
++        /**
++         * JM confirmed the checkpoint with the changes included. No re-upload will happen anymore.
++         */
++        CONFIRMED,
++        /** State with these changes included was materialized. No upload will happen anymore. */
++        MATERIALIZED,
++        /** Upload of changes failed permanently. */
++        FAILED,
++        /** Cancelled e.g. due to shutdown. */
++        CANCELLED;
++        private static final Map<Status, Set<Status>> transitionsTo = new HashMap<>();
++
++        static {
++            transitionsTo.put(PENDING, of(UPLOAD_STARTED, CANCELLED, MATERIALIZED));
++            transitionsTo.put(UPLOAD_STARTED, of(CONFIRMED, FAILED, CANCELLED, UPLOAD_STARTED));
++            transitionsTo.put(CONFIRMED, of(CANCELLED, MATERIALIZED, CONFIRMED));
++            transitionsTo.put(FAILED, of(CANCELLED, MATERIALIZED, FAILED));
++            transitionsTo.put(CANCELLED, noneOf(Status.class));
++        }
++
++        public boolean canTransitionTo(Status newStatus) {
++            return transitionsTo.get(this).contains(newStatus);
++        }
++    }
++
++    @Override
++    public String toString() {
++        return String.format(
++                "sqn=%s, logId=%s, status=%s, changes=%d",
++                sequenceNumber, logId, status, changes.size());
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeSetUpload.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeSetUpload.java
+new file mode 100644
+index 0000000000000..2359008dd1ea9
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeSetUpload.java
+@@ -0,0 +1,117 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++import org.apache.flink.runtime.state.changelog.StateChange;
++
++import javax.annotation.Nullable;
++import javax.annotation.concurrent.ThreadSafe;
++
++import java.util.List;
++import java.util.UUID;
++import java.util.concurrent.CancellationException;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.apache.flink.util.Preconditions.checkNotNull;
++import static org.apache.flink.util.Preconditions.checkState;
++
++/**
++ * An upload of {@link StateChangeSet}. Note that there can exist more than such upload for a single
++ * change set if the checkpoint that initiated it wasn't confirmed at the time of the next one.
++ */
++@ThreadSafe
++class StateChangeSetUpload {
++    private final long size;
++    private final UUID logId;
++    private final SequenceNumber sequenceNumber;
++    private final CompletableFuture<StoreResult> storeResultFuture;
++    private final AtomicReference<Status> status = new AtomicReference<>(Status.PENDING);
++    private List<StateChange> changes;
++
++    private enum Status {
++        PENDING,
++        UPLOADING,
++        COMPLETED // uploaded/cancelled/failed
++    }
++
++    StateChangeSetUpload(
++            List<StateChange> changes, long size, UUID logId, SequenceNumber sequenceNumber) {
++        this.changes = checkNotNull(changes);
++        this.sequenceNumber = checkNotNull(sequenceNumber);
++        this.storeResultFuture = new CompletableFuture<>();
++        this.size = size;
++        this.logId = checkNotNull(logId);
++    }
++
++    public void cancel() {
++        fail(new CancellationException());
++    }
++
++    public void fail(Throwable error) {
++        if (status.compareAndSet(Status.PENDING, Status.COMPLETED)) {
++            storeResultFuture.completeExceptionally(error);
++            dispose(); // only free memory, nothing was uploaded
++        }
++        // if the upload is COMPLETED then there is a chance it was sent to JM
++        // so we shouldn't discard lest invalidate any checkpoints
++    }
++
++    public boolean startUpload() {
++        // prevent disposal during the upload
++        return status.compareAndSet(Status.PENDING, Status.UPLOADING);
++    }
++
++    public void complete(StoreResult storeResult, FsStateChangelogCleaner cleaner) {
++        if (status.compareAndSet(Status.UPLOADING, Status.COMPLETED)) {
++            storeResultFuture.complete(storeResult);
++        } else {
++            cleaner.cleanupAsync(storeResult);
++        }
++        dispose();
++    }
++
++    private void dispose() {
++        checkState(
++                status.get() == Status.COMPLETED, "Upload in status %s can't be disposed", status);
++        changes = null;
++    }
++
++    public long getSize() {
++        return size;
++    }
++
++    /** @return guaranteed to return not null unless was already completed (successfully or not). */
++    @Nullable
++    public List<StateChange> getChanges() {
++        return changes;
++    }
++
++    public UUID getLogId() {
++        return logId;
++    }
++
++    public SequenceNumber getSequenceNumber() {
++        return sequenceNumber;
++    }
++
++    public CompletableFuture<StoreResult> getStoreResultFuture() {
++        return storeResultFuture;
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeUploader.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeUploader.java
+new file mode 100644
+index 0000000000000..3932a8baa6057
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StateChangeUploader.java
+@@ -0,0 +1,68 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.configuration.ReadableConfig;
++import org.apache.flink.core.fs.Path;
++
++import java.io.IOException;
++import java.util.Collection;
++
++import static org.apache.flink.changelog.fs.FsStateChangelogOptions.BASE_PATH;
++import static org.apache.flink.changelog.fs.FsStateChangelogOptions.COMPRESSION_ENABLED;
++import static org.apache.flink.changelog.fs.FsStateChangelogOptions.PERSIST_DELAY;
++import static org.apache.flink.changelog.fs.FsStateChangelogOptions.PERSIST_SIZE_THRESHOLD;
++import static org.apache.flink.changelog.fs.FsStateChangelogOptions.UPLOAD_BUFFER_SIZE;
++import static org.apache.flink.util.Preconditions.checkArgument;
++
++// todo: consider using CheckpointStreamFactory / CheckpointStorageWorkerView
++//     Considerations:
++//     0. need for checkpointId in the current API to resolve the location
++//       option a: pass checkpointId (race condition?)
++//       option b: pass location (race condition?)
++//       option c: add FsCheckpointStorageAccess.createSharedStateStream
++//     1. different settings for materialized/changelog (e.g. timeouts)
++//     2. re-use closeAndGetHandle
++//     3. re-use in-memory handles (.metadata)
++//     4. handle in-memory handles duplication
++interface StateChangeUploader extends AutoCloseable {
++
++    void upload(Collection<StateChangeSetUpload> changeSets) throws IOException;
++
++    static StateChangeUploader fromConfig(ReadableConfig config, FsStateChangelogCleaner cleaner)
++            throws IOException {
++        Path basePath = new Path(config.get(BASE_PATH));
++        long bytes = config.get(UPLOAD_BUFFER_SIZE).getBytes();
++        checkArgument(bytes <= Integer.MAX_VALUE);
++        int bufferSize = (int) bytes;
++        StateChangeFsUploader store =
++                new StateChangeFsUploader(
++                        basePath,
++                        basePath.getFileSystem(),
++                        config.get(COMPRESSION_ENABLED),
++                        bufferSize,
++                        cleaner);
++        BatchingStateChangeUploader batchingStore =
++                new BatchingStateChangeUploader(
++                        config.get(PERSIST_DELAY).toMillis(),
++                        config.get(PERSIST_SIZE_THRESHOLD).getBytes(),
++                        RetryPolicy.fromConfig(config),
++                        store);
++        return batchingStore;
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StoreResult.java b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StoreResult.java
+new file mode 100644
+index 0000000000000..bd735399198eb
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/java/org/apache/flink/changelog/fs/StoreResult.java
+@@ -0,0 +1,69 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.runtime.state.StreamStateHandle;
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++
++import static org.apache.flink.util.Preconditions.checkNotNull;
++
++final class StoreResult {
++    public final StreamStateHandle streamStateHandle;
++    public final long offset;
++    public final SequenceNumber sequenceNumber;
++    public final long size;
++
++    public StoreResult(
++            StreamStateHandle streamStateHandle,
++            long offset,
++            SequenceNumber sequenceNumber,
++            long size) {
++        this.streamStateHandle = checkNotNull(streamStateHandle);
++        this.offset = offset;
++        this.sequenceNumber = checkNotNull(sequenceNumber);
++        this.size = size;
++    }
++
++    public StreamStateHandle getStreamStateHandle() {
++        return streamStateHandle;
++    }
++
++    public long getOffset() {
++        return offset;
++    }
++
++    public SequenceNumber getSequenceNumber() {
++        return sequenceNumber;
++    }
++
++    public long getSize() {
++        return size;
++    }
++
++    @Override
++    public String toString() {
++        return "streamStateHandle="
++                + streamStateHandle
++                + ", size="
++                + size
++                + ", offset="
++                + offset
++                + ", sequenceNumber="
++                + sequenceNumber;
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/main/resources/META-INF/services/org.apache.flink.runtime.state.changelog.StateChangelogStorage b/flink-dstl/flink-dstl-dfs/src/main/resources/META-INF/services/org.apache.flink.runtime.state.changelog.StateChangelogStorage
+new file mode 100644
+index 0000000000000..8fa3a5859aa7f
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/main/resources/META-INF/services/org.apache.flink.runtime.state.changelog.StateChangelogStorage
+@@ -0,0 +1,16 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++org.apache.flink.changelog.fs.FsStateChangelogStorage
+diff --git a/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/BatchingStateChangeUploaderTest.java b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/BatchingStateChangeUploaderTest.java
+new file mode 100644
+index 0000000000000..de1e1f9d5fbeb
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/BatchingStateChangeUploaderTest.java
+@@ -0,0 +1,200 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++import org.apache.flink.runtime.state.changelog.StateChange;
++import org.apache.flink.runtime.testutils.DirectScheduledExecutorService;
++import org.apache.flink.util.function.BiConsumerWithException;
++
++import org.junit.Test;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.List;
++import java.util.Random;
++import java.util.UUID;
++import java.util.concurrent.RejectedExecutionException;
++import java.util.stream.Collectors;
++
++import static java.util.Collections.singletonList;
++import static java.util.stream.Collectors.toList;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++/** {@link BatchingStateChangeUploader} test. */
++public class BatchingStateChangeUploaderTest {
++
++    private final Random random = new Random();
++
++    @Test
++    public void testNoDelayAndThreshold() throws Exception {
++        withStore(
++                0,
++                0,
++                (store, probe) -> {
++                    List<StateChangeSet> changes1 = getChanges(4);
++                    save(store, changes1);
++                    assertSaved(probe, changes1);
++                    List<StateChangeSet> changes2 = getChanges(4);
++                    save(store, changes2);
++                    assertSaved(probe, changes1, changes2);
++                });
++    }
++
++    private void save(BatchingStateChangeUploader store, List<StateChangeSet> changeSets) {
++        changeSets.forEach(StateChangeSet::startUpload);
++        store.upload(
++                changeSets.stream()
++                        .map(StateChangeSet::getCurrentUpload)
++                        .collect(Collectors.toSet()));
++    }
++
++    @Test
++    public void testSizeThreshold() throws Exception {
++        int numChanges = 7;
++        int changeSize = 11;
++        int threshold = changeSize * numChanges;
++        withStore(
++                Integer.MAX_VALUE,
++                threshold,
++                (store, probe) -> {
++                    List<StateChangeSet> expected = new ArrayList<>();
++                    int runningSize = 0;
++                    for (int i = 0; i < numChanges; i++) {
++                        List<StateChangeSet> changes = getChanges(changeSize);
++                        runningSize += changes.stream().mapToLong(StateChangeSet::getSize).sum();
++                        save(store, changes);
++                        expected.addAll(changes);
++                        if (runningSize >= threshold) {
++                            assertSaved(probe, expected);
++                        } else {
++                            assertTrue(probe.getSaved().isEmpty());
++                        }
++                    }
++                });
++    }
++
++    @Test
++    public void testDelay() throws Exception {
++        int delayMs = 50;
++        withStore(
++                delayMs,
++                Integer.MAX_VALUE,
++                (store, probe) -> {
++                    List<StateChangeSet> changeSets = getChanges(4);
++                    save(store, changeSets);
++                    assertTrue(probe.getSaved().isEmpty());
++                    Thread.sleep(delayMs * 2);
++                    assertEquals(
++                            changeSets.stream()
++                                    .map(StateChangeSet::getCurrentUpload)
++                                    .collect(Collectors.toList()),
++                            probe.getSaved());
++                });
++    }
++
++    @Test(expected = RejectedExecutionException.class)
++    public void testErrorHandling() throws Exception {
++        TestingStateChangeUploader probe = new TestingStateChangeUploader();
++        DirectScheduledExecutorService scheduler = new DirectScheduledExecutorService();
++        try (BatchingStateChangeUploader store =
++                new BatchingStateChangeUploader(
++                        Integer.MAX_VALUE,
++                        Integer.MAX_VALUE,
++                        RetryPolicy.NONE,
++                        probe,
++                        scheduler,
++                        new RetryingExecutor())) {
++            scheduler.shutdown();
++            List<StateChangeSet> changes = getChanges(4);
++            try {
++                save(store, changes);
++            } finally {
++                changes.forEach(
++                        c ->
++                                assertTrue(
++                                        c.getCurrentUpload()
++                                                .getStoreResultFuture()
++                                                .isCompletedExceptionally()));
++            }
++        }
++    }
++
++    @Test
++    public void testClose() throws Exception {
++        TestingStateChangeUploader probe = new TestingStateChangeUploader();
++        DirectScheduledExecutorService scheduler = new DirectScheduledExecutorService();
++        DirectScheduledExecutorService retryScheduler = new DirectScheduledExecutorService();
++        new BatchingStateChangeUploader(
++                        0,
++                        0,
++                        RetryPolicy.NONE,
++                        probe,
++                        scheduler,
++                        new RetryingExecutor(retryScheduler))
++                .close();
++        assertTrue(probe.isClosed());
++        assertTrue(scheduler.isShutdown());
++        assertTrue(retryScheduler.isShutdown());
++    }
++
++    private List<StateChangeSet> getChanges(int size) {
++        byte[] change = new byte[size];
++        random.nextBytes(change);
++        return singletonList(
++                new StateChangeSet(
++                        UUID.randomUUID(),
++                        SequenceNumber.of(0),
++                        singletonList(new StateChange(0, change)),
++                        StateChangeSet.Status.UPLOAD_STARTED));
++    }
++
++    private static void withStore(
++            int delayMs,
++            int sizeThreshold,
++            BiConsumerWithException<
++                            BatchingStateChangeUploader, TestingStateChangeUploader, Exception>
++                    test)
++            throws Exception {
++        TestingStateChangeUploader probe = new TestingStateChangeUploader();
++
++        try (BatchingStateChangeUploader store =
++                new BatchingStateChangeUploader(
++                        delayMs,
++                        sizeThreshold,
++                        RetryPolicy.NONE,
++                        probe,
++                        new DirectScheduledExecutorService(),
++                        new RetryingExecutor(new DirectScheduledExecutorService()))) {
++            test.accept(store, probe);
++        }
++    }
++
++    @SafeVarargs
++    private final void assertSaved(
++            TestingStateChangeUploader probe, List<StateChangeSet>... expected) {
++        assertEquals(
++                Arrays.stream(expected)
++                        .flatMap(Collection::stream)
++                        .map(StateChangeSet::getCurrentUpload)
++                        .collect(toList()),
++                new ArrayList<>(probe.getSaved()));
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogStorageLoaderTest.java b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogStorageLoaderTest.java
+new file mode 100644
+index 0000000000000..f53c2331ea565
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogStorageLoaderTest.java
+@@ -0,0 +1,47 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.core.plugin.DefaultPluginManager;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorageLoader;
++
++import org.junit.Test;
++
++import java.util.Collections;
++import java.util.Iterator;
++
++import static org.junit.Assert.fail;
++
++/** {@link StateChangelogStorageLoader} test for {@link FsStateChangelogStorage} case. */
++public class FsStateChangelogStorageLoaderTest {
++
++    @Test
++    @SuppressWarnings("rawtypes")
++    public void testLoaded() {
++        StateChangelogStorageLoader loader =
++                new StateChangelogStorageLoader(
++                        new DefaultPluginManager(Collections.emptyList(), new String[0]));
++        for (Iterator<StateChangelogStorage> it = loader.load(); it.hasNext(); ) {
++            if (it.next() instanceof FsStateChangelogStorage) {
++                return; // found
++            }
++        }
++        fail(FsStateChangelogStorage.class.getName() + " not loaded");
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogStorageTest.java b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogStorageTest.java
+new file mode 100644
+index 0000000000000..0818538f6887e
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogStorageTest.java
+@@ -0,0 +1,49 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.core.fs.Path;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
++import org.apache.flink.runtime.state.changelog.inmemory.StateChangelogStorageTest;
++
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++
++import java.io.IOException;
++
++import static org.apache.flink.changelog.fs.FsStateChangelogCleaner.NO_OP;
++
++/** {@link FsStateChangelogStorage} test. */
++@RunWith(Parameterized.class)
++public class FsStateChangelogStorageTest extends StateChangelogStorageTest {
++    @Parameterized.Parameter public boolean compression;
++
++    @Parameterized.Parameters(name = "use compression = {0}")
++    public static Object[] parameters() {
++        return new Object[] {true, false};
++    }
++
++    @Override
++    protected StateChangelogStorage<?> getFactory() throws IOException {
++        return new FsStateChangelogStorage(
++                Path.fromLocalFile(temporaryFolder.newFolder()),
++                compression,
++                1024 * 1024 * 10,
++                NO_OP);
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogWriterSqnTest.java b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogWriterSqnTest.java
+new file mode 100644
+index 0000000000000..5247f4052fa79
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogWriterSqnTest.java
+@@ -0,0 +1,153 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.runtime.state.KeyGroupRange;
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++import org.apache.flink.util.function.BiConsumerWithException;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++
++import java.io.IOException;
++import java.util.List;
++import java.util.UUID;
++
++import static java.util.Arrays.asList;
++import static org.apache.flink.changelog.fs.FsStateChangelogWriterSqnTest.WriterSqnTestSettings.of;
++import static org.junit.Assert.assertEquals;
++
++/**
++ * Test of incrementing {@link SequenceNumber sequence numbers} by {@link FsStateChangelogWriter}.
++ */
++@RunWith(Parameterized.class)
++public class FsStateChangelogWriterSqnTest {
++
++    @Parameterized.Parameters(name = "{0}")
++    public static List<WriterSqnTestSettings> getSettings() {
++        return asList(
++                of(
++                                (writer, sqn) -> writer.lastAppendedSequenceNumber(),
++                                "lastAppendedSequenceNumber")
++                        .withAppendCall(false)
++                        .expectIncrement(false),
++                of(
++                                (writer, sqn) -> writer.lastAppendedSequenceNumber(),
++                                "lastAppendedSequenceNumber")
++                        .withAppendCall(true)
++                        .expectIncrement(true),
++                of((writer, sqn) -> writer.persist(sqn.next()), "persist")
++                        .withAppendCall(false)
++                        .expectIncrement(false),
++                of((writer, sqn) -> writer.persist(sqn.next()), "persist")
++                        .withAppendCall(true)
++                        .expectIncrement(true),
++                of((writer, sqn) -> writer.append(0, getBytes()), "append")
++                        .withAppendCall(true)
++                        .expectIncrement(false),
++                of((writer, sqn) -> writer.append(0, getBytes()), "append")
++                        .withAppendCall(false)
++                        .expectIncrement(false),
++                of(FsStateChangelogWriter::truncate, "truncate empty")
++                        .withAppendCall(false)
++                        .expectIncrement(false),
++                of(FsStateChangelogWriter::truncate, "truncate old")
++                        .withAppendCall(true)
++                        .expectIncrement(false),
++                of((writer, sqn) -> writer.truncate(sqn.next()), "truncate current")
++                        .withAppendCall(true)
++                        .expectIncrement(true));
++    }
++
++    private final WriterSqnTestSettings test;
++
++    public FsStateChangelogWriterSqnTest(WriterSqnTestSettings test) {
++        this.test = test;
++    }
++
++    @Test
++    public void runTest() throws IOException {
++        try (FsStateChangelogWriter writer =
++                new FsStateChangelogWriter(
++                        UUID.randomUUID(),
++                        KeyGroupRange.of(0, 0),
++                        new TestingStateChangeUploader(),
++                        Long.MAX_VALUE)) {
++            SequenceNumber startSqn = writer.lastAppendedSequenceNumber();
++            if (test.withAppend) {
++                writer.append(0, getBytes());
++            }
++            test.action.accept(writer, startSqn);
++            assertEquals(
++                    getMessage(),
++                    test.expectIncrement ? startSqn.next() : startSqn,
++                    writer.lastAppendedSqnUnsafe());
++        }
++    }
++
++    private String getMessage() {
++        return test.name
++                + " should"
++                + (test.expectIncrement ? " " : " NOT ")
++                + "increment SQN"
++                + (test.expectIncrement ? " after " : " without ")
++                + "appends";
++    }
++
++    static class WriterSqnTestSettings {
++        private final String name;
++        private final BiConsumerWithException<FsStateChangelogWriter, SequenceNumber, IOException>
++                action;
++        private boolean withAppend;
++        private boolean expectIncrement;
++
++        public WriterSqnTestSettings(
++                String name,
++                BiConsumerWithException<FsStateChangelogWriter, SequenceNumber, IOException>
++                        action) {
++            this.name = name;
++            this.action = action;
++        }
++
++        public static WriterSqnTestSettings of(
++                BiConsumerWithException<FsStateChangelogWriter, SequenceNumber, IOException> action,
++                String name) {
++            return new WriterSqnTestSettings(name, action);
++        }
++
++        public WriterSqnTestSettings withAppendCall(boolean withAppend) {
++            this.withAppend = withAppend;
++            return this;
++        }
++
++        public WriterSqnTestSettings expectIncrement(boolean expectIncrement) {
++            this.expectIncrement = expectIncrement;
++            return this;
++        }
++
++        @Override
++        public String toString() {
++            return name + ", withAppend: " + withAppend + ", expectIncrement: " + expectIncrement;
++        }
++    }
++
++    private static byte[] getBytes() {
++        return new byte[] {1, 2, 3, 4};
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogWriterTest.java b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogWriterTest.java
+new file mode 100644
+index 0000000000000..3f1db691ab202
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/FsStateChangelogWriterTest.java
+@@ -0,0 +1,202 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.runtime.state.KeyGroupRange;
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++import org.apache.flink.util.function.BiConsumerWithException;
++
++import org.junit.Test;
++
++import java.io.IOException;
++import java.util.Random;
++import java.util.UUID;
++
++import static org.apache.flink.shaded.guava18.com.google.common.collect.Iterables.getOnlyElement;
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertTrue;
++
++/** {@link FsStateChangelogWriter} test. */
++public class FsStateChangelogWriterTest {
++    private static final int KEY_GROUP = 0;
++    private final Random random = new Random();
++
++    @Test
++    public void testAppend() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    writer.append(KEY_GROUP, getBytes());
++                    writer.append(KEY_GROUP, getBytes());
++                    writer.append(KEY_GROUP, getBytes());
++                    assertNoUpload(store, "append shouldn't persist");
++                });
++    }
++
++    @Test
++    public void testPreUpload() throws IOException {
++        int threshold = 1000;
++        withWriter(
++                threshold,
++                (writer, store) -> {
++                    byte[] bytes = getBytes(threshold);
++                    SequenceNumber sqn = append(writer, bytes);
++                    assertSubmittedOnly(store, bytes);
++                    store.reset();
++                    writer.persist(sqn);
++                    assertNoUpload(store, "changes should have been pre-uploaded");
++                    writer.persist(sqn);
++                    assertSubmittedOnly(store, bytes); // 2nd persist should re-upload
++                });
++    }
++
++    @Test
++    public void testPersist() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    byte[] bytes = getBytes();
++                    writer.persist(append(writer, bytes));
++                    assertSubmittedOnly(store, bytes);
++                });
++    }
++
++    @Test
++    public void testPersistAgain() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    byte[] bytes = getBytes();
++                    SequenceNumber sqn = append(writer, bytes);
++                    writer.persist(sqn);
++                    store.completeAndReset();
++                    writer.confirm(sqn, writer.lastAppendedSqnUnsafe().next());
++                    writer.persist(sqn);
++                    assertNoUpload(store, "confirmed changes shouldn't be re-uploaded");
++                });
++    }
++
++    @Test
++    public void testPersistAgainBeforeCompletion() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    byte[] bytes = getBytes();
++                    SequenceNumber sqn = append(writer, bytes);
++                    writer.persist(sqn);
++                    store.reset();
++                    writer.persist(sqn);
++                    assertSubmittedOnly(store, bytes);
++                });
++    }
++
++    @Test
++    public void testPersistNewlyAppended() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    SequenceNumber sqn = append(writer, getBytes());
++                    writer.persist(sqn);
++                    store.completeAndReset();
++                    byte[] bytes = getBytes();
++                    sqn = append(writer, bytes);
++                    writer.persist(sqn);
++                    assertSubmittedOnly(store, bytes);
++                });
++    }
++
++    /** Emulates checkpoint abortion followed by a new checkpoint. */
++    @Test
++    public void testPersistAfterReset() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    byte[] bytes = getBytes();
++                    SequenceNumber sqn = append(writer, bytes);
++                    writer.reset(sqn, SequenceNumber.of(Long.MAX_VALUE));
++                    store.reset();
++                    writer.persist(sqn);
++                    assertSubmittedOnly(store, bytes);
++                });
++    }
++
++    @Test
++    public void testPersistAfterFailure() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    byte[] bytes = getBytes();
++                    SequenceNumber sqn = append(writer, bytes);
++                    store.failUpload();
++                    store.reset();
++                    writer.persist(sqn);
++                    assertSubmittedOnly(store, bytes);
++                });
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void testTruncate() throws IOException {
++        withWriter(
++                (writer, store) -> {
++                    SequenceNumber sqn = append(writer, getBytes());
++                    writer.truncate(sqn.next());
++                    writer.persist(sqn);
++                });
++    }
++
++    private void withWriter(
++            BiConsumerWithException<FsStateChangelogWriter, TestingStateChangeUploader, IOException>
++                    test)
++            throws IOException {
++        withWriter(1000, test);
++    }
++
++    private void withWriter(
++            int appendPersistThreshold,
++            BiConsumerWithException<FsStateChangelogWriter, TestingStateChangeUploader, IOException>
++                    test)
++            throws IOException {
++        TestingStateChangeUploader store = new TestingStateChangeUploader();
++        try (FsStateChangelogWriter writer =
++                new FsStateChangelogWriter(
++                        UUID.randomUUID(),
++                        KeyGroupRange.of(KEY_GROUP, KEY_GROUP),
++                        store,
++                        appendPersistThreshold)) {
++            test.accept(writer, store);
++        }
++    }
++
++    private void assertSubmittedOnly(TestingStateChangeUploader store, byte[] bytes) {
++        assertArrayEquals(
++                bytes, getOnlyElement(getOnlyElement(store.getSaved()).getChanges()).getChange());
++    }
++
++    private SequenceNumber append(FsStateChangelogWriter writer, byte[] bytes) throws IOException {
++        SequenceNumber sqn = writer.lastAppendedSequenceNumber().next();
++        writer.append(KEY_GROUP, bytes);
++        return sqn;
++    }
++
++    private byte[] getBytes() {
++        return getBytes(10);
++    }
++
++    private byte[] getBytes(int size) {
++        byte[] bytes = new byte[size];
++        random.nextBytes(bytes);
++        return bytes;
++    }
++
++    private static void assertNoUpload(TestingStateChangeUploader store, String message) {
++        assertTrue(message, store.getSaved().isEmpty());
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/TestingStateChangeUploader.java b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/TestingStateChangeUploader.java
+new file mode 100644
+index 0000000000000..b8f3dbc155a46
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/test/java/org/apache/flink/changelog/fs/TestingStateChangeUploader.java
+@@ -0,0 +1,72 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.changelog.fs;
++
++import org.apache.flink.runtime.state.changelog.SequenceNumber;
++import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
++
++import java.util.ArrayList;
++import java.util.Collection;
++
++class TestingStateChangeUploader implements StateChangeUploader {
++    private final Collection<StateChangeSetUpload> saved = new ArrayList<>();
++    private final FsStateChangelogCleaner cleaner = FsStateChangelogCleaner.DIRECT;
++    private boolean closed;
++
++    @Override
++    public void close() {
++        this.closed = true;
++    }
++
++    @Override
++    public void upload(Collection<StateChangeSetUpload> changeSets) {
++        saved.addAll(changeSets);
++    }
++
++    public Collection<StateChangeSetUpload> getSaved() {
++        return saved;
++    }
++
++    public boolean isClosed() {
++        return closed;
++    }
++
++    void reset() {
++        saved.clear();
++    }
++
++    public void failUpload() {
++        for (StateChangeSetUpload upload : saved) {
++            upload.fail(new RuntimeException());
++        }
++    }
++
++    public void completeAndReset() {
++        for (StateChangeSetUpload upload : saved) {
++            upload.startUpload();
++            upload.complete(
++                    new StoreResult(
++                            new ByteStreamStateHandle("", new byte[1]),
++                            0L,
++                            SequenceNumber.of(0L),
++                            100L),
++                    cleaner);
++        }
++        reset();
++    }
++}
+diff --git a/flink-dstl/flink-dstl-dfs/src/test/resources/log4j2.properties b/flink-dstl/flink-dstl-dfs/src/test/resources/log4j2.properties
+new file mode 100644
+index 0000000000000..d9441bc01ed44
+--- /dev/null
++++ b/flink-dstl/flink-dstl-dfs/src/test/resources/log4j2.properties
+@@ -0,0 +1,28 @@
++################################################################################
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++# limitations under the License.
++################################################################################
++
++# Set root logger level to OFF to not flood build logs
++# set manually to INFO for debugging purposes
++rootLogger.level = OFF
++rootLogger.appenderRef.test.ref = TestLogger
++
++appender.testLogger.name = TestLogger
++appender.testLogger.type = CONSOLE
++appender.testLogger.target = SYSTEM_ERR
++appender.testLogger.layout.type = PatternLayout
++appender.testLogger.layout.pattern = %d %-5p %m [%c{0} %t]%n
+diff --git a/flink-dstl/pom.xml b/flink-dstl/pom.xml
+new file mode 100644
+index 0000000000000..3a64d1766edd0
+--- /dev/null
++++ b/flink-dstl/pom.xml
+@@ -0,0 +1,42 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++Licensed to the Apache Software Foundation (ASF) under one
++or more contributor license agreements.  See the NOTICE file
++distributed with this work for additional information
++regarding copyright ownership.  The ASF licenses this file
++to you under the Apache License, Version 2.0 (the
++"License"); you may not use this file except in compliance
++with the License.  You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing,
++software distributed under the License is distributed on an
++"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++KIND, either express or implied.  See the License for the
++specific language governing permissions and limitations
++under the License.
++
++-->
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
++
++	<modelVersion>4.0.0</modelVersion>
++
++	<parent>
++		<groupId>org.apache.flink</groupId>
++		<artifactId>flink-parent</artifactId>
++		<version>1.14-SNAPSHOT</version>
++		<relativePath>..</relativePath>
++	</parent>
++
++	<artifactId>flink-dstl</artifactId>
++	<name>Flink : DSTL</name>
++
++	<packaging>pom</packaging>
++
++	<modules>
++		<module>flink-dstl-dfs</module>
++	</modules>
++</project>
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/state/StateBackendLoader.java b/flink-runtime/src/main/java/org/apache/flink/runtime/state/StateBackendLoader.java
+index 86dfab9ec374e..268a54832cc6e 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/state/StateBackendLoader.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/state/StateBackendLoader.java
+@@ -23,6 +23,7 @@
+ import org.apache.flink.configuration.IllegalConfigurationException;
+ import org.apache.flink.configuration.ReadableConfig;
+ import org.apache.flink.configuration.StateBackendOptions;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+ import org.apache.flink.runtime.state.delegate.DelegatingStateBackend;
+ import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
+ import org.apache.flink.runtime.state.hashmap.HashMapStateBackendFactory;
+@@ -52,6 +53,9 @@ public class StateBackendLoader {
+     private static final String CHANGELOG_STATE_BACKEND =
+             "org.apache.flink.state.changelog.ChangelogStateBackend";
+ 
++    private static final String CHANGELOG_FS_WRITER_FACTORY =
++            "org.apache.flink.runtime.state.changelog.inmemory.InMemoryStateChangelogStorage";
++
+     /** Used for loading RocksDBStateBackend. */
+     private static final String ROCKSDB_STATE_BACKEND_FACTORY =
+             "org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackendFactory";
+@@ -304,7 +308,7 @@ public static StateBackend fromApplicationOrConfigOrDefault(
+ 
+         StateBackend backend;
+         if (enableChangeLog) {
+-            backend = loadChangelogStateBackend(rootBackend, classLoader);
++            backend = loadChangelogStateBackend(rootBackend, classLoader, config);
+             LOG.info(
+                     "State backend loader loads {} to delegate {}",
+                     backend.getClass().getSimpleName(),
+@@ -358,16 +362,25 @@ public static boolean stateBackendFromApplicationOrConfigOrDefaultUseManagedMemo
+     }
+ 
+     private static StateBackend loadChangelogStateBackend(
+-            StateBackend backend, ClassLoader classLoader) throws DynamicCodeLoadingException {
++            StateBackend backend, ClassLoader classLoader, ReadableConfig cfg)
++            throws DynamicCodeLoadingException, IOException {
+ 
+         // ChangelogStateBackend resides in a separate module, load it using reflection
+         try {
+             Constructor<? extends DelegatingStateBackend> constructor =
+                     Class.forName(CHANGELOG_STATE_BACKEND, false, classLoader)
+                             .asSubclass(DelegatingStateBackend.class)
+-                            .getDeclaredConstructor(StateBackend.class);
++                            .getDeclaredConstructor(
++                                    StateBackend.class, StateChangelogStorage.class);
++
++            StateChangelogStorage<?> factory =
++                    Class.forName(CHANGELOG_FS_WRITER_FACTORY, false, classLoader)
++                            .asSubclass(StateChangelogStorage.class)
++                            .getConstructor()
++                            .newInstance();
++            factory.configure(cfg);
+             constructor.setAccessible(true);
+-            return constructor.newInstance(backend);
++            return constructor.newInstance(backend, factory);
+         } catch (ClassNotFoundException e) {
+             throw new DynamicCodeLoadingException(
+                     "Cannot find DelegateStateBackend class: " + CHANGELOG_STATE_BACKEND, e);
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/ChangelogStateHandleStreamImpl.java b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/ChangelogStateHandleStreamImpl.java
+index d36b8ada7af28..9a3898196f2ea 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/ChangelogStateHandleStreamImpl.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/ChangelogStateHandleStreamImpl.java
+@@ -27,11 +27,9 @@
+ import org.apache.flink.runtime.state.StreamStateHandle;
+ import org.apache.flink.runtime.state.filesystem.FileStateHandle;
+ import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
+-import org.apache.flink.util.CloseableIterator;
+ 
+ import javax.annotation.Nullable;
+ 
+-import java.io.IOException;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.stream.Collectors;
+@@ -117,11 +115,6 @@ private static SharedStateRegistryKey getKey(StreamStateHandle stateHandle) {
+         }
+     }
+ 
+-    public interface StateChangeStreamReader {
+-        CloseableIterator<StateChange> read(StreamStateHandle handle, long offset)
+-                throws IOException;
+-    }
+-
+     public List<Tuple2<StreamStateHandle, Long>> getHandlesAndOffsets() {
+         return Collections.unmodifiableList(handlesAndOffsets);
+     }
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogHandleStreamHandleReader.java b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogHandleStreamHandleReader.java
+index 900d781a3d711..386eba55626df 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogHandleStreamHandleReader.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogHandleStreamHandleReader.java
+@@ -45,8 +45,8 @@
+ 
+     /** Reads a stream of state changes starting from a specified offset. */
+     public interface StateChangeIterator {
+-        // todo: add implementation (FLINK-21353)
+-        CloseableIterator<StateChange> read(StreamStateHandle handle, long offset);
++        CloseableIterator<StateChange> read(StreamStateHandle handle, long offset)
++                throws IOException;
+     }
+ 
+     private final StateChangeIterator changeIterator;
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorage.java b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorage.java
+index 1cc08d356805a..3c6dc73acf3ad 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorage.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorage.java
+@@ -19,14 +19,19 @@
+ package org.apache.flink.runtime.state.changelog;
+ 
+ import org.apache.flink.annotation.Internal;
++import org.apache.flink.configuration.ReadableConfig;
+ import org.apache.flink.runtime.state.KeyGroupRange;
+ 
++import java.io.IOException;
++import java.io.Serializable;
++
+ /**
+  * A factory for {@link StateChangelogWriter} and {@link StateChangelogHandleReader}. Please use
+  * {@link StateChangelogStorageLoader} to obtain an instance.
+  */
+ @Internal
+-public interface StateChangelogStorage<Handle extends ChangelogStateHandle> extends AutoCloseable {
++public interface StateChangelogStorage<Handle extends ChangelogStateHandle>
++        extends AutoCloseable, Serializable {
+ 
+     StateChangelogWriter<Handle> createWriter(String operatorID, KeyGroupRange keyGroupRange);
+ 
+@@ -34,4 +39,7 @@
+ 
+     @Override
+     default void close() throws Exception {}
++
++    /** Configure this factory. Should be called at most once. */
++    void configure(ReadableConfig config) throws IOException;
+ }
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorageLoader.java b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorageLoader.java
+index c40ec57d50517..ba23f4b73fb21 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorageLoader.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogStorageLoader.java
+@@ -18,6 +18,7 @@
+ package org.apache.flink.runtime.state.changelog;
+ 
+ import org.apache.flink.annotation.Internal;
++import org.apache.flink.configuration.ReadableConfig;
+ import org.apache.flink.core.plugin.PluginManager;
+ 
+ import java.util.Iterator;
+@@ -34,6 +35,10 @@ public StateChangelogStorageLoader(PluginManager pluginManager) {
+         this.pluginManager = pluginManager;
+     }
+ 
++    /**
++     * Returned factory must be {@link StateChangelogStorage#configure(ReadableConfig) configured}
++     * before use.
++     */
+     @SuppressWarnings({"rawtypes"})
+     public Iterator<StateChangelogStorage> load() {
+         return concat(
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogWriter.java b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogWriter.java
+index 694973de1bad8..4692ed4783f93 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogWriter.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/StateChangelogWriter.java
+@@ -35,7 +35,7 @@
+     SequenceNumber lastAppendedSequenceNumber();
+ 
+     /** Appends the provided data to this log. No persistency guarantees. */
+-    void append(int keyGroup, byte[] value);
++    void append(int keyGroup, byte[] value) throws IOException;
+ 
+     /**
+      * Durably persist previously {@link #append(int, byte[]) appended} data starting from the
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/inmemory/InMemoryStateChangelogStorage.java b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/inmemory/InMemoryStateChangelogStorage.java
+index c9bfdfbc5004a..a35550385ceb3 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/inmemory/InMemoryStateChangelogStorage.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/state/changelog/inmemory/InMemoryStateChangelogStorage.java
+@@ -17,6 +17,7 @@
+ 
+ package org.apache.flink.runtime.state.changelog.inmemory;
+ 
++import org.apache.flink.configuration.ReadableConfig;
+ import org.apache.flink.runtime.state.KeyGroupRange;
+ import org.apache.flink.runtime.state.changelog.StateChangelogHandleReader;
+ import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+@@ -32,6 +33,9 @@ public InMemoryStateChangelogWriter createWriter(
+         return new InMemoryStateChangelogWriter(keyGroupRange);
+     }
+ 
++    @Override
++    public void configure(ReadableConfig config) {}
++
+     @Override
+     public StateChangelogHandleReader<InMemoryChangelogStateHandle> createReader() {
+         return handle -> CloseableIterator.fromList(handle.getChanges(), change -> {});
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/state/HashMapStateBackendTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/state/HashMapStateBackendTest.java
+index 3e366d872d396..626d77a682dfa 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/state/HashMapStateBackendTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/state/HashMapStateBackendTest.java
+@@ -66,7 +66,7 @@ public static List<Object[]> modes() {
+     public SupplierWithException<CheckpointStorage, IOException> storageSupplier;
+ 
+     @Override
+-    protected ConfigurableStateBackend getStateBackend() {
++    protected ConfigurableStateBackend getStateBackend() throws IOException {
+         return new HashMapStateBackend();
+     }
+ 
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/state/MemoryStateBackendTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/state/MemoryStateBackendTest.java
+index 3e51e109b2e0b..55169da14302b 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/state/MemoryStateBackendTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/state/MemoryStateBackendTest.java
+@@ -25,6 +25,7 @@
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+ 
++import java.io.IOException;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+@@ -40,7 +41,7 @@ public static List<Boolean> modes() {
+     @Parameterized.Parameter public boolean useAsyncmode;
+ 
+     @Override
+-    protected ConfigurableStateBackend getStateBackend() {
++    protected ConfigurableStateBackend getStateBackend() throws IOException {
+         return new MemoryStateBackend(useAsyncmode);
+     }
+ 
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/state/changelog/inmemory/StateChangelogStorageTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/state/changelog/inmemory/StateChangelogStorageTest.java
+index a0dfa8b44e021..d5e33038070a9 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/state/changelog/inmemory/StateChangelogStorageTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/state/changelog/inmemory/StateChangelogStorageTest.java
+@@ -133,7 +133,7 @@ private byte[] randomBytes(int len) {
+         return bytes;
+     }
+ 
+-    protected StateChangelogStorage<T> getFactory() {
++    protected StateChangelogStorage<T> getFactory() throws IOException {
+         return (StateChangelogStorage<T>) new InMemoryStateChangelogStorage();
+     }
+ }
+diff --git a/flink-state-backends/flink-statebackend-changelog/pom.xml b/flink-state-backends/flink-statebackend-changelog/pom.xml
+index 0c4e8a5f20dd5..7af555813fe7b 100644
+--- a/flink-state-backends/flink-statebackend-changelog/pom.xml
++++ b/flink-state-backends/flink-statebackend-changelog/pom.xml
+@@ -64,6 +64,13 @@ under the License.
+ 			<scope>test</scope>
+ 		</dependency>
+ 
++		<dependency>
++			<groupId>org.apache.flink</groupId>
++			<artifactId>flink-dstl-dfs_2.11</artifactId>
++			<version>${project.version}</version>
++			<scope>test</scope>
++		</dependency>
++
+ 		<dependency>
+ 			<groupId>org.apache.flink</groupId>
+ 			<artifactId>flink-runtime_${scala.binary.version}</artifactId>
+diff --git a/flink-state-backends/flink-statebackend-changelog/src/main/java/org/apache/flink/state/changelog/ChangelogStateBackend.java b/flink-state-backends/flink-statebackend-changelog/src/main/java/org/apache/flink/state/changelog/ChangelogStateBackend.java
+index 4346370f7af75..c52864074c191 100644
+--- a/flink-state-backends/flink-statebackend-changelog/src/main/java/org/apache/flink/state/changelog/ChangelogStateBackend.java
++++ b/flink-state-backends/flink-statebackend-changelog/src/main/java/org/apache/flink/state/changelog/ChangelogStateBackend.java
+@@ -36,7 +36,7 @@
+ import org.apache.flink.runtime.state.OperatorStateHandle;
+ import org.apache.flink.runtime.state.StateBackend;
+ import org.apache.flink.runtime.state.changelog.ChangelogStateBackendHandle;
+-import org.apache.flink.runtime.state.changelog.inmemory.InMemoryStateChangelogStorage;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+ import org.apache.flink.runtime.state.delegate.DelegatingStateBackend;
+ import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
+ import org.apache.flink.state.changelog.restore.ChangelogBackendRestoreOperation;
+@@ -63,6 +63,7 @@ public class ChangelogStateBackend implements DelegatingStateBackend, Configurab
+     private static final Logger LOG = LoggerFactory.getLogger(ChangelogStateBackend.class);
+ 
+     private final StateBackend delegatedStateBackend;
++    private final StateChangelogStorage<?> stateChangelogStorage;
+ 
+     /**
+      * Delegate a state backend by a ChangelogStateBackend.
+@@ -71,8 +72,10 @@ public class ChangelogStateBackend implements DelegatingStateBackend, Configurab
+      *
+      * @param stateBackend the delegated state backend.
+      */
+-    ChangelogStateBackend(StateBackend stateBackend) {
++    ChangelogStateBackend(
++            StateBackend stateBackend, StateChangelogStorage<?> stateChangelogStorage) {
+         this.delegatedStateBackend = Preconditions.checkNotNull(stateBackend);
++        this.stateChangelogStorage = stateChangelogStorage;
+ 
+         Preconditions.checkArgument(
+                 !(stateBackend instanceof DelegatingStateBackend),
+@@ -185,7 +188,8 @@ public StateBackend configure(ReadableConfig config, ClassLoader classLoader)
+         if (delegatedStateBackend instanceof ConfigurableStateBackend) {
+             return new ChangelogStateBackend(
+                     ((ConfigurableStateBackend) delegatedStateBackend)
+-                            .configure(config, classLoader));
++                            .configure(config, classLoader),
++                    this.stateChangelogStorage);
+         }
+ 
+         return this;
+@@ -200,10 +204,8 @@ private <K> ChangelogKeyedStateBackend<K> restore(
+             Collection<KeyedStateHandle> stateHandles,
+             BaseBackendBuilder<K> baseBackendBuilder)
+             throws Exception {
+-        // todo: FLINK-21804 get from Environment.getTaskStateManager
+-        InMemoryStateChangelogStorage changelogStorage = new InMemoryStateChangelogStorage();
+         return ChangelogBackendRestoreOperation.restore(
+-                changelogStorage.createReader(),
++                stateChangelogStorage.createReader(),
+                 env.getUserCodeClassLoader().asClassLoader(),
+                 castHandles(stateHandles),
+                 baseBackendBuilder,
+@@ -212,7 +214,8 @@ private <K> ChangelogKeyedStateBackend<K> restore(
+                                 baseBackend,
+                                 env.getExecutionConfig(),
+                                 ttlTimeProvider,
+-                                changelogStorage.createWriter(operatorIdentifier, keyGroupRange),
++                                stateChangelogStorage.createWriter(
++                                        operatorIdentifier, keyGroupRange),
+                                 baseState));
+     }
+ 
+diff --git a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateEmbeddedRocksDBStateBackendTest.java b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateEmbeddedRocksDBStateBackendTest.java
+index 32e5528634291..75cb0482e9a02 100644
+--- a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateEmbeddedRocksDBStateBackendTest.java
++++ b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateEmbeddedRocksDBStateBackendTest.java
+@@ -19,18 +19,22 @@
+ package org.apache.flink.state.changelog;
+ 
+ import org.apache.flink.api.common.typeutils.TypeSerializer;
++import org.apache.flink.changelog.fs.FsStateChangelogStorage;
+ import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
+ import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackendTest;
++import org.apache.flink.core.fs.Path;
+ import org.apache.flink.runtime.execution.Environment;
+ import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
+-import org.apache.flink.runtime.state.ConfigurableStateBackend;
+ import org.apache.flink.runtime.state.KeyGroupRange;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+ 
+ import org.junit.Ignore;
+ import org.junit.Test;
+ 
+ import java.io.IOException;
+ 
++import static org.apache.flink.changelog.fs.FsStateChangelogCleaner.NO_OP;
++
+ /** Tests for {@link ChangelogStateBackend} delegating {@link EmbeddedRocksDBStateBackend}. */
+ public class ChangelogDelegateEmbeddedRocksDBStateBackendTest
+         extends EmbeddedRocksDBStateBackendTest {
+@@ -58,7 +62,7 @@ protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
+             throws Exception {
+ 
+         return ChangelogStateBackendTestUtils.createKeyedBackend(
+-                new ChangelogStateBackend(super.getStateBackend()),
++                new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage()),
+                 keySerializer,
+                 numberOfKeyGroups,
+                 keyGroupRange,
+@@ -66,7 +70,12 @@ protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
+     }
+ 
+     @Override
+-    protected ConfigurableStateBackend getStateBackend() throws IOException {
+-        return new ChangelogStateBackend(super.getStateBackend());
++    protected ChangelogStateBackend getStateBackend() throws IOException {
++        return new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage());
++    }
++
++    private StateChangelogStorage<?> getStateChangelogStorage() throws IOException {
++        return new FsStateChangelogStorage(
++                Path.fromLocalFile(TEMP_FOLDER.newFolder()), false, 1024 * 1024 * 10, NO_OP);
+     }
+ }
+diff --git a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateFileStateBackendTest.java b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateFileStateBackendTest.java
+index 819a77a0f94b5..5a60607afa198 100644
+--- a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateFileStateBackendTest.java
++++ b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateFileStateBackendTest.java
+@@ -19,15 +19,22 @@
+ package org.apache.flink.state.changelog;
+ 
+ import org.apache.flink.api.common.typeutils.TypeSerializer;
++import org.apache.flink.changelog.fs.FsStateChangelogStorage;
++import org.apache.flink.core.fs.Path;
+ import org.apache.flink.runtime.execution.Environment;
+ import org.apache.flink.runtime.state.CheckpointStorage;
+ import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
+ import org.apache.flink.runtime.state.ConfigurableStateBackend;
+ import org.apache.flink.runtime.state.FileStateBackendTest;
+ import org.apache.flink.runtime.state.KeyGroupRange;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+ import org.apache.flink.runtime.state.filesystem.FsStateBackend;
+ import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
+ 
++import java.io.IOException;
++
++import static org.apache.flink.changelog.fs.FsStateChangelogCleaner.NO_OP;
++
+ /** Tests for {@link ChangelogStateBackend} delegating {@link FsStateBackend}. */
+ public class ChangelogDelegateFileStateBackendTest extends FileStateBackendTest {
+ 
+@@ -50,7 +57,7 @@ protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
+             throws Exception {
+ 
+         return ChangelogStateBackendTestUtils.createKeyedBackend(
+-                new ChangelogStateBackend(super.getStateBackend()),
++                new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage()),
+                 keySerializer,
+                 numberOfKeyGroups,
+                 keyGroupRange,
+@@ -59,7 +66,12 @@ protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
+ 
+     @Override
+     protected ConfigurableStateBackend getStateBackend() throws Exception {
+-        return new ChangelogStateBackend(super.getStateBackend());
++        return new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage());
++    }
++
++    private StateChangelogStorage getStateChangelogStorage() throws IOException {
++        return new FsStateChangelogStorage(
++                Path.fromLocalFile(tempFolder.newFolder()), false, 1024 * 1024 * 10, NO_OP);
+     }
+ 
+     @Override
+diff --git a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateHashMapTest.java b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateHashMapTest.java
+index 9b4666561b2e7..9a70e1b407a98 100644
+--- a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateHashMapTest.java
++++ b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateHashMapTest.java
+@@ -19,11 +19,17 @@
+ package org.apache.flink.state.changelog;
+ 
+ import org.apache.flink.api.common.typeutils.TypeSerializer;
++import org.apache.flink.changelog.fs.FsStateChangelogStorage;
++import org.apache.flink.core.fs.Path;
+ import org.apache.flink.runtime.execution.Environment;
+ import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
+-import org.apache.flink.runtime.state.ConfigurableStateBackend;
+ import org.apache.flink.runtime.state.HashMapStateBackendTest;
+ import org.apache.flink.runtime.state.KeyGroupRange;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
++
++import java.io.IOException;
++
++import static org.apache.flink.changelog.fs.FsStateChangelogCleaner.NO_OP;
+ 
+ /** Tests for {@link ChangelogStateBackend} delegating {@link HashMapStateBackendTest}. */
+ public class ChangelogDelegateHashMapTest extends HashMapStateBackendTest {
+@@ -47,15 +53,20 @@ protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
+             throws Exception {
+ 
+         return ChangelogStateBackendTestUtils.createKeyedBackend(
+-                new ChangelogStateBackend(super.getStateBackend()),
++                new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage()),
+                 keySerializer,
+                 numberOfKeyGroups,
+                 keyGroupRange,
+                 env);
+     }
+ 
++    private StateChangelogStorage getStateChangelogStorage() throws IOException {
++        return new FsStateChangelogStorage(
++                Path.fromLocalFile(TEMP_FOLDER.newFolder()), false, 1024 * 1024 * 10, NO_OP);
++    }
++
+     @Override
+-    protected ConfigurableStateBackend getStateBackend() {
+-        return new ChangelogStateBackend(super.getStateBackend());
++    protected ChangelogStateBackend getStateBackend() throws IOException {
++        return new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage());
+     }
+ }
+diff --git a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateMemoryStateBackendTest.java b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateMemoryStateBackendTest.java
+index 0911b567fa715..ec7ccfd0da181 100644
+--- a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateMemoryStateBackendTest.java
++++ b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateMemoryStateBackendTest.java
+@@ -19,18 +19,30 @@
+ package org.apache.flink.state.changelog;
+ 
+ import org.apache.flink.api.common.typeutils.TypeSerializer;
++import org.apache.flink.changelog.fs.FsStateChangelogStorage;
++import org.apache.flink.core.fs.Path;
+ import org.apache.flink.runtime.execution.Environment;
+ import org.apache.flink.runtime.state.CheckpointStorage;
+ import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
+ import org.apache.flink.runtime.state.ConfigurableStateBackend;
+ import org.apache.flink.runtime.state.KeyGroupRange;
+ import org.apache.flink.runtime.state.MemoryStateBackendTest;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+ import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+ import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
+ 
++import org.junit.Rule;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.IOException;
++
++import static org.apache.flink.changelog.fs.FsStateChangelogCleaner.NO_OP;
++
+ /** Tests for {@link ChangelogStateBackend} delegating {@link MemoryStateBackend}. */
+ public class ChangelogDelegateMemoryStateBackendTest extends MemoryStateBackendTest {
+ 
++    @Rule public final TemporaryFolder tmp = new TemporaryFolder();
++
+     @Override
+     protected boolean snapshotUsesStreamFactory() {
+         return false;
+@@ -50,7 +62,7 @@ protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
+             throws Exception {
+ 
+         return ChangelogStateBackendTestUtils.createKeyedBackend(
+-                new ChangelogStateBackend(super.getStateBackend()),
++                new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage()),
+                 keySerializer,
+                 numberOfKeyGroups,
+                 keyGroupRange,
+@@ -58,8 +70,13 @@ protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
+     }
+ 
+     @Override
+-    protected ConfigurableStateBackend getStateBackend() {
+-        return new ChangelogStateBackend(super.getStateBackend());
++    protected ConfigurableStateBackend getStateBackend() throws IOException {
++        return new ChangelogStateBackend(super.getStateBackend(), getStateChangelogStorage());
++    }
++
++    private StateChangelogStorage getStateChangelogStorage() throws IOException {
++        return new FsStateChangelogStorage(
++                Path.fromLocalFile(tmp.newFolder()), false, 1024 * 1024 * 10, NO_OP);
+     }
+ 
+     @Override
+diff --git a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateStateTest.java b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateStateTest.java
+index f2cb3c0c2a553..0a0981f8e8053 100644
+--- a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateStateTest.java
++++ b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogDelegateStateTest.java
+@@ -24,26 +24,33 @@
+ import org.apache.flink.api.common.state.State;
+ import org.apache.flink.api.common.state.StateDescriptor;
+ import org.apache.flink.api.common.state.ValueStateDescriptor;
++import org.apache.flink.changelog.fs.FsStateChangelogStorage;
+ import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
++import org.apache.flink.core.fs.Path;
+ import org.apache.flink.runtime.operators.testutils.MockEnvironment;
+ import org.apache.flink.runtime.state.AbstractStateBackend;
+ import org.apache.flink.runtime.state.KeyedStateBackend;
+ import org.apache.flink.runtime.state.StateBackendTestBase;
+ import org.apache.flink.runtime.state.VoidNamespace;
+ import org.apache.flink.runtime.state.VoidNamespaceSerializer;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+ import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
+ import org.apache.flink.util.IOUtils;
+ 
+ import org.junit.After;
+ import org.junit.Before;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+ 
++import java.io.IOException;
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.function.Supplier;
+ 
++import static org.apache.flink.changelog.fs.FsStateChangelogCleaner.NO_OP;
+ import static org.apache.flink.state.changelog.ChangelogStateBackendTestUtils.createKeyedBackend;
+ import static org.junit.Assert.assertSame;
+ 
+@@ -51,6 +58,7 @@
+ @RunWith(Parameterized.class)
+ public class ChangelogDelegateStateTest {
+     private MockEnvironment env;
++    @Rule public final TemporaryFolder tmp = new TemporaryFolder();
+ 
+     @Parameterized.Parameters
+     public static List<Supplier<AbstractStateBackend>> delegatedStateBackend() {
+@@ -113,7 +121,9 @@ private void testDelegatingState(StateDescriptor descriptor, Class<?> stateClass
+ 
+         try {
+             delegatedBackend = createKeyedBackend(backend.get(), env);
+-            changelogBackend = createKeyedBackend(new ChangelogStateBackend(backend.get()), env);
++            changelogBackend =
++                    createKeyedBackend(
++                            new ChangelogStateBackend(backend.get(), getChangelogStorage()), env);
+ 
+             State state =
+                     changelogBackend.getPartitionedState(
+@@ -138,4 +148,9 @@ private void testDelegatingState(StateDescriptor descriptor, Class<?> stateClass
+             }
+         }
+     }
++
++    private StateChangelogStorage<?> getChangelogStorage() throws IOException {
++        return new FsStateChangelogStorage(
++                Path.fromLocalFile(tmp.newFolder()), false, 1024 * 1024 * 10, NO_OP);
++    }
+ }
+diff --git a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogStateBackendLoadingTest.java b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogStateBackendLoadingTest.java
+index 00e8b78acddc7..9e24e4b0ecd8a 100644
+--- a/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogStateBackendLoadingTest.java
++++ b/flink-state-backends/flink-statebackend-changelog/src/test/java/org/apache/flink/state/changelog/ChangelogStateBackendLoadingTest.java
+@@ -21,6 +21,8 @@
+ import org.apache.flink.api.common.JobID;
+ import org.apache.flink.api.common.functions.FlatMapFunction;
+ import org.apache.flink.api.common.typeutils.TypeSerializer;
++import org.apache.flink.changelog.fs.FsStateChangelogOptions;
++import org.apache.flink.changelog.fs.FsStateChangelogStorage;
+ import org.apache.flink.configuration.CheckpointingOptions;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.configuration.IllegalConfigurationException;
+@@ -28,6 +30,7 @@
+ import org.apache.flink.configuration.StateBackendOptions;
+ import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
+ import org.apache.flink.core.fs.CloseableRegistry;
++import org.apache.flink.core.fs.Path;
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.runtime.execution.Environment;
+ import org.apache.flink.runtime.jobgraph.tasks.JobCheckpointingSettings;
+@@ -45,6 +48,7 @@
+ import org.apache.flink.runtime.state.OperatorStateHandle;
+ import org.apache.flink.runtime.state.StateBackend;
+ import org.apache.flink.runtime.state.StateBackendLoader;
++import org.apache.flink.runtime.state.changelog.StateChangelogStorage;
+ import org.apache.flink.runtime.state.delegate.DelegatingStateBackend;
+ import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
+ import org.apache.flink.runtime.state.memory.MemoryStateBackend;
+@@ -63,8 +67,10 @@
+ 
+ import javax.annotation.Nonnull;
+ 
++import java.io.IOException;
+ import java.util.Collection;
+ 
++import static org.apache.flink.changelog.fs.FsStateChangelogCleaner.NO_OP;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertSame;
+@@ -82,11 +88,11 @@ public class ChangelogStateBackendLoadingTest {
+     public void testLoadingDefault() throws Exception {
+         final StateBackend backend =
+                 StateBackendLoader.fromApplicationOrConfigOrDefault(
+-                        null, TernaryBoolean.UNDEFINED, config(), cl, null);
++                        null, TernaryBoolean.UNDEFINED, new Configuration(), cl, null);
+         final CheckpointStorage storage =
+                 CheckpointStorageLoader.load(null, null, backend, config(), cl, null);
+ 
+-        assertTrue(backend instanceof HashMapStateBackend);
++        assertTrue(backend.getClass().toString(), backend instanceof HashMapStateBackend);
+     }
+ 
+     @Test
+@@ -146,8 +152,12 @@ public void testApplicationDisableChangelogStateBackend() throws Exception {
+ 
+     @Test(expected = IllegalArgumentException.class)
+     public void testRecursiveDelegation() throws Exception {
++        StateChangelogStorage<?> stateChangelogWriterFactory = getStateChangelogStorage();
+         final StateBackend appBackend =
+-                new ChangelogStateBackend(new ChangelogStateBackend(new MockStateBackend()));
++                new ChangelogStateBackend(
++                        new ChangelogStateBackend(
++                                new MockStateBackend(), stateChangelogWriterFactory),
++                        stateChangelogWriterFactory);
+ 
+         StateBackendLoader.fromApplicationOrConfigOrDefault(
+                 appBackend, TernaryBoolean.UNDEFINED, config("rocksdb", true), cl, null);
+@@ -242,7 +252,8 @@ public void testEnableChangelogStateBackendInStreamExecutionEnvironment() throws
+                 env, TernaryBoolean.TRUE, MemoryStateBackend.class);
+     }
+ 
+-    private Configuration config(String stateBackend, boolean enableChangelogStateBackend) {
++    private Configuration config(String stateBackend, boolean enableChangelogStateBackend)
++            throws IOException {
+         final Configuration config = new Configuration();
+         config.setBoolean(
+                 CheckpointingOptions.ENABLE_STATE_CHANGE_LOG, enableChangelogStateBackend);
+@@ -259,15 +270,18 @@ private Configuration config(boolean enableChangelogStateBackend) {
+         return config;
+     }
+ 
+-    private Configuration config(String stateBackend) {
++    private Configuration config(String stateBackend) throws IOException {
+         final Configuration config = new Configuration();
+         config.setString(backendKey, stateBackend);
++        config.set(FsStateChangelogOptions.BASE_PATH, tmp.newFolder().toString());
+ 
+         return config;
+     }
+ 
+-    private Configuration config() {
++    private Configuration config() throws IOException {
+         final Configuration config = new Configuration();
++        config.setBoolean(CheckpointingOptions.ENABLE_STATE_CHANGE_LOG, true);
++        config.set(FsStateChangelogOptions.BASE_PATH, tmp.newFolder().toString());
+ 
+         return config;
+     }
+@@ -435,4 +449,9 @@ boolean isConfigUpdated() {
+             return configUpdated;
+         }
+     }
++
++    private StateChangelogStorage<?> getStateChangelogStorage() throws IOException {
++        return new FsStateChangelogStorage(
++                Path.fromLocalFile(tmp.newFolder()), false, 1024 * 1024 * 10, NO_OP);
++    }
+ }
+diff --git a/pom.xml b/pom.xml
+index 6387ca31ffcf7..0213852c8f1bf 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -71,6 +71,7 @@ under the License.
+ 		<module>flink-end-to-end-tests</module>
+ 		<module>flink-test-utils-parent</module>
+ 		<module>flink-state-backends</module>
++		<module>flink-dstl</module>
+ 		<module>flink-libraries</module>
+ 		<module>flink-table</module>
+ 		<module>flink-quickstart</module>

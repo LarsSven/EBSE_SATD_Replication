@@ -1,0 +1,377 @@
+diff --git a/nnvm/python/nnvm/frontend/keras.py b/nnvm/python/nnvm/frontend/keras.py
+index eb3bb0d01ea5..eb9bf4d3720d 100644
+--- a/nnvm/python/nnvm/frontend/keras.py
++++ b/nnvm/python/nnvm/frontend/keras.py
+@@ -180,7 +180,10 @@ def _convert_convolution(insym, keras_layer, symtab):
+         in_w = keras_layer.input_shape[2]
+         pad_t, pad_b = _get_pad_pair(in_h, kernel_h, stride_h)
+         pad_l, pad_r = _get_pad_pair(in_w, kernel_w, stride_w)
+-        insym = _sym.pad(data=insym, pad_width=((0, 0), (0, 0), (pad_t, pad_b), (pad_l, pad_r)))
++        if pad_t == pad_b and pad_l == pad_r:
++            params['padding'] = (pad_t, pad_l)
++        else:
++            insym = _sym.pad(data=insym, pad_width=((0, 0), (0, 0), (pad_t, pad_b), (pad_l, pad_r)))
+     else:
+         raise TypeError("Unsupported padding type : {}".format(keras_layer.padding))
+     if is_deconv:
+diff --git a/tutorials/autotvm/tune_conv2d_cuda.py b/tutorials/autotvm/tune_conv2d_cuda.py
+index b541e4310df0..f2ee98a61f66 100644
+--- a/tutorials/autotvm/tune_conv2d_cuda.py
++++ b/tutorials/autotvm/tune_conv2d_cuda.py
+@@ -169,14 +169,16 @@ def conv2d_no_batching(N, H, W, CO, CI, KH, KW, stride, padding):
+                            target='cuda')
+ print(task.config_space)
+ 
+-# use local gpu, measure 10 times for every config to reduce variance
++# Use local gpu, measure 10 times for every config to reduce variance
+ # The timeout of compiling a program is 10 seconds, the timeout for running is 4 seconds
+ measure_option = autotvm.measure_option(
+     builder=autotvm.LocalBuilder(),
+     runner=autotvm.LocalRunner(repeat=3, min_repeat_ms=100, timeout=4)
+ )
+ 
+-# begin tuning, log records to file `conv2d.log`
++# Begin tuning, log records to file `conv2d.log`
++# During tuning we will also try many invalid configs, so you are expected to
++# see many error reports. As long as you can see non-zero GFLOPS, it is okay.
+ tuner = autotvm.tuner.XGBTuner(task)
+ tuner.tune(n_trial=20,
+            measure_option=measure_option,
+diff --git a/tutorials/nnvm/deploy_ssd.py b/tutorials/nnvm/deploy_ssd.py
+index 58725a3c92d3..26591b86c692 100644
+--- a/tutorials/nnvm/deploy_ssd.py
++++ b/tutorials/nnvm/deploy_ssd.py
+@@ -94,8 +94,7 @@
+ # execute
+ m.run()
+ # get outputs
+-_, oshape = compiler.graph_util.infer_shape(graph, shape={"data": dshape})
+-tvm_output = m.get_output(0, tvm.nd.empty(tuple(oshape[0]), dtype))
++tvm_output = m.get_output(0)
+ 
+ 
+ ######################################################################
+diff --git a/tutorials/nnvm/from_coreml.py b/tutorials/nnvm/from_coreml.py
+index 3cf8babe6418..1c958746247b 100644
+--- a/tutorials/nnvm/from_coreml.py
++++ b/tutorials/nnvm/from_coreml.py
+@@ -8,9 +8,11 @@
+ For us to begin with, coremltools module is required to be installed.
+ 
+ A quick solution is to install via pip
+-```bash
+-pip install -U coremltools --user
+-```
++
++.. code-block:: bash
++
++    pip install -U coremltools --user
++
+ or please refer to official site
+ https://github.com/apple/coremltools
+ """
+@@ -65,7 +67,8 @@ def download(url, path, overwrite=False):
+ import nnvm.compiler
+ target = 'cuda'
+ shape_dict = {'image': x.shape}
+-graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
++with nnvm.compiler.build_config(opt_level=2, add_pass=['AlterOpLayout']):
++    graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
+ 
+ ######################################################################
+ # Execute on TVM
+@@ -81,14 +84,13 @@ def download(url, path, overwrite=False):
+ # execute
+ m.run()
+ # get outputs
+-output_shape = (1000,)
+-tvm_output = m.get_output(0, tvm.nd.empty(output_shape, dtype)).asnumpy()
+-top1 = np.argmax(tvm_output)
++tvm_output = m.get_output(0)
++top1 = np.argmax(tvm_output.asnumpy()[0])
+ 
+ #####################################################################
+ # Look up synset name
+ # -------------------
+-# Look up prdiction top 1 index in 1000 class synset.
++# Look up prediction top 1 index in 1000 class synset.
+ synset_url = ''.join(['https://gist.githubusercontent.com/zhreshold/',
+                       '4d0b62f3d01426887599d4f7ede23ee5/raw/',
+                       '596b27d23537e5a1b5751d2b0481ef172f58b539/',
+diff --git a/tutorials/nnvm/from_darknet.py b/tutorials/nnvm/from_darknet.py
+index 2bd7f4a1748a..87ab60fc2850 100644
+--- a/tutorials/nnvm/from_darknet.py
++++ b/tutorials/nnvm/from_darknet.py
+@@ -21,14 +21,13 @@
+ import matplotlib.pyplot as plt
+ import numpy as np
+ import tvm
+-import os
+ import sys
+ 
+ from ctypes import *
+ from tvm.contrib.download import download
+ from nnvm.testing.darknet import __darknetffi__
+ 
+-#Model name
++# Model name
+ MODEL_NAME = 'yolo'
+ 
+ ######################################################################
+@@ -79,30 +78,13 @@
+ with nnvm.compiler.build_config(opt_level=2):
+     graph, lib, params = nnvm.compiler.build(sym, target, shape, dtype, params)
+ 
+-#####################################################################
+-# Save the JSON
+-# -------------
+-def save_lib():
+-    #Save the graph, params and .so to the current directory
+-    print("Saving the compiled output...")
+-    path_name = 'nnvm_darknet_' + model_name
+-    path_lib = path_name + '_deploy_lib.so'
+-    lib.export_library(path_lib)
+-    with open(path_name
+-+ "deploy_graph.json", "w") as fo:
+-        fo.write(graph.json())
+-    with open(path_name
+-+ "deploy_param.params", "wb") as fo:
+-        fo.write(nnvm.compiler.save_param_dict(params))
+-#save_lib()
+-
+ ######################################################################
+ # Load a test image
+ # --------------------------------------------------------------------
+ test_image = 'dog.jpg'
+ print("Loading the test image...")
+ img_url = 'https://github.com/siju-samuel/darknet/blob/master/data/' + \
+-            test_image   +'?raw=true'
++          test_image + '?raw=true'
+ download(img_url, test_image)
+ 
+ data = nnvm.testing.darknet.load_image(test_image, net.w, net.h)
+@@ -124,9 +106,9 @@ def save_lib():
+ m.run()
+ # get outputs
+ out_shape = (net.outputs,)
+-tvm_out = m.get_output(0, tvm.nd.empty(out_shape, dtype)).asnumpy()
++tvm_out = m.get_output(0).asnumpy().flatten()
+ 
+-#do the detection and bring up the bounding boxes
++# do the detection and bring up the bounding boxes
+ thresh = 0.24
+ hier_thresh = 0.5
+ img = nnvm.testing.darknet.load_image_color(test_image)
+@@ -134,16 +116,18 @@ def save_lib():
+ probs = []
+ boxes = []
+ region_layer = net.layers[net.n - 1]
+-boxes, probs = nnvm.testing.yolo2_detection.get_region_boxes(region_layer, im_w, im_h, net.w, net.h,
+-                       thresh, probs, boxes, 1, tvm_out)
++boxes, probs = nnvm.testing.yolo2_detection.get_region_boxes(
++    region_layer, im_w, im_h, net.w, net.h,
++    thresh, probs, boxes, 1, tvm_out)
+ 
+-boxes, probs = nnvm.testing.yolo2_detection.do_nms_sort(boxes, probs,
+-                       region_layer.w*region_layer.h*region_layer.n, region_layer.classes, 0.3)
++boxes, probs = nnvm.testing.yolo2_detection.do_nms_sort(
++    boxes, probs,
++    region_layer.w*region_layer.h*region_layer.n, region_layer.classes, 0.3)
+ 
+ coco_name = 'coco.names'
+-coco_url = 'https://github.com/siju-samuel/darknet/blob/master/data/' + coco_name   +'?raw=true'
++coco_url = 'https://github.com/siju-samuel/darknet/blob/master/data/' + coco_name + '?raw=true'
+ font_name = 'arial.ttf'
+-font_url = 'https://github.com/siju-samuel/darknet/blob/master/data/' + font_name   +'?raw=true'
++font_url = 'https://github.com/siju-samuel/darknet/blob/master/data/' + font_name + '?raw=true'
+ download(coco_url, coco_name)
+ download(font_url, font_name)
+ 
+@@ -152,7 +136,8 @@ def save_lib():
+ 
+ names = [x.strip() for x in content]
+ 
+-nnvm.testing.yolo2_detection.draw_detections(img, region_layer.w*region_layer.h*region_layer.n,
+-                 thresh, boxes, probs, names, region_layer.classes)
++nnvm.testing.yolo2_detection.draw_detections(
++    img, region_layer.w*region_layer.h*region_layer.n,
++    thresh, boxes, probs, names, region_layer.classes)
+ plt.imshow(img.transpose(1, 2, 0))
+ plt.show()
+diff --git a/tutorials/nnvm/from_keras.py b/tutorials/nnvm/from_keras.py
+index 402010b98634..5c13b8b1d30a 100644
+--- a/tutorials/nnvm/from_keras.py
++++ b/tutorials/nnvm/from_keras.py
+@@ -9,12 +9,12 @@
+ Tensorflow is also required since it's used as the default backend of keras.
+ 
+ A quick solution is to install via pip
+-```
+-pip install -U keras --user
+-```
+-```
+-pip install -U tensorflow --user
+-```
++
++.. code-block:: bash
++
++    pip install -U keras --user
++    pip install -U tensorflow --user
++
+ or please refer to official site
+ https://keras.io/#installation
+ """
+@@ -45,7 +45,7 @@ def download(url, path, overwrite=False):
+ weights_file = 'resnet50_weights.h5'
+ download(weights_url, weights_file)
+ keras_resnet50 = keras.applications.resnet50.ResNet50(include_top=True, weights=None,
+-	input_shape=(224,224,3), classes=1000)
++                                                      input_shape=(224, 224, 3), classes=1000)
+ keras_resnet50.load_weights('resnet50_weights.h5')
+ 
+ ######################################################################
+@@ -75,8 +75,8 @@ def download(url, path, overwrite=False):
+ # compile the model
+ target = 'cuda'
+ shape_dict = {'input_1': data.shape}
+-with nnvm.compiler.build_config(opt_level=2):
+-	graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
++with nnvm.compiler.build_config(opt_level=3):
++    graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
+ 
+ ######################################################################
+ # Execute on TVM
+@@ -91,14 +91,13 @@ def download(url, path, overwrite=False):
+ # execute
+ m.run()
+ # get outputs
+-out_shape = (1000,)
+-tvm_out = m.get_output(0, tvm.nd.empty(out_shape, 'float32')).asnumpy()
+-top1_tvm = np.argmax(tvm_out)
++tvm_out = m.get_output(0)
++top1_tvm = np.argmax(tvm_out.asnumpy()[0])
+ 
+ #####################################################################
+ # Look up synset name
+ # -------------------
+-# Look up prdiction top 1 index in 1000 class synset.
++# Look up prediction top 1 index in 1000 class synset.
+ synset_url = ''.join(['https://gist.githubusercontent.com/zhreshold/',
+                       '4d0b62f3d01426887599d4f7ede23ee5/raw/',
+                       '596b27d23537e5a1b5751d2b0481ef172f58b539/',
+diff --git a/tutorials/nnvm/from_mxnet.py b/tutorials/nnvm/from_mxnet.py
+index cce3bc37126a..78247dbe2b0a 100644
+--- a/tutorials/nnvm/from_mxnet.py
++++ b/tutorials/nnvm/from_mxnet.py
+@@ -10,9 +10,11 @@
+ For us to begin with, mxnet module is required to be installed.
+ 
+ A quick solution is
+-```
+-pip install mxnet --user
+-```
++
++.. code-block:: bash
++
++    pip install mxnet --user
++
+ or please refer to offical installation guide.
+ https://mxnet.incubator.apache.org/versions/master/install/index.html
+ """
+@@ -70,7 +72,8 @@ def transform_image(image):
+ import nnvm.compiler
+ target = 'cuda'
+ shape_dict = {'data': x.shape}
+-graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
++with nnvm.compiler.build_config(opt_level=3):
++    graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
+ 
+ ######################################################################
+ # Execute the portable graph on TVM
+@@ -86,8 +89,8 @@ def transform_image(image):
+ # execute
+ m.run()
+ # get outputs
+-tvm_output = m.get_output(0, tvm.nd.empty((1000,), dtype))
+-top1 = np.argmax(tvm_output.asnumpy())
++tvm_output = m.get_output(0)
++top1 = np.argmax(tvm_output.asnumpy()[0])
+ print('TVM prediction top-1:', top1, synset[top1])
+ 
+ ######################################################################
+diff --git a/tutorials/nnvm/from_onnx.py b/tutorials/nnvm/from_onnx.py
+index 8fb5a1048569..df8dee8272ce 100644
+--- a/tutorials/nnvm/from_onnx.py
++++ b/tutorials/nnvm/from_onnx.py
+@@ -8,9 +8,11 @@
+ For us to begin with, onnx module is required to be installed.
+ 
+ A quick solution is to install protobuf compiler, and
+-```bash
+-pip install onnx --user
+-```
++
++.. code-block:: bash
++
++    pip install onnx --user
++
+ or please refer to offical site.
+ https://github.com/onnx/onnx
+ """
+@@ -69,7 +71,8 @@ def download(url, path, overwrite=False):
+ # assume first input name is data
+ input_name = sym.list_input_names()[0]
+ shape_dict = {input_name: x.shape}
+-graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
++with nnvm.compiler.build_config(opt_level=3):
++    graph, lib, params = nnvm.compiler.build(sym, target, shape_dict, params=params)
+ 
+ ######################################################################
+ # Execute on TVM
+diff --git a/tutorials/nnvm/from_tensorflow.py b/tutorials/nnvm/from_tensorflow.py
+index ee025c5b09ff..f4af2381780c 100644
+--- a/tutorials/nnvm/from_tensorflow.py
++++ b/tutorials/nnvm/from_tensorflow.py
+@@ -5,9 +5,7 @@
+ 
+ For us to begin with, tensorflow python module is required to be installed.
+ 
+-A quick solution is to install tensorflow from
+-
+-https://www.tensorflow.org/install
++Please refer to https://www.tensorflow.org/install
+ """
+ 
+ # tvm and nnvm
+diff --git a/tutorials/nnvm_quick_start.py b/tutorials/nnvm_quick_start.py
+index c171823604cd..e16184300e2f 100644
+--- a/tutorials/nnvm_quick_start.py
++++ b/tutorials/nnvm_quick_start.py
+@@ -49,8 +49,8 @@
+ data_shape = (batch_size,) + image_shape
+ out_shape = (batch_size, num_class)
+ 
+-net, params = nnvm.testing.resnet.get_workload(layers=18,
+-        batch_size=batch_size, image_shape=image_shape)
++net, params = nnvm.testing.resnet.get_workload(
++    layers=18, batch_size=batch_size, image_shape=image_shape)
+ print(net.debug_str())
+ 
+ ######################################################################
+@@ -117,7 +117,7 @@
+ from tvm.contrib import util
+ 
+ temp = util.tempdir()
+-path_lib = temp.relpath("deploy_lib.so")
++path_lib = temp.relpath("deploy_lib.tar")
+ lib.export_library(path_lib)
+ with open(temp.relpath("deploy_graph.json"), "w") as fo:
+     fo.write(graph.json())
+@@ -136,6 +136,4 @@
+ module = graph_runtime.create(loaded_json, loaded_lib, tvm.gpu(0))
+ module.load_params(loaded_params)
+ module.run(data=input_data)
+-
+-out = module.get_output(0, out=tvm.nd.empty(out_shape))
+-
++out = module.get_output(0).asnumpy()

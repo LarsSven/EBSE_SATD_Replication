@@ -1,0 +1,448 @@
+diff --git a/airflow/config_templates/default_airflow.cfg b/airflow/config_templates/default_airflow.cfg
+index e08a865dda5a5..15bc51203145b 100644
+--- a/airflow/config_templates/default_airflow.cfg
++++ b/airflow/config_templates/default_airflow.cfg
+@@ -132,14 +132,6 @@ dag_concurrency = 16
+ # Are DAGs paused by default at creation
+ dags_are_paused_at_creation = True
+ 
+-# When not using pools, tasks are run in the "default pool",
+-# whose size is guided by this config element
+-non_pooled_task_slot_count = 128
+-
+-# When not using pools, the number of backfill tasks per backfill
+-# is limited by this config element
+-non_pooled_backfill_task_slot_count = %(non_pooled_task_slot_count)s
+-
+ # The maximum number of active DAG runs per DAG
+ max_active_runs_per_dag = 16
+ 
+diff --git a/airflow/config_templates/default_test.cfg b/airflow/config_templates/default_test.cfg
+index e0b3e8d389915..521049768fa4f 100644
+--- a/airflow/config_templates/default_test.cfg
++++ b/airflow/config_templates/default_test.cfg
+@@ -46,7 +46,6 @@ donot_pickle = False
+ dag_concurrency = 16
+ dags_are_paused_at_creation = False
+ fernet_key = {FERNET_KEY}
+-non_pooled_task_slot_count = 128
+ enable_xcom_pickling = False
+ killed_task_cleanup_time = 5
+ secure_mode = False
+diff --git a/airflow/jobs/backfill_job.py b/airflow/jobs/backfill_job.py
+index 34aa6bdf6eb31..680998599f0de 100644
+--- a/airflow/jobs/backfill_job.py
++++ b/airflow/jobs/backfill_job.py
+@@ -23,7 +23,6 @@
+ 
+ from sqlalchemy.orm.session import make_transient
+ 
+-from airflow import configuration as conf
+ from airflow import executors, models
+ from airflow.exceptions import (
+     AirflowException,
+@@ -542,32 +541,24 @@ def _per_task_process(task, key, ti, session=None):
+                 self.log.debug('Adding %s to not_ready', ti)
+                 ti_status.not_ready.add(key)
+ 
+-            non_pool_slots = conf.getint('core', 'non_pooled_backfill_task_slot_count')
+-
+             try:
+                 for task in self.dag.topological_sort():
+                     for key, ti in list(ti_status.to_run.items()):
+                         if task.task_id != ti.task_id:
+                             continue
+-                        if task.pool:
+-                            pool = session.query(models.Pool) \
+-                                .filter(models.Pool.pool == task.pool) \
+-                                .first()
+-                            if not pool:
+-                                raise PoolNotFound('Unknown pool: {}'.format(task.pool))
+-
+-                            open_slots = pool.open_slots(session=session)
+-                            if open_slots <= 0:
+-                                raise NoAvailablePoolSlot(
+-                                    "Not scheduling since there are "
+-                                    "%s open slots in pool %s".format(
+-                                        open_slots, task.pool))
+-                        else:
+-                            if non_pool_slots <= 0:
+-                                raise NoAvailablePoolSlot(
+-                                    "Not scheduling since there are no "
+-                                    "non_pooled_backfill_task_slot_count.")
+-                            non_pool_slots -= 1
++
++                        pool = session.query(models.Pool) \
++                            .filter(models.Pool.pool == task.pool) \
++                            .first()
++                        if not pool:
++                            raise PoolNotFound('Unknown pool: {}'.format(task.pool))
++
++                        open_slots = pool.open_slots(session=session)
++                        if open_slots <= 0:
++                            raise NoAvailablePoolSlot(
++                                "Not scheduling since there are "
++                                "%s open slots in pool %s".format(
++                                    open_slots, task.pool))
+ 
+                         num_running_task_instances_in_dag = DAG.get_num_task_instances(
+                             self.dag_id,
+diff --git a/airflow/jobs/scheduler_job.py b/airflow/jobs/scheduler_job.py
+index 6b8ef69a15836..733e22b3f3b62 100644
+--- a/airflow/jobs/scheduler_job.py
++++ b/airflow/jobs/scheduler_job.py
+@@ -893,21 +893,14 @@ def _find_executable_task_instances(self, simple_dag_bag, states, session=None):
+         # any open slots in the pool.
+         for pool, task_instances in pool_to_task_instances.items():
+             pool_name = pool
+-            if not pool:
+-                # Arbitrary:
+-                # If queued outside of a pool, trigger no more than
+-                # non_pooled_task_slot_count
+-                open_slots = models.Pool.default_pool_open_slots()
+-                pool_name = models.Pool.default_pool_name
++            if pool not in pools:
++                self.log.warning(
++                    "Tasks using non-existent pool '%s' will not be scheduled",
++                    pool
++                )
++                open_slots = 0
+             else:
+-                if pool not in pools:
+-                    self.log.warning(
+-                        "Tasks using non-existent pool '%s' will not be scheduled",
+-                        pool
+-                    )
+-                    open_slots = 0
+-                else:
+-                    open_slots = pools[pool].open_slots(session=session)
++                open_slots = pools[pool].open_slots(session=session)
+ 
+             num_ready = len(task_instances)
+             self.log.info(
+diff --git a/airflow/models/baseoperator.py b/airflow/models/baseoperator.py
+index a22d691a834e4..0ecaed3746c77 100644
+--- a/airflow/models/baseoperator.py
++++ b/airflow/models/baseoperator.py
+@@ -34,6 +34,7 @@
+ from airflow.exceptions import AirflowException
+ from airflow.lineage import prepare_lineage, apply_lineage, DataSet
+ from airflow.models.dag import DAG
++from airflow.models.pool import Pool
+ from airflow.models.taskinstance import TaskInstance, clear_task_instances
+ from airflow.models.xcom import XCOM_RETURN_KEY
+ from airflow.ti_deps.deps.not_in_retry_period_dep import NotInRetryPeriodDep
+@@ -258,7 +259,7 @@ def __init__(
+         priority_weight: int = 1,
+         weight_rule: str = WeightRule.DOWNSTREAM,
+         queue: str = configuration.conf.get('celery', 'default_queue'),
+-        pool: Optional[str] = None,
++        pool: Optional[str] = Pool.default_pool_name,
+         sla: Optional[timedelta] = None,
+         execution_timeout: Optional[timedelta] = None,
+         on_failure_callback: Optional[Callable] = None,
+diff --git a/airflow/models/pool.py b/airflow/models/pool.py
+index a7ecebf3a2c8d..3a57d1c9a6950 100644
+--- a/airflow/models/pool.py
++++ b/airflow/models/pool.py
+@@ -19,7 +19,6 @@
+ 
+ from sqlalchemy import Column, Integer, String, Text, func
+ 
+-from airflow import conf
+ from airflow.models.base import Base
+ from airflow.utils.state import State
+ from airflow.utils.db import provide_session
+@@ -33,20 +32,19 @@ class Pool(Base):
+     slots = Column(Integer, default=0)
+     description = Column(Text)
+ 
+-    default_pool_name = 'not_pooled'
++    default_pool_name = 'default_pool'
+ 
+     def __repr__(self):
+         return self.pool
+ 
+     @staticmethod
+     @provide_session
+-    def default_pool_open_slots(session):
+-        from airflow.models import TaskInstance as TI  # To avoid circular imports
+-        total_slots = conf.getint('core', 'non_pooled_task_slot_count')
+-        used_slots = session.query(func.count()).filter(
+-            TI.pool == Pool.default_pool_name).filter(
+-            TI.state.in_([State.RUNNING, State.QUEUED])).scalar()
+-        return total_slots - used_slots
++    def get_pool(pool_name, session=None):
++        return session.query(Pool).filter(Pool.pool == pool_name).first()
++
++    @staticmethod
++    def get_default_pool():
++        return Pool.get_pool(Pool.default_pool_name)
+ 
+     def to_json(self):
+         return {
+diff --git a/airflow/utils/db.py b/airflow/utils/db.py
+index 4de470261e991..90c39cf70f108 100644
+--- a/airflow/utils/db.py
++++ b/airflow/utils/db.py
+@@ -78,6 +78,19 @@ def merge_conn(conn, session=None):
+         session.commit()
+ 
+ 
++@provide_session
++def add_default_pool_if_not_exists(session=None):
++    from airflow.models.pool import Pool
++    if not Pool.get_pool(Pool.default_pool_name, session=session):
++        default_pool = Pool(
++            pool=Pool.default_pool_name,
++            slots=128,
++            description="Default pool",
++        )
++        session.add(default_pool)
++        session.commit()
++
++
+ def initdb():
+     from airflow import models
+     from airflow.models import Connection
+@@ -311,6 +324,7 @@ def upgradedb():
+     config.set_main_option('script_location', directory.replace('%', '%%'))
+     config.set_main_option('sqlalchemy.url', settings.SQL_ALCHEMY_CONN.replace('%', '%%'))
+     command.upgrade(config, 'heads')
++    add_default_pool_if_not_exists()
+ 
+ 
+ def resetdb():
+diff --git a/tests/jobs/test_backfill_job.py b/tests/jobs/test_backfill_job.py
+index ccdd5f49a8605..b925b722a016a 100644
+--- a/tests/jobs/test_backfill_job.py
++++ b/tests/jobs/test_backfill_job.py
+@@ -36,12 +36,13 @@
+ from airflow.models import DAG, DagBag, DagRun, Pool, TaskInstance as TI
+ from airflow.operators.dummy_operator import DummyOperator
+ from airflow.utils import timezone
++from airflow.utils.db import add_default_pool_if_not_exists
+ from airflow.utils.state import State
+ from airflow.utils.timeout import timeout
+ from tests.compat import Mock, patch
+ from tests.executors.test_executor import TestExecutor
+ from tests.test_utils.db import clear_db_pools, \
+-    clear_db_runs
++    clear_db_runs, set_default_pool_slots
+ 
+ configuration.load_test_config()
+ 
+@@ -82,6 +83,7 @@ def setUpClass(cls):
+     def setUp(self):
+         clear_db_runs()
+         clear_db_pools()
++        add_default_pool_if_not_exists()
+ 
+         self.parser = cli.CLIFactory.get_parser()
+ 
+@@ -397,18 +399,9 @@ def test_backfill_respect_dag_concurrency_limit(self, mock_log):
+         self.assertGreater(times_dag_concurrency_limit_reached_in_debug, 0)
+ 
+     @patch('airflow.jobs.backfill_job.BackfillJob.log')
+-    @patch('airflow.jobs.backfill_job.conf.getint')
+-    def test_backfill_with_no_pool_limit(self, mock_getint, mock_log):
+-        non_pooled_backfill_task_slot_count = 2
+-
+-        def getint(section, key):
+-            if section.lower() == 'core' and \
+-                    'non_pooled_backfill_task_slot_count' == key.lower():
+-                return non_pooled_backfill_task_slot_count
+-            else:
+-                return configuration.conf.getint(section, key)
+-
+-        mock_getint.side_effect = getint
++    def test_backfill_respect_default_pool_limit(self, mock_log):
++        default_pool_slots = 2
++        set_default_pool_slots(default_pool_slots)
+ 
+         dag = self._get_dummy_dag('test_backfill_with_no_pool_limit')
+ 
+@@ -425,24 +418,24 @@ def getint(section, key):
+ 
+         self.assertTrue(0 < len(executor.history))
+ 
+-        non_pooled_task_slot_count_reached_at_least_once = False
++        default_pool_task_slot_count_reached_at_least_once = False
+ 
+         num_running_task_instances = 0
+ 
+         # if no pool is specified, the number of tasks running in
+         # parallel per backfill should be less than
+-        # non_pooled_backfill_task_slot_count at any point of time.
++        # default_pool slots at any point of time.
+         for running_task_instances in executor.history:
+             self.assertLessEqual(
+                 len(running_task_instances),
+-                non_pooled_backfill_task_slot_count,
++                default_pool_slots,
+             )
+             num_running_task_instances += len(running_task_instances)
+-            if len(running_task_instances) == non_pooled_backfill_task_slot_count:
+-                non_pooled_task_slot_count_reached_at_least_once = True
++            if len(running_task_instances) == default_pool_slots:
++                default_pool_task_slot_count_reached_at_least_once = True
+ 
+         self.assertEquals(8, num_running_task_instances)
+-        self.assertTrue(non_pooled_task_slot_count_reached_at_least_once)
++        self.assertTrue(default_pool_task_slot_count_reached_at_least_once)
+ 
+         times_dag_concurrency_limit_reached_in_debug = self._times_called_with(
+             mock_log.debug,
+diff --git a/tests/jobs/test_scheduler_job.py b/tests/jobs/test_scheduler_job.py
+index 739c19fa81ab3..3d66f60c159c8 100644
+--- a/tests/jobs/test_scheduler_job.py
++++ b/tests/jobs/test_scheduler_job.py
+@@ -40,15 +40,14 @@
+ from airflow.utils import timezone
+ from airflow.utils.dag_processing import SimpleDag, SimpleDagBag, list_py_file_paths
+ from airflow.utils.dates import days_ago
+-from airflow.utils.db import create_session, provide_session
++from airflow.utils.db import create_session, provide_session, add_default_pool_if_not_exists
+ from airflow.utils.state import State
+ from tests.compat import MagicMock, Mock, PropertyMock, patch
+ from tests.compat import mock
+ from tests.core import TEST_DAG_FOLDER
+ from tests.executors.test_executor import TestExecutor
+ from tests.test_utils.db import clear_db_dags, clear_db_errors, clear_db_pools, \
+-    clear_db_runs, clear_db_sla_miss
+-from tests.test_utils.decorators import mock_conf_get
++    clear_db_runs, clear_db_sla_miss, set_default_pool_slots
+ 
+ configuration.load_test_config()
+ 
+@@ -73,6 +72,7 @@ def setUp(self):
+         clear_db_dags()
+         clear_db_sla_miss()
+         clear_db_errors()
++        add_default_pool_if_not_exists()
+ 
+         # Speed up some tests by not running the tasks, just look at what we
+         # enqueue!
+@@ -354,9 +354,10 @@ def test_find_executable_task_instances_pool(self):
+         self.assertIn(tis[1].key, res_keys)
+         self.assertIn(tis[3].key, res_keys)
+ 
+-    @mock_conf_get('core', 'non_pooled_task_slot_count', 1)
+-    def test_find_executable_task_instances_in_non_pool(self):
+-        dag_id = 'SchedulerJobTest.test_find_executable_task_instances_in_non_pool'
++    def test_find_executable_task_instances_in_default_pool(self):
++        set_default_pool_slots(1)
++        session = settings.Session()
++        dag_id = 'SchedulerJobTest.test_find_executable_task_instances_in_default_pool'
+         dag = DAG(dag_id=dag_id, start_date=DEFAULT_DATE)
+         t1 = DummyOperator(dag=dag, task_id='dummy1')
+         t2 = DummyOperator(dag=dag, task_id='dummy2')
+@@ -366,7 +367,6 @@ def test_find_executable_task_instances_in_non_pool(self):
+         scheduler = SchedulerJob(executor=executor)
+         dr1 = scheduler.create_dag_run(dag)
+         dr2 = scheduler.create_dag_run(dag)
+-        session = settings.Session()
+ 
+         ti1 = TI(task=t1, execution_date=dr1.execution_date)
+         ti2 = TI(task=t2, execution_date=dr2.execution_date)
+@@ -377,7 +377,7 @@ def test_find_executable_task_instances_in_non_pool(self):
+         session.merge(ti2)
+         session.commit()
+ 
+-        # Two tasks w/o pool up for execution and our non_pool size is 1
++        # Two tasks w/o pool up for execution and our default pool size is 1
+         res = scheduler._find_executable_task_instances(
+             dagbag,
+             states=(State.SCHEDULED,),
+@@ -385,7 +385,6 @@ def test_find_executable_task_instances_in_non_pool(self):
+         self.assertEqual(1, len(res))
+ 
+         ti2.state = State.RUNNING
+-        ti2.pool = Pool.default_pool_name
+         session.merge(ti2)
+         session.commit()
+ 
+diff --git a/tests/models/test_pool.py b/tests/models/test_pool.py
+index cff4de6fd9844..37c805a0cbeed 100644
+--- a/tests/models/test_pool.py
++++ b/tests/models/test_pool.py
+@@ -25,18 +25,25 @@
+ from airflow.models.taskinstance import TaskInstance as TI
+ from airflow.operators.dummy_operator import DummyOperator
+ from airflow.utils import timezone
++from airflow.utils.db import add_default_pool_if_not_exists
+ from airflow.utils.state import State
+-from tests.test_utils.db import clear_db_pools, clear_db_runs
+-from tests.test_utils.decorators import mock_conf_get
++from tests.test_utils.db import clear_db_pools, clear_db_runs, set_default_pool_slots
+ 
+ DEFAULT_DATE = timezone.datetime(2016, 1, 1)
+ 
+ 
+ class PoolTest(unittest.TestCase):
+ 
+-    def tearDown(self):
++    def setUp(self):
+         clear_db_runs()
+         clear_db_pools()
++        add_default_pool_if_not_exists()
++
++    @classmethod
++    def tearDownClass(cls):
++        clear_db_runs()
++        clear_db_pools()
++        add_default_pool_if_not_exists()
+ 
+     def test_open_slots(self):
+         pool = Pool(pool='test_pool', slots=5)
+@@ -59,8 +66,9 @@ def test_open_slots(self):
+ 
+         self.assertEqual(3, pool.open_slots())
+ 
+-    @mock_conf_get('core', 'non_pooled_task_slot_count', 5)
+     def test_default_pool_open_slots(self):
++        set_default_pool_slots(5)
++
+         dag = DAG(
+             dag_id='test_default_pool_open_slots',
+             start_date=DEFAULT_DATE, )
+@@ -79,4 +87,4 @@ def test_default_pool_open_slots(self):
+         session.commit()
+         session.close()
+ 
+-        self.assertEqual(3, Pool.default_pool_open_slots())
++        self.assertEqual(3, Pool.get_default_pool())
+diff --git a/tests/test_impersonation.py b/tests/test_impersonation.py
+index e4a9d90e7a486..b06c5df035eef 100644
+--- a/tests/test_impersonation.py
++++ b/tests/test_impersonation.py
+@@ -24,6 +24,7 @@
+ import logging
+ 
+ from airflow import jobs, models
++from airflow.utils.db import add_default_pool_if_not_exists
+ from airflow.utils.state import State
+ from airflow.utils.timezone import datetime
+ 
+@@ -45,6 +46,7 @@
+ 
+ class ImpersonationTest(unittest.TestCase):
+     def setUp(self):
++        add_default_pool_if_not_exists()
+         self.dagbag = models.DagBag(
+             dag_folder=TEST_DAG_FOLDER,
+             include_examples=False,
+diff --git a/tests/test_utils/db.py b/tests/test_utils/db.py
+index 998e7cc0f8067..5c85a1d3a67c5 100644
+--- a/tests/test_utils/db.py
++++ b/tests/test_utils/db.py
+@@ -44,3 +44,9 @@ def clear_db_errors():
+ def clear_db_pools():
+     with create_session() as session:
+         session.query(Pool).delete()
++
++
++def set_default_pool_slots(slots):
++    with create_session():
++        default_pool = Pool.get_default_pool()
++        default_pool.slots = slots

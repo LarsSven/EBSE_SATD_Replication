@@ -1,0 +1,1541 @@
+diff --git a/UPDATING.md b/UPDATING.md
+index c2dfcb4022f2d..5d9b876b2940a 100644
+--- a/UPDATING.md
++++ b/UPDATING.md
+@@ -61,6 +61,43 @@ https://developers.google.com/style/inclusive-documentation
+ 
+ -->
+ 
++### Introduction of TaskExecutionRequest in the Executor.
++
++The BaseExecutor now uses `TaskExecutionRequest` instead of a list of strings with the command to be executed.
++All methods and fields that previously used the `command` parameter now use `task_execution_request`.
++If your executor only extends non-implemented methods from BaseExecutor, you only need to update
++the `execute_async` method.
++
++The code below
++```python
++    def execute_async(
++        self,
++        key: TaskInstanceKeyType,
++        command: CommandType,
++        queue: Optional[str] = None,
++        executor_config: Optional[Any] = None) -> None:
++
++        [...]
++
++        self.task_queue.put((key, command))
++```
++can be replaced by the following code:
++```python
++    def execute_async(
++        self,
++        key: TaskInstanceKeyType,
++        task_execution_request: TaskExecutionRequest,
++        queue: Optional[str] = None,
++        executor_config: Optional[Any] = None) -> None:
++
++        [...]
++
++        command = task_execution_request.as_command()
++        self.task_queue.put((key, command))
++```
++
++This change allows the development of executors that run LocalTaskJob in a different way.
++
+ ### Added `airflow dags test` CLI command
+ 
+ A new command was added to the CLI for executing one full run of a DAG for a given execution date, similar to
+diff --git a/airflow/executors/base_executor.py b/airflow/executors/base_executor.py
+index c6d322954b5b8..b0dad8417a3f0 100644
+--- a/airflow/executors/base_executor.py
++++ b/airflow/executors/base_executor.py
+@@ -22,25 +22,23 @@
+ 
+ from airflow import LoggingMixin, conf
+ from airflow.models import TaskInstance
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.models.taskinstance import SimpleTaskInstance, TaskInstanceKeyType
+ from airflow.stats import Stats
++from airflow.utils.dag_processing import SimpleDag
+ from airflow.utils.state import State
+ 
+ PARALLELISM: int = conf.getint('core', 'PARALLELISM')
+ 
+ NOT_STARTED_MESSAGE = "The executor should be started first!"
+ 
+-# Command to execute - list of strings
+-# the first element is always "airflow".
+-# It should be result of TaskInstance.generate_command method.q
+-CommandType = List[str]
+-
+-
+ # Task that is queued. It contains all the information that is
+ # needed to run the task.
+ #
+-# Tuple of: command, priority, queue name, SimpleTaskInstance
+-QueuedTaskInstanceType = Tuple[CommandType, int, Optional[str], Union[SimpleTaskInstance, TaskInstance]]
++# Tuple of: task_execution_request, priority, queue name, SimpleTaskInstance
++QueuedTaskInstanceType = Tuple[
++    TaskExecutionRequest, int, Optional[str], Union[SimpleTaskInstance, TaskInstance]
++]
+ 
+ 
+ class BaseExecutor(LoggingMixin):
+@@ -64,15 +62,19 @@ def start(self):  # pragma: no cover
+         Executors may need to get things started.
+         """
+ 
+-    def queue_command(self,
+-                      simple_task_instance: SimpleTaskInstance,
+-                      command: CommandType,
+-                      priority: int = 1,
+-                      queue: Optional[str] = None):
+-        """Queues command to task"""
++    def _queue_task_execution_request(
++        self,
++        simple_task_instance: SimpleTaskInstance,
++        task_execution_request: TaskExecutionRequest,
++        priority: int = 1,
++        queue: Optional[str] = None
++    ):
++        """Queues task exeuction request run of local task job to task"""
+         if simple_task_instance.key not in self.queued_tasks and simple_task_instance.key not in self.running:
+-            self.log.info("Adding to queue: %s", command)
+-            self.queued_tasks[simple_task_instance.key] = (command, priority, queue, simple_task_instance)
++            self.log.info("Adding to queue: %s", task_execution_request)
++            self.queued_tasks[simple_task_instance.key] = (
++                task_execution_request, priority, queue, simple_task_instance
++            )
+         else:
+             self.log.info("could not queue task %s", simple_task_instance.key)
+ 
+@@ -94,22 +96,46 @@ def queue_task_instance(
+         # cfg_path is needed to propagate the config values if using impersonation
+         # (run_as_user), given that there are different code paths running tasks.
+         # For a long term solution we need to address AIRFLOW-1986
+-        command_list_to_run = task_instance.command_as_list(
+-            local=True,
++        task_execution_request = TaskExecutionRequest(
++            dag_id=task_instance.dag_id,
++            task_id=task_instance.task_id,
++            execution_date=task_instance.execution_date,
+             mark_success=mark_success,
+-            ignore_all_deps=ignore_all_deps,
++            ignore_all_dependencies=ignore_all_deps,
+             ignore_depends_on_past=ignore_depends_on_past,
+-            ignore_task_deps=ignore_task_deps,
+-            ignore_ti_state=ignore_ti_state,
++            ignore_dependencies=ignore_task_deps,
++            force=ignore_ti_state,
+             pool=pool,
+             pickle_id=pickle_id,
+-            cfg_path=cfg_path)
+-        self.queue_command(
++            cfg_path=cfg_path,
++        )
++        self._queue_task_execution_request(
+             SimpleTaskInstance(task_instance),
+-            command_list_to_run,
++            task_execution_request,
+             priority=task_instance.task.priority_weight_total,
+             queue=task_instance.task.queue)
+ 
++    def queue_simple_task_instance(self, simple_task_instance: SimpleTaskInstance, simple_dag: SimpleDag):
++        """Queues simple task instance."""
++        priority = simple_task_instance.priority_weight
++        queue = simple_task_instance.queue
++
++        task_execution_request = TaskExecutionRequest(
++            dag_id=simple_task_instance.dag_id,
++            task_id=simple_task_instance.task_id,
++            execution_date=simple_task_instance.execution_date,
++            pool=simple_task_instance.pool,
++            subdir=simple_dag.full_filepath,
++            pickle_id=simple_dag.pickle_id
++        )
++
++        self._queue_task_execution_request(
++            simple_task_instance,
++            task_execution_request,
++            priority=priority,
++            queue=queue
++        )
++
+     def has_task(self, task_instance: TaskInstance) -> bool:
+         """
+         Checks if a task is either queued or running in this executor.
+@@ -171,11 +197,11 @@ def trigger_tasks(self, open_slots: int) -> None:
+         sorted_queue = self.order_queued_tasks_by_priority()
+ 
+         for _ in range(min((open_slots, len(self.queued_tasks)))):
+-            key, (command, _, _, simple_ti) = sorted_queue.pop(0)
++            key, (task_execution_request, _, _, simple_ti) = sorted_queue.pop(0)
+             self.queued_tasks.pop(key)
+             self.running.add(key)
+             self.execute_async(key=key,
+-                               command=command,
++                               task_execution_request=task_execution_request,
+                                queue=None,
+                                executor_config=simple_ti.executor_config)
+ 
+@@ -232,14 +258,14 @@ def get_event_buffer(self, dag_ids=None) -> Dict[TaskInstanceKeyType, Optional[s
+ 
+     def execute_async(self,
+                       key: TaskInstanceKeyType,
+-                      command: CommandType,
++                      task_execution_request: TaskExecutionRequest,
+                       queue: Optional[str] = None,
+                       executor_config: Optional[Any] = None) -> None:  # pragma: no cover
+         """
+-        This method will execute the command asynchronously.
++        This method will execute the task execution request run asynchronously.
+ 
+         :param key: Unique key for the task instance
+-        :param command: Command to run
++        :param task_execution_request: Task execution request that contains information about task
+         :param queue: name of the queue
+         :param executor_config: Configuration passed to the executor.
+         """
+diff --git a/airflow/executors/celery_executor.py b/airflow/executors/celery_executor.py
+index f910bfee1375b..c535e6f43204b 100644
+--- a/airflow/executors/celery_executor.py
++++ b/airflow/executors/celery_executor.py
+@@ -23,7 +23,7 @@
+ import time
+ import traceback
+ from multiprocessing import Pool, cpu_count
+-from typing import Any, List, Optional, Tuple, Union
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ from celery import Celery, Task, states as celery_states
+ from celery.result import AsyncResult
+@@ -31,7 +31,8 @@
+ from airflow.config_templates.default_celery import DEFAULT_CELERY_CONFIG
+ from airflow.configuration import conf
+ from airflow.exceptions import AirflowException
+-from airflow.executors.base_executor import BaseExecutor, CommandType
++from airflow.executors.base_executor import BaseExecutor
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.models.taskinstance import SimpleTaskInstance, TaskInstanceKeyType, TaskInstanceStateType
+ from airflow.utils.module_loading import import_string
+ from airflow.utils.timeout import timeout
+@@ -63,15 +64,17 @@
+ 
+ 
+ @app.task
+-def execute_command(command_to_exec: CommandType) -> None:
+-    """Executes command."""
++def execute_task_execution_request(task_execution_request_kwargs: Dict) -> None:
++    """Executes Task Execution Request."""
++    task_execution_request = TaskExecutionRequest(**task_execution_request_kwargs)
++    command_to_exec = task_execution_request.as_command()
+     log.info("Executing command in Celery: %s", command_to_exec)
+     env = os.environ.copy()
+     try:
+         subprocess.check_call(command_to_exec, stderr=subprocess.STDOUT,
+                               close_fds=True, env=env)
+     except subprocess.CalledProcessError as e:
+-        log.exception('execute_command encountered a CalledProcessError')
++        log.exception('execute_task_execution_request encountered a CalledProcessError')
+         log.error(e.output)
+         raise AirflowException('Celery command failed')
+ 
+@@ -116,22 +119,24 @@ def fetch_celery_task_state(celery_task: Tuple[TaskInstanceKeyType, AsyncResult]
+ 
+ 
+ # Task instance that is sent over Celery queues
+-# TaskInstanceKeyType, SimpleTaskInstance, Command, queue_name, CallableTask
+-TaskInstanceInCelery = Tuple[TaskInstanceKeyType, SimpleTaskInstance, CommandType, Optional[str], Task]
++# TaskInstanceKeyType, SimpleTaskInstance, TaskExecutionRequest, queue_name, CallableTask
++TaskInstanceInCelery = Tuple[
++    TaskInstanceKeyType, SimpleTaskInstance, TaskExecutionRequest, Optional[str], Task
++]
+ 
+ 
+ def send_task_to_executor(task_tuple: TaskInstanceInCelery) \
+-        -> Tuple[TaskInstanceKeyType, CommandType, Union[AsyncResult, ExceptionWithTraceback]]:
++        -> Tuple[TaskInstanceKeyType, TaskExecutionRequest, Union[AsyncResult, ExceptionWithTraceback]]:
+     """Sends task to executor."""
+-    key, _, command, queue, task_to_run = task_tuple
++    key, _, task_execution_request, queue, task_to_run = task_tuple
+     try:
+         with timeout(seconds=OPERATION_TIMEOUT):
+-            result = task_to_run.apply_async(args=[command], queue=queue)
++            result = task_to_run.apply_async(args=[task_execution_request.__dict__], queue=queue)
+     except Exception as e:  # pylint: disable=broad-except
+         exception_traceback = "Celery Task ID: {}\n{}".format(key, traceback.format_exc())
+         result = ExceptionWithTraceback(e, exception_traceback)
+ 
+-    return key, command, result
++    return key, task_execution_request, result
+ 
+ 
+ class CeleryExecutor(BaseExecutor):
+@@ -196,8 +201,10 @@ def trigger_tasks(self, open_slots: int) -> None:
+         task_tuples_to_send: List[TaskInstanceInCelery] = []
+ 
+         for _ in range(min((open_slots, len(self.queued_tasks)))):
+-            key, (command, _, queue, simple_ti) = sorted_queue.pop(0)
+-            task_tuples_to_send.append((key, simple_ti, command, queue, execute_command))
++            key, (task_execution_request, _, queue, simple_ti) = sorted_queue.pop(0)
++            task_tuples_to_send.append(
++                (key, simple_ti, task_execution_request, queue, execute_task_execution_request)
++            )
+ 
+         cached_celery_backend = None
+         if task_tuples_to_send:
+@@ -223,7 +230,7 @@ def trigger_tasks(self, open_slots: int) -> None:
+             send_pool.join()
+             self.log.debug('Sent all tasks.')
+ 
+-            for key, command, result in key_and_async_results:
++            for key, task_execution_request, result in key_and_async_results:
+                 if isinstance(result, ExceptionWithTraceback):
+                     self.log.error(  # pylint: disable=logging-not-lazy
+                         CELERY_SEND_ERR_MSG_HEADER + ":%s\n%s\n", result.exception, result.traceback
+@@ -309,7 +316,7 @@ def end(self, synchronous: bool = False) -> None:
+ 
+     def execute_async(self,
+                       key: TaskInstanceKeyType,
+-                      command: CommandType,
++                      task_execution_request: TaskExecutionRequest,
+                       queue: Optional[str] = None,
+                       executor_config: Optional[Any] = None):
+         """Do not allow async execution for Celery executor."""
+diff --git a/airflow/executors/dask_executor.py b/airflow/executors/dask_executor.py
+index fe9eb3bef560d..88e16a7d06d87 100644
+--- a/airflow/executors/dask_executor.py
++++ b/airflow/executors/dask_executor.py
+@@ -24,7 +24,8 @@
+ 
+ from airflow import AirflowException
+ from airflow.configuration import conf
+-from airflow.executors.base_executor import NOT_STARTED_MESSAGE, BaseExecutor, CommandType
++from airflow.executors.base_executor import NOT_STARTED_MESSAGE, BaseExecutor
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.models.taskinstance import TaskInstanceKeyType
+ 
+ 
+@@ -62,14 +63,14 @@ def start(self) -> None:
+ 
+     def execute_async(self,
+                       key: TaskInstanceKeyType,
+-                      command: CommandType,
++                      task_execution_request: TaskExecutionRequest,
+                       queue: Optional[str] = None,
+                       executor_config: Optional[Any] = None) -> None:
+         if not self.futures:
+             raise AirflowException(NOT_STARTED_MESSAGE)
+ 
+         def airflow_run():
+-            return subprocess.check_call(command, close_fds=True)
++            return subprocess.check_call(task_execution_request.as_command(), close_fds=True)
+ 
+         if not self.client:
+             raise AirflowException(NOT_STARTED_MESSAGE)
+diff --git a/airflow/executors/debug_executor.py b/airflow/executors/debug_executor.py
+index e0920df77e624..44c891fa71d73 100644
+--- a/airflow/executors/debug_executor.py
++++ b/airflow/executors/debug_executor.py
+@@ -21,10 +21,11 @@
+ """
+ 
+ import threading
+-from typing import Any, Dict, List, Optional
++from typing import List, Tuple
+ 
+ from airflow import conf
+ from airflow.executors.base_executor import BaseExecutor
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.models.taskinstance import TaskInstance, TaskInstanceKeyType
+ from airflow.utils.state import State
+ 
+@@ -41,9 +42,7 @@ class DebugExecutor(BaseExecutor):
+ 
+     def __init__(self):
+         super().__init__()
+-        self.tasks_to_run: List[TaskInstance] = []
+-        # Place where we keep information for task instance raw run
+-        self.tasks_params: Dict[TaskInstanceKeyType, Dict[str, Any]] = {}
++        self.tasks_to_run: List[Tuple[TaskInstance, TaskExecutionRequest]] = []
+         self.fail_fast = conf.getboolean("debug", "fail_fast")
+ 
+     def execute_async(self, *args, **kwargs) -> None:
+@@ -54,7 +53,7 @@ def execute_async(self, *args, **kwargs) -> None:
+     def sync(self) -> None:
+         task_succeeded = True
+         while self.tasks_to_run:
+-            ti = self.tasks_to_run.pop(0)
++            ti, task_execution_request = self.tasks_to_run.pop(0)
+             if self.fail_fast and not task_succeeded:
+                 self.log.info("Setting %s to %s", ti.key, State.UPSTREAM_FAILED)
+                 ti.set_state(State.UPSTREAM_FAILED)
+@@ -69,15 +68,16 @@ def sync(self) -> None:
+                 self.change_state(ti.key, State.FAILED)
+                 continue
+ 
+-            task_succeeded = self._run_task(ti)
++            task_succeeded = self._run_task(ti, task_execution_request)
+ 
+-    def _run_task(self, ti: TaskInstance) -> bool:
++    def _run_task(self, ti: TaskInstance, task_execution_request: TaskExecutionRequest) -> bool:
+         self.log.debug("Executing task: %s", ti)
+         key = ti.key
+         try:
+-            params = self.tasks_params.pop(ti.key, {})
+             ti._run_raw_task(  # pylint: disable=protected-access
+-                job_id=ti.job_id, **params
++                job_id=ti.job_id,
++                mark_success=task_execution_request.mark_success,
++                pool=task_execution_request.pool
+             )
+             self.change_state(key, State.SUCCESS)
+             return True
+@@ -86,33 +86,6 @@ def _run_task(self, ti: TaskInstance) -> bool:
+             self.log.exception("Failed to execute task: %s.", str(e))
+             return False
+ 
+-    def queue_task_instance(
+-        self,
+-        task_instance: TaskInstance,
+-        mark_success: bool = False,
+-        pickle_id: Optional[str] = None,
+-        ignore_all_deps: bool = False,
+-        ignore_depends_on_past: bool = False,
+-        ignore_task_deps: bool = False,
+-        ignore_ti_state: bool = False,
+-        pool: Optional[str] = None,
+-        cfg_path: Optional[str] = None,
+-    ) -> None:
+-        """
+-        Queues task instance with empty command because we do not need it.
+-        """
+-        self.queue_command(
+-            task_instance,
+-            [str(task_instance)],  # Just for better logging, it's not used anywhere
+-            priority=task_instance.task.priority_weight_total,
+-            queue=task_instance.task.queue,
+-        )
+-        # Save params for TaskInstance._run_raw_task
+-        self.tasks_params[task_instance.key] = {
+-            "mark_success": mark_success,
+-            "pool": pool,
+-        }
+-
+     def trigger_tasks(self, open_slots: int) -> None:
+         """
+         Triggers tasks. Instead of calling exec_async we just
+@@ -126,17 +99,19 @@ def trigger_tasks(self, open_slots: int) -> None:
+             reverse=True,
+         )
+         for _ in range(min((open_slots, len(self.queued_tasks)))):
+-            key, (_, _, _, ti) = sorted_queue.pop(0)
++            key, (task_execution_request, _, _, ti) = sorted_queue.pop(0)
+             self.queued_tasks.pop(key)
+             self.running.add(key)
+-            self.tasks_to_run.append(ti)  # type: ignore
++            if not isinstance(ti, TaskInstance):
++                raise ValueError(f"Expected TaskInstance, but found {type(ti)} type")
++            self.tasks_to_run.append((ti, task_execution_request))
+ 
+     def end(self) -> None:
+         """
+         When the method is called we just set states of queued tasks
+         to UPSTREAM_FAILED marking them as not executed.
+         """
+-        for ti in self.tasks_to_run:
++        for ti, _ in self.tasks_to_run:
+             self.log.info("Setting %s to %s", ti.key, State.UPSTREAM_FAILED)
+             ti.set_state(State.UPSTREAM_FAILED)
+             self.change_state(ti.key, State.UPSTREAM_FAILED)
+diff --git a/airflow/executors/kubernetes_executor.py b/airflow/executors/kubernetes_executor.py
+index 8975001d57934..f36dcbc432d25 100644
+--- a/airflow/executors/kubernetes_executor.py
++++ b/airflow/executors/kubernetes_executor.py
+@@ -22,7 +22,7 @@
+ import multiprocessing
+ import re
+ from queue import Empty, Queue  # pylint: disable=unused-import
+-from typing import Any, Dict, Optional, Tuple, Union
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ import kubernetes
+ from dateutil import parser
+@@ -33,7 +33,7 @@
+ from airflow import settings
+ from airflow.configuration import conf
+ from airflow.exceptions import AirflowConfigException, AirflowException
+-from airflow.executors.base_executor import NOT_STARTED_MESSAGE, BaseExecutor, CommandType
++from airflow.executors.base_executor import NOT_STARTED_MESSAGE, BaseExecutor, TaskExecutionRequest
+ from airflow.kubernetes.kube_client import get_kube_client
+ from airflow.kubernetes.pod_generator import MAX_POD_ID_LEN, PodGenerator
+ from airflow.kubernetes.pod_launcher import PodLauncher
+@@ -47,7 +47,7 @@
+ MAX_LABEL_LEN = 63
+ 
+ # TaskInstance key, command, configuration
+-KubernetesJobType = Tuple[TaskInstanceKeyType, CommandType, Any]
++KubernetesJobType = Tuple[TaskInstanceKeyType, List[str], Any]
+ 
+ # key, state, pod_id, resource_version
+ KubernetesResultsType = Tuple[TaskInstanceKeyType, Optional[str], str, str]
+@@ -775,19 +775,19 @@ def start(self) -> None:
+ 
+     def execute_async(self,
+                       key: TaskInstanceKeyType,
+-                      command: CommandType,
++                      task_execution_request: TaskExecutionRequest,
+                       queue: Optional[str] = None,
+                       executor_config: Optional[Any] = None) -> None:
+         """Executes task asynchronously"""
+         self.log.info(
+             'Add task %s with command %s with executor_config %s',
+-            key, command, executor_config
++            key, task_execution_request, executor_config
+         )
+ 
+         kube_executor_config = PodGenerator.from_obj(executor_config)
+         if not self.task_queue:
+             raise AirflowException(NOT_STARTED_MESSAGE)
+-        self.task_queue.put((key, command, kube_executor_config))
++        self.task_queue.put((key, task_execution_request.as_command(), kube_executor_config))
+ 
+     def sync(self) -> None:
+         """Synchronize task state."""
+diff --git a/airflow/executors/local_executor.py b/airflow/executors/local_executor.py
+index 0a1b4bd6e3415..b9741cd087e10 100644
+--- a/airflow/executors/local_executor.py
++++ b/airflow/executors/local_executor.py
+@@ -49,7 +49,8 @@
+ from typing import Any, List, Optional, Tuple, Union  # pylint: disable=unused-import # noqa: F401
+ 
+ from airflow import AirflowException
+-from airflow.executors.base_executor import NOT_STARTED_MESSAGE, PARALLELISM, BaseExecutor, CommandType
++from airflow.executors.base_executor import NOT_STARTED_MESSAGE, PARALLELISM, BaseExecutor
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.models.taskinstance import (  # pylint: disable=unused-import # noqa: F401
+     TaskInstanceKeyType, TaskInstanceStateType,
+ )
+@@ -59,7 +60,7 @@
+ # This is a work to be executed by a worker.
+ # It can Key and Command - but it can also be None, None which is actually a
+ # "Poison Pill" - worker seeing Poison Pill should take the pill and ... die instantly.
+-ExecutorWorkType = Tuple[Optional[TaskInstanceKeyType], Optional[CommandType]]
++ExecutorWorkType = Tuple[Optional[TaskInstanceKeyType], Optional[TaskExecutionRequest]]
+ 
+ 
+ class LocalWorkerBase(Process, LoggingMixin):
+@@ -74,17 +75,18 @@ def __init__(self, result_queue: 'Queue[TaskInstanceStateType]'):
+         self.daemon: bool = True
+         self.result_queue: 'Queue[TaskInstanceStateType]' = result_queue
+ 
+-    def execute_work(self, key: TaskInstanceKeyType, command: CommandType) -> None:
++    def execute_work(self, key: TaskInstanceKeyType, task_execution_request: TaskExecutionRequest) -> None:
+         """
+-        Executes command received and stores result state in queue.
++        Executes task execution request received and stores result state in queue.
+ 
+         :param key: the key to identify the task instance
+-        :param command: the command to execute
++        :param task_execution_request: the task execution request to execute
+         """
+         if key is None:
+             return
+-        self.log.info("%s running %s", self.__class__.__name__, command)
++        self.log.info("%s running %s", self.__class__.__name__, task_execution_request)
+         try:
++            command = task_execution_request.as_command()
+             subprocess.check_call(command, close_fds=True)
+             state = State.SUCCESS
+         except subprocess.CalledProcessError as e:
+@@ -99,18 +101,18 @@ class LocalWorker(LocalWorkerBase):
+ 
+     :param result_queue: queue where results of the tasks are put.
+     :param key: key identifying task instance
+-    :param command: Command to execute
++    :param task_execution_request: task execution request to execute
+     """
+     def __init__(self,
+                  result_queue: 'Queue[TaskInstanceStateType]',
+                  key: TaskInstanceKeyType,
+-                 command: CommandType):
++                 task_execution_request: TaskExecutionRequest):
+         super().__init__(result_queue)
+         self.key: TaskInstanceKeyType = key
+-        self.command: CommandType = command
++        self.task_execution_request: TaskExecutionRequest = task_execution_request
+ 
+     def run(self) -> None:
+-        self.execute_work(key=self.key, command=self.command)
++        self.execute_work(key=self.key, task_execution_request=self.task_execution_request)
+ 
+ 
+ class QueuedLocalWorker(LocalWorkerBase):
+@@ -130,12 +132,12 @@ def __init__(self,
+ 
+     def run(self) -> None:
+         while True:
+-            key, command = self.task_queue.get()
++            key, task_execution_request = self.task_queue.get()
+             try:
+-                if key is None or command is None:
++                if key is None or task_execution_request is None:
+                     # Received poison pill, no more tasks to run
+                     break
+-                self.execute_work(key=key, command=command)
++                self.execute_work(key=key, task_execution_request=task_execution_request)
+             finally:
+                 self.task_queue.task_done()
+ 
+@@ -161,7 +163,7 @@ def __init__(self, parallelism: int = PARALLELISM):
+     class UnlimitedParallelism:
+         """
+         Implements LocalExecutor with unlimited parallelism, starting one process
+-        per each command to execute.
++        per each task execution request to execute.
+ 
+         :param executor: the executor instance to implement.
+         """
+@@ -176,7 +178,7 @@ def start(self) -> None:
+         # noinspection PyUnusedLocal
+         def execute_async(self,
+                           key: TaskInstanceKeyType,
+-                          command: CommandType,
++                          task_execution_request: TaskExecutionRequest,
+                           queue: Optional[str] = None,
+                           executor_config: Optional[Any] = None) -> None:  \
+                 # pylint: disable=unused-argument # pragma: no cover
+@@ -184,13 +186,15 @@ def execute_async(self,
+             Executes task asynchronously.
+ 
+             :param key: the key to identify the task instance
+-            :param command: the command to execute
++            :param task_execution_request: the task execution request to execute
+             :param queue: Name of the queue
+             :param executor_config: configuration for the executor
+             """
+             if not self.executor.result_queue:
+                 raise AirflowException(NOT_STARTED_MESSAGE)
+-            local_worker = LocalWorker(self.executor.result_queue, key=key, command=command)
++            local_worker = LocalWorker(
++                self.executor.result_queue, key=key, task_execution_request=task_execution_request
++            )
+             self.executor.workers_used += 1
+             self.executor.workers_active += 1
+             local_worker.start()
+@@ -246,7 +250,7 @@ def start(self) -> None:
+         # noinspection PyUnusedLocal
+         def execute_async(self,
+                           key: TaskInstanceKeyType,
+-                          command: CommandType,
++                          task_execution_request: TaskExecutionRequest,
+                           queue: Optional[str] = None,
+                           executor_config: Optional[Any] = None) -> None: \
+                 # pylint: disable=unused-argument # pragma: no cover
+@@ -254,13 +258,13 @@ def execute_async(self,
+             Executes task asynchronously.
+ 
+             :param key: the key to identify the task instance
+-            :param command: the command to execute
++            :param task_execution_request: the task execution request to execute
+             :param queue: name of the queue
+             :param executor_config: configuration for the executor
+-           """
++            """
+             if not self.queue:
+                 raise AirflowException(NOT_STARTED_MESSAGE)
+-            self.queue.put((key, command))
++            self.queue.put((key, task_execution_request))
+ 
+         def sync(self):
+             """
+@@ -297,14 +301,20 @@ def start(self) -> None:
+ 
+         self.impl.start()
+ 
+-    def execute_async(self, key: TaskInstanceKeyType,
+-                      command: CommandType,
++    def execute_async(self,
++                      key: TaskInstanceKeyType,
++                      task_execution_request: TaskExecutionRequest,
+                       queue: Optional[str] = None,
+                       executor_config: Optional[Any] = None) -> None:
+         """Execute asynchronously."""
+         if not self.impl:
+             raise AirflowException(NOT_STARTED_MESSAGE)
+-        self.impl.execute_async(key=key, command=command, queue=queue, executor_config=executor_config)
++        self.impl.execute_async(
++            key=key,
++            task_execution_request=task_execution_request,
++            queue=queue,
++            executor_config=executor_config
++        )
+ 
+     def sync(self) -> None:
+         """
+diff --git a/airflow/executors/sequential_executor.py b/airflow/executors/sequential_executor.py
+index a0d58b7350c7f..2e73183aad00a 100644
+--- a/airflow/executors/sequential_executor.py
++++ b/airflow/executors/sequential_executor.py
+@@ -17,9 +17,10 @@
+ # under the License.
+ """Sequential executor."""
+ import subprocess
+-from typing import Any, Optional
++from typing import Any, List, Optional, Tuple
+ 
+-from airflow.executors.base_executor import BaseExecutor, CommandType
++from airflow.executors.base_executor import BaseExecutor
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.models.taskinstance import TaskInstanceKeyType
+ from airflow.utils.state import State
+ 
+@@ -36,27 +37,27 @@ class SequentialExecutor(BaseExecutor):
+ 
+     def __init__(self):
+         super().__init__()
+-        self.commands_to_run = []
++        self.task_execution_request_to_run: List[Tuple[TaskInstanceKeyType, TaskExecutionRequest]] = []
+ 
+     def execute_async(self,
+                       key: TaskInstanceKeyType,
+-                      command: CommandType,
++                      task_execution_request: TaskExecutionRequest,
+                       queue: Optional[str] = None,
+                       executor_config: Optional[Any] = None) -> None:
+-        self.commands_to_run.append((key, command))
++        self.task_execution_request_to_run.append((key, task_execution_request))
+ 
+     def sync(self) -> None:
+-        for key, command in self.commands_to_run:
+-            self.log.info("Executing command: %s", command)
++        for key, command in self.task_execution_request_to_run:
++            self.log.info("Executing command: %s", command.as_command())
+ 
+             try:
+-                subprocess.check_call(command, close_fds=True)
++                subprocess.check_call(command.as_command(), close_fds=True)
+                 self.change_state(key, State.SUCCESS)
+             except subprocess.CalledProcessError as e:
+                 self.change_state(key, State.FAILED)
+                 self.log.error("Failed to execute task %s.", str(e))
+ 
+-        self.commands_to_run = []
++        self.task_execution_request_to_run = []
+ 
+     def end(self):
+         """End the executor."""
+diff --git a/airflow/jobs/base_job.py b/airflow/jobs/base_job.py
+index 41927930ab660..71390b85856e5 100644
+--- a/airflow/jobs/base_job.py
++++ b/airflow/jobs/base_job.py
+@@ -28,6 +28,7 @@
+ from airflow import models
+ from airflow.configuration import conf
+ from airflow.exceptions import AirflowException
++from airflow.executors.base_executor import BaseExecutor
+ from airflow.executors.executor_loader import ExecutorLoader
+ from airflow.models.base import ID_LEN, Base
+ from airflow.stats import Stats
+@@ -79,7 +80,7 @@ def __init__(
+             heartrate=None,
+             *args, **kwargs):
+         self.hostname = get_hostname()
+-        self.executor = executor or ExecutorLoader.get_default_executor()
++        self.executor: BaseExecutor = executor or ExecutorLoader.get_default_executor()
+         self.executor_class = executor.__class__.__name__
+         self.start_date = timezone.utcnow()
+         self.latest_heartbeat = timezone.utcnow()
+diff --git a/airflow/jobs/scheduler_job.py b/airflow/jobs/scheduler_job.py
+index f40d060c40357..001e51093e7ef 100644
+--- a/airflow/jobs/scheduler_job.py
++++ b/airflow/jobs/scheduler_job.py
+@@ -1304,36 +1304,16 @@ def _enqueue_task_instances_with_queued_state(self, simple_dag_bag,
+         :param simple_dag_bag: Should contains all of the task_instances' dags
+         :type simple_dag_bag: airflow.utils.dag_processing.SimpleDagBag
+         """
+-        TI = models.TaskInstance
+         # actually enqueue them
+         for simple_task_instance in simple_task_instances:
+-            simple_dag = simple_dag_bag.get_dag(simple_task_instance.dag_id)
+-            command = TI.generate_command(
+-                simple_task_instance.dag_id,
+-                simple_task_instance.task_id,
+-                simple_task_instance.execution_date,
+-                local=True,
+-                mark_success=False,
+-                ignore_all_deps=False,
+-                ignore_depends_on_past=False,
+-                ignore_task_deps=False,
+-                ignore_ti_state=False,
+-                pool=simple_task_instance.pool,
+-                file_path=simple_dag.full_filepath,
+-                pickle_id=simple_dag.pickle_id)
+-
+             priority = simple_task_instance.priority_weight
+             queue = simple_task_instance.queue
+             self.log.info(
+                 "Sending %s to executor with priority %s and queue %s",
+                 simple_task_instance.key, priority, queue
+             )
+-
+-            self.executor.queue_command(
+-                simple_task_instance,
+-                command,
+-                priority=priority,
+-                queue=queue)
++            simple_dag = simple_dag_bag.get_dag(simple_task_instance.dag_id)
++            self.executor.queue_simple_task_instance(simple_task_instance, simple_dag)
+ 
+     @provide_session
+     def _execute_task_instances(self,
+diff --git a/airflow/models/dag.py b/airflow/models/dag.py
+index 87f084c77f042..d906e9c3edb13 100644
+--- a/airflow/models/dag.py
++++ b/airflow/models/dag.py
+@@ -558,6 +558,16 @@ def tasks(self, val):
+     def task_ids(self):
+         return list(self.task_dict.keys())
+ 
++    @property
++    def portable_path(self) -> str:
++        """
++        Return path that can be used on another node.
++        """
++        if self.full_filepath != self.filepath:
++            return "DAGS_FOLDER/{}".format(self.filepath)
++        else:
++            return self.full_filepath
++
+     @property
+     def filepath(self):
+         """
+diff --git a/airflow/models/queue_task_run.py b/airflow/models/queue_task_run.py
+new file mode 100644
+index 0000000000000..9020f8d3e2b64
+--- /dev/null
++++ b/airflow/models/queue_task_run.py
+@@ -0,0 +1,127 @@
++
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++from airflow.utils import timezone
++
++
++class TaskExecutionRequest:  # pylint: disable=too-many-instance-attributes
++    """
++    Information about the task to be executor by the Executor.
++
++    :param dag_id: DAG ID
++    :type dag_id: unicode
++    :param task_id: Task ID
++    :type task_id: unicode
++    :param execution_date: Execution date for the task
++    :type execution_date: datetime.datetime
++    :param mark_success: Whether to mark the task as successful
++    :type mark_success: bool
++    :param ignore_all_dependencies: Ignore all ignorable dependencies.
++        Overrides the other ignore_* parameters.
++    :type ignore_all_dependencies: bool
++    :param ignore_depends_on_past: Ignore depends_on_past parameter of DAGs
++        (e.g. for Backfills)
++    :type ignore_depends_on_past: bool
++    :param ignore_dependencies: Ignore task-specific dependencies such as depends_on_past
++        and trigger rule
++    :type ignore_dependencies: bool
++    :param force: Ignore the task instance's previous failure/success
++    :type force: bool
++    :param local: Whether to run the task locally
++    :type local: bool
++    :param pickle_id: If the DAG was serialized to the DB, the ID
++        associated with the pickled DAG
++    :type pickle_id: unicode
++    :param subdir: path to the file containing the DAG definition
++    :param raw: raw mode (needs more details)
++    :param job_id: job ID (needs more details)
++    :param pool: the Airflow pool that the task should run in
++    :type pool: unicode
++    :param cfg_path: the Path to the configuration file
++    :type cfg_path: str
++    :return: shell command that can be used to run the task instance
++    """
++    def __init__(  # pylint: disable=too-many-arguments
++        self,
++        dag_id,
++        task_id,
++        execution_date,
++        mark_success=None,
++        pickle_id=None,
++        job_id=None,
++        ignore_all_dependencies=None,
++        ignore_dependencies=None,
++        ignore_depends_on_past=None,
++        force=None,
++        local=None,
++        pool=None,
++        raw=None,
++        subdir=None,
++        cfg_path=None,
++        mock_command=None,
++    ):
++        self.dag_id = dag_id
++        self.task_id = task_id
++        if isinstance(execution_date, str):
++            self.execution_date = timezone.parse(execution_date)
++        else:
++            self.execution_date = execution_date
++        self.mark_success = mark_success
++        self.pickle_id = pickle_id
++        self.job_id = job_id
++        self.ignore_all_dependencies = ignore_all_dependencies
++        self.ignore_dependencies = ignore_dependencies
++        self.ignore_depends_on_past = ignore_depends_on_past
++        self.force = force
++        self.local = local
++        self.pool = pool
++        self.raw = raw
++        self.subdir = subdir
++        self.cfg_path = cfg_path
++        self.mock_command = mock_command
++
++    def as_command(self):
++        """Generate CLI command"""
++        if self.mock_command:
++            return self.mock_command
++        iso = self.execution_date.isoformat()
++        cmd = ["airflow", "tasks", "run", str(self.dag_id), str(self.task_id), str(iso), "--local"]
++        if self.mark_success:
++            cmd.extend(["--mark_success"])
++        if self.pickle_id:
++            cmd.extend(["--pickle", str(self.pickle_id)])
++        if self.job_id:
++            cmd.extend(["--job_id", str(self.job_id)])
++        if self.ignore_all_dependencies:
++            cmd.extend(["--ignore_all_dependencies"])
++        if self.ignore_dependencies:
++            cmd.extend(["--ignore_dependencies"])
++        if self.ignore_depends_on_past:
++            cmd.extend(["--ignore_depends_on_past"])
++        if self.force:
++            cmd.extend(["--force"])
++        if self.pool:
++            cmd.extend(["--pool", self.pool])
++        if self.subdir:
++            cmd.extend(["--subdir", self.subdir])
++        if self.cfg_path:
++            cmd.extend(["--cfg_path", self.cfg_path])
++        return cmd
++
++    def __repr__(self):
++        iso = self.execution_date.isoformat()
++        return f"TaskExecutionRequest(dag_id={self.dag_id}, task_id={self.task_id}, execution_date={iso})"
+diff --git a/airflow/models/taskinstance.py b/airflow/models/taskinstance.py
+index d45b5179b96e7..1acf386016ed5 100644
+--- a/airflow/models/taskinstance.py
++++ b/airflow/models/taskinstance.py
+@@ -252,120 +252,6 @@ def prev_attempted_tries(self):
+     def next_try_number(self):
+         return self._try_number + 1
+ 
+-    def command_as_list(
+-            self,
+-            mark_success=False,
+-            ignore_all_deps=False,
+-            ignore_task_deps=False,
+-            ignore_depends_on_past=False,
+-            ignore_ti_state=False,
+-            local=False,
+-            pickle_id=None,
+-            raw=False,
+-            job_id=None,
+-            pool=None,
+-            cfg_path=None):
+-        """
+-        Returns a command that can be executed anywhere where airflow is
+-        installed. This command is part of the message sent to executors by
+-        the orchestrator.
+-        """
+-        dag = self.task.dag
+-
+-        should_pass_filepath = not pickle_id and dag
+-        if should_pass_filepath and dag.full_filepath != dag.filepath:
+-            path = "DAGS_FOLDER/{}".format(dag.filepath)
+-        elif should_pass_filepath and dag.full_filepath:
+-            path = dag.full_filepath
+-        else:
+-            path = None
+-
+-        return TaskInstance.generate_command(
+-            self.dag_id,
+-            self.task_id,
+-            self.execution_date,
+-            mark_success=mark_success,
+-            ignore_all_deps=ignore_all_deps,
+-            ignore_task_deps=ignore_task_deps,
+-            ignore_depends_on_past=ignore_depends_on_past,
+-            ignore_ti_state=ignore_ti_state,
+-            local=local,
+-            pickle_id=pickle_id,
+-            file_path=path,
+-            raw=raw,
+-            job_id=job_id,
+-            pool=pool,
+-            cfg_path=cfg_path)
+-
+-    @staticmethod
+-    def generate_command(dag_id,
+-                         task_id,
+-                         execution_date,
+-                         mark_success=False,
+-                         ignore_all_deps=False,
+-                         ignore_depends_on_past=False,
+-                         ignore_task_deps=False,
+-                         ignore_ti_state=False,
+-                         local=False,
+-                         pickle_id=None,
+-                         file_path=None,
+-                         raw=False,
+-                         job_id=None,
+-                         pool=None,
+-                         cfg_path=None
+-                         ):
+-        """
+-        Generates the shell command required to execute this task instance.
+-
+-        :param dag_id: DAG ID
+-        :type dag_id: unicode
+-        :param task_id: Task ID
+-        :type task_id: unicode
+-        :param execution_date: Execution date for the task
+-        :type execution_date: datetime.datetime
+-        :param mark_success: Whether to mark the task as successful
+-        :type mark_success: bool
+-        :param ignore_all_deps: Ignore all ignorable dependencies.
+-            Overrides the other ignore_* parameters.
+-        :type ignore_all_deps: bool
+-        :param ignore_depends_on_past: Ignore depends_on_past parameter of DAGs
+-            (e.g. for Backfills)
+-        :type ignore_depends_on_past: bool
+-        :param ignore_task_deps: Ignore task-specific dependencies such as depends_on_past
+-            and trigger rule
+-        :type ignore_task_deps: bool
+-        :param ignore_ti_state: Ignore the task instance's previous failure/success
+-        :type ignore_ti_state: bool
+-        :param local: Whether to run the task locally
+-        :type local: bool
+-        :param pickle_id: If the DAG was serialized to the DB, the ID
+-            associated with the pickled DAG
+-        :type pickle_id: unicode
+-        :param file_path: path to the file containing the DAG definition
+-        :param raw: raw mode (needs more details)
+-        :param job_id: job ID (needs more details)
+-        :param pool: the Airflow pool that the task should run in
+-        :type pool: unicode
+-        :param cfg_path: the Path to the configuration file
+-        :type cfg_path: str
+-        :return: shell command that can be used to run the task instance
+-        """
+-        iso = execution_date.isoformat()
+-        cmd = ["airflow", "tasks", "run", str(dag_id), str(task_id), str(iso)]
+-        cmd.extend(["--mark_success"]) if mark_success else None
+-        cmd.extend(["--pickle", str(pickle_id)]) if pickle_id else None
+-        cmd.extend(["--job_id", str(job_id)]) if job_id else None
+-        cmd.extend(["-A"]) if ignore_all_deps else None
+-        cmd.extend(["-i"]) if ignore_task_deps else None
+-        cmd.extend(["-I"]) if ignore_depends_on_past else None
+-        cmd.extend(["--force"]) if ignore_ti_state else None
+-        cmd.extend(["--local"]) if local else None
+-        cmd.extend(["--pool", pool]) if pool else None
+-        cmd.extend(["--raw"]) if raw else None
+-        cmd.extend(["-sd", file_path]) if file_path else None
+-        cmd.extend(["--cfg_path", cfg_path]) if cfg_path else None
+-        return cmd
+-
+     @property
+     def log_filepath(self):
+         iso = self.execution_date.isoformat()
+@@ -1575,9 +1461,7 @@ def __init__(self, ti: TaskInstance):
+         self._pool: Optional[str] = None
+         if hasattr(ti, 'pool'):
+             self._pool = ti.pool
+-        self._priority_weight: Optional[int] = None
+-        if hasattr(ti, 'priority_weight'):
+-            self._priority_weight = ti.priority_weight
++        self._priority_weight = ti.priority_weight
+         self._queue: str = ti.queue
+         self._key = ti.key
+ 
+@@ -1615,7 +1499,7 @@ def pool(self) -> Any:
+         return self._pool
+ 
+     @property
+-    def priority_weight(self) -> Optional[int]:
++    def priority_weight(self) -> int:
+         return self._priority_weight
+ 
+     @property
+diff --git a/airflow/task/task_runner/base_task_runner.py b/airflow/task/task_runner/base_task_runner.py
+index 4f1afa1dee084..03b3392ad5390 100644
+--- a/airflow/task/task_runner/base_task_runner.py
++++ b/airflow/task/task_runner/base_task_runner.py
+@@ -85,16 +85,31 @@ def __init__(self, local_task_job):
+             cfg_path = tmp_configuration_copy(chmod=0o600)
+ 
+         self._cfg_path = cfg_path
+-        self._command = popen_prepend + self._task_instance.command_as_list(
+-            raw=True,
+-            pickle_id=local_task_job.pickle_id,
+-            mark_success=local_task_job.mark_success,
+-            job_id=local_task_job.id,
+-            pool=local_task_job.pool,
+-            cfg_path=cfg_path,
+-        )
++        self._command = popen_prepend + self.prepare_command(cfg_path, local_task_job)
+         self.process = None
+ 
++    def prepare_command(self, cfg_path, local_task_job):
++        ti = local_task_job.task_instance
++        should_pass_filepath = not local_task_job.pickle_id
++
++        subdir = ti.task.dag.portable_path if should_pass_filepath else None
++
++        iso = ti.execution_date.isoformat()
++        cmd = ["airflow", "tasks", "run", str(ti.dag_id), str(ti.task_id), str(iso), "--raw"]
++        if local_task_job.mark_success:
++            cmd.extend(["--mark_success"])
++        if local_task_job.pickle_id:
++            cmd.extend(["--pickle", str(local_task_job.pickle_id)])
++        if local_task_job.id:
++            cmd.extend(["--job_id", str(local_task_job.id)])
++        if local_task_job.pool:
++            cmd.extend(["--pool", local_task_job.pool])
++        if subdir:
++            cmd.extend(["--subdir", subdir])
++        if cfg_path:
++            cmd.extend(["--cfg_path", cfg_path])
++        return cmd
++
+     def _read_task_logs(self, stream):
+         while True:
+             line = stream.readline()
+diff --git a/tests/executors/test_celery_executor.py b/tests/executors/test_celery_executor.py
+index ae786d0ec693d..e4dd32062ab00 100644
+--- a/tests/executors/test_celery_executor.py
++++ b/tests/executors/test_celery_executor.py
+@@ -36,6 +36,7 @@
+ from airflow.configuration import conf
+ from airflow.executors import celery_executor
+ from airflow.models import TaskInstance
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.models.taskinstance import SimpleTaskInstance
+ from airflow.operators.bash import BashOperator
+ from airflow.utils.state import State
+@@ -55,14 +56,16 @@ class TestCeleryExecutor(unittest.TestCase):
+     @contextlib.contextmanager
+     def _prepare_app(self, broker_url=None, execute=None):
+         broker_url = broker_url or conf.get('celery', 'BROKER_URL')
+-        execute = execute or celery_executor.execute_command.__wrapped__
++        execute = execute or celery_executor.execute_task_execution_request.__wrapped__
+ 
+         test_config = dict(celery_executor.celery_configuration)
+         test_config.update({'broker_url': broker_url})
+         test_app = Celery(broker_url, config_source=test_config)
+         test_execute = test_app.task(execute)
+         patch_app = mock.patch('airflow.executors.celery_executor.app', test_app)
+-        patch_execute = mock.patch('airflow.executors.celery_executor.execute_command', test_execute)
++        patch_execute = mock.patch(
++            'airflow.executors.celery_executor.execute_task_execution_request', test_execute
++        )
+ 
+         with patch_app, patch_execute:
+             try:
+@@ -81,18 +84,36 @@ def test_celery_integration(self, broker_url):
+             executor.start()
+ 
+             with start_worker(app=app, logfile=sys.stdout, loglevel='info'):
+-                success_command = ['true', 'some_parameter']
+-                fail_command = ['false', 'some_parameter']
++                success_task_execution_request = TaskExecutionRequest(
++                    dag_id="test_executor_dag",
++                    task_id="success",
++                    execution_date=None,
++                    local=True,
++                    mock_command=["bash", "-c", "exit 0"],
++                )
++                fail_task_execution_request = TaskExecutionRequest(
++                    dag_id="test_executor_dag",
++                    task_id="fail",
++                    execution_date=None,
++                    local=True,
++                    mock_command=["bash", "-c", "exit 1"],
++                )
+                 execute_date = datetime.datetime.now()
+ 
+-                cached_celery_backend = celery_executor.execute_command.backend
++                cached_celery_backend = celery_executor.execute_task_execution_request.backend
+                 task_tuples_to_send = [
+-                    (('success', 'fake_simple_ti', execute_date, 0),
+-                     None, success_command, celery_executor.celery_configuration['task_default_queue'],
+-                     celery_executor.execute_command),
+-                    (('fail', 'fake_simple_ti', execute_date, 0),
+-                     None, fail_command, celery_executor.celery_configuration['task_default_queue'],
+-                     celery_executor.execute_command)
++                    (
++                        ('success', 'fake_simple_ti', execute_date, 0),
++                        None, success_task_execution_request,
++                        celery_executor.celery_configuration['task_default_queue'],
++                        celery_executor.execute_task_execution_request
++                    ),
++                    (
++                        ('fail', 'fake_simple_ti', execute_date, 0),
++                        None, fail_task_execution_request,
++                        celery_executor.celery_configuration['task_default_queue'],
++                        celery_executor.execute_task_execution_request
++                    )
+                 ]
+ 
+                 chunksize = executor._num_tasks_per_send_process(len(task_tuples_to_send))
+@@ -146,8 +167,9 @@ def fake_execute_command():
+                 dag=DAG(dag_id='id'),
+                 start_date=datetime.datetime.now()
+             )
+-            value_tuple = 'command', 1, None, \
+-                SimpleTaskInstance(ti=TaskInstance(task=task, execution_date=datetime.datetime.now()))
++            qtr = TaskExecutionRequest(None, None, None, mock_command=["command"])
++            sti = SimpleTaskInstance(ti=TaskInstance(task=task, execution_date=datetime.datetime.now()))
++            value_tuple = qtr, 1, None, sti
+             key = ('fail', 'fake_simple_ti', datetime.datetime.now(), 0)
+             executor.queued_tasks[key] = value_tuple
+             executor.heartbeat()
+diff --git a/tests/executors/test_dask_executor.py b/tests/executors/test_dask_executor.py
+index 01ea30c56946f..1a96ea4f6ea2e 100644
+--- a/tests/executors/test_dask_executor.py
++++ b/tests/executors/test_dask_executor.py
+@@ -25,6 +25,7 @@
+ from airflow.configuration import conf
+ from airflow.jobs import BackfillJob
+ from airflow.models import DagBag
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.utils import timezone
+ 
+ try:
+@@ -51,11 +52,15 @@ def assert_tasks_on_executor(self, executor):
+         # start the executor
+         executor.start()
+ 
+-        success_command = ['true', 'some_parameter']
+-        fail_command = ['false', 'some_parameter']
++        success_task_execution_request = TaskExecutionRequest(
++            None, None, None, mock_command=["true", "some_parameter"]
++        )
++        fail_task_execution_request = TaskExecutionRequest(
++            None, None, None, mock_command=["false", "some_parameter"]
++        )
+ 
+-        executor.execute_async(key='success', command=success_command)
+-        executor.execute_async(key='fail', command=fail_command)
++        executor.execute_async(key='success', task_execution_request=success_task_execution_request)
++        executor.execute_async(key='fail', task_execution_request=fail_task_execution_request)
+ 
+         success_future = next(
+             k for k, v in executor.futures.items() if v == 'success')
+diff --git a/tests/executors/test_debug_executor.py b/tests/executors/test_debug_executor.py
+index 1c37766f47d4d..bdbcfb4968034 100644
+--- a/tests/executors/test_debug_executor.py
++++ b/tests/executors/test_debug_executor.py
+@@ -19,6 +19,7 @@
+ from unittest.mock import MagicMock
+ 
+ from airflow.executors.debug_executor import DebugExecutor
++from airflow.models import TaskInstance
+ from airflow.utils.state import State
+ 
+ 
+@@ -30,12 +31,15 @@ def test_sync(self, run_task_mock):
+         executor = DebugExecutor()
+ 
+         ti1 = MagicMock(key="t1")
++        qtr1 = mock.MagicMock()
+         ti2 = MagicMock(key="t2")
+-        executor.tasks_to_run = [ti1, ti2]
++        qtr2 = mock.MagicMock()
++        executor.tasks_to_run = [(ti1, qtr1), (ti2, qtr2)]
+ 
+         executor.sync()
+         assert not executor.tasks_to_run
+-        run_task_mock.assert_has_calls([mock.call(ti1), mock.call(ti2)])
++        print(run_task_mock.call_args_list)
++        run_task_mock.assert_has_calls([mock.call(ti1, qtr1), mock.call(ti2, qtr2)])
+ 
+     @mock.patch("airflow.executors.debug_executor.TaskInstance")
+     def test_run_task(self, task_instance_mock):
+@@ -43,13 +47,16 @@ def test_run_task(self, task_instance_mock):
+         job_id = " job_id"
+         task_instance_mock.key = ti_key
+         task_instance_mock.job_id = job_id
++        qtr = mock.MagicMock()
+ 
+         executor = DebugExecutor()
+         executor.running = set([ti_key])
+-        succeeded = executor._run_task(task_instance_mock)
++        succeeded = executor._run_task(task_instance_mock, qtr)
+ 
+         assert succeeded
+-        task_instance_mock._run_raw_task.assert_called_once_with(job_id=job_id)
++        task_instance_mock._run_raw_task.assert_called_once_with(
++            job_id=job_id, mark_success=qtr.mark_success, pool=qtr.pool
++        )
+ 
+     def test_queue_task_instance(self):
+         key = "ti_key"
+@@ -59,11 +66,6 @@ def test_queue_task_instance(self):
+         executor.queue_task_instance(task_instance=ti, mark_success=True, pool="pool")
+ 
+         assert key in executor.queued_tasks
+-        assert key in executor.tasks_params
+-        assert executor.tasks_params[key] == {
+-            "mark_success": True,
+-            "pool": "pool",
+-        }
+ 
+     def test_trigger_tasks(self):
+         execute_async_mock = MagicMock()
+@@ -71,8 +73,8 @@ def test_trigger_tasks(self):
+         executor.execute_async = execute_async_mock
+ 
+         executor.queued_tasks = {
+-            "t1": (None, 1, None, MagicMock(key="t1")),
+-            "t2": (None, 2, None, MagicMock(key="t2")),
++            "t1": (None, 1, None, MagicMock(key="t1", spec=TaskInstance)),
++            "t2": (None, 2, None, MagicMock(key="t2", spec=TaskInstance)),
+         }
+ 
+         executor.trigger_tasks(open_slots=4)
+@@ -85,8 +87,8 @@ def test_end(self):
+         ti = MagicMock(key="ti_key")
+ 
+         executor = DebugExecutor()
+-        executor.tasks_to_run = [ti]
+-        executor.running = set([ti.key])
++        executor.tasks_to_run = [(ti, mock.MagicMock)]
++        executor.running = {ti.key}
+         executor.end()
+ 
+         ti.set_state.assert_called_once_with(State.UPSTREAM_FAILED)
+@@ -98,11 +100,13 @@ def test_fail_fast(self, change_state_mock):
+             executor = DebugExecutor()
+ 
+         ti1 = MagicMock(key="t1")
++        qtr1 = mock.MagicMock()
+         ti2 = MagicMock(key="t2")
++        qtr2 = mock.MagicMock()
+ 
+         ti1._run_raw_task.side_effect = Exception
+ 
+-        executor.tasks_to_run = [ti1, ti2]
++        executor.tasks_to_run = [(ti1, qtr1), (ti2, qtr2)]
+ 
+         executor.sync()
+ 
+diff --git a/tests/executors/test_kubernetes_executor.py b/tests/executors/test_kubernetes_executor.py
+index e9adbbb5710b4..fb50a83ef9a67 100644
+--- a/tests/executors/test_kubernetes_executor.py
++++ b/tests/executors/test_kubernetes_executor.py
+@@ -25,6 +25,7 @@
+ import mock
+ from urllib3 import HTTPResponse
+ 
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from tests.test_utils.config import conf_vars
+ 
+ try:
+@@ -201,10 +202,15 @@ def test_run_next_exception(self, mock_get_kube_client, mock_kubernetes_job_watc
+ 
+         # Execute a task while the Api Throws errors
+         try_number = 1
+-        kubernetes_executor.execute_async(key=('dag', 'task', datetime.utcnow(), try_number),
+-                                          queue=None,
+-                                          command='command',
+-                                          executor_config={})
++        task_execution_request = TaskExecutionRequest(
++            dag_id=None, task_id=None, execution_date=None, mock_command="true"
++        )
++        kubernetes_executor.execute_async(
++            key=('dag', 'task', datetime.utcnow(), try_number),
++            queue=None,
++            task_execution_request=task_execution_request,
++            executor_config={}
++        )
+         kubernetes_executor.sync()
+         kubernetes_executor.sync()
+ 
+diff --git a/tests/executors/test_local_executor.py b/tests/executors/test_local_executor.py
+index 47d20f012789d..3756877d09968 100644
+--- a/tests/executors/test_local_executor.py
++++ b/tests/executors/test_local_executor.py
+@@ -20,44 +20,47 @@
+ from unittest import mock
+ 
+ from airflow.executors.local_executor import LocalExecutor
++from airflow.models.queue_task_run import TaskExecutionRequest
+ from airflow.utils.state import State
+ 
+ 
+ class TestLocalExecutor(unittest.TestCase):
+ 
+-    TEST_SUCCESS_COMMANDS = 5
++    TEST_SUCCESS_TASK_EXECUTION_REQUESTS = 5
+ 
+     def execution_parallelism(self, parallelism=0):
+         executor = LocalExecutor(parallelism=parallelism)
+         executor.start()
+ 
+         success_key = 'success {}'
+-        success_command = ['true', 'some_parameter']
+-        fail_command = ['false', 'some_parameter']
++        success_task_execution_request = TaskExecutionRequest(
++            None, None, None, mock_command=['true', 'some_parameter'])
++        fail_task_execution_request = TaskExecutionRequest(
++            None, None, None, mock_command=['false', 'some_parameter'])
+         self.assertTrue(executor.result_queue.empty())
+ 
+         execution_date = datetime.datetime.now()
+-        for i in range(self.TEST_SUCCESS_COMMANDS):
+-            key_id, command = success_key.format(i), success_command
++        for i in range(self.TEST_SUCCESS_TASK_EXECUTION_REQUESTS):
++            key_id = success_key.format(i)
+             key = key_id, 'fake_ti', execution_date, 0
+             executor.running.add(key)
+-            executor.execute_async(key=key, command=command)
++            executor.execute_async(key=key, task_execution_request=success_task_execution_request)
+ 
+         fail_key = 'fail', 'fake_ti', execution_date, 0
+         executor.running.add(fail_key)
+-        executor.execute_async(key=fail_key, command=fail_command)
++        executor.execute_async(key=fail_key, task_execution_request=fail_task_execution_request)
+ 
+         executor.end()
+         # By that time Queues are already shutdown so we cannot check if they are empty
+         self.assertEqual(len(executor.running), 0)
+ 
+-        for i in range(self.TEST_SUCCESS_COMMANDS):
++        for i in range(self.TEST_SUCCESS_TASK_EXECUTION_REQUESTS):
+             key_id = success_key.format(i)
+             key = key_id, 'fake_ti', execution_date, 0
+             self.assertEqual(executor.event_buffer[key], State.SUCCESS)
+         self.assertEqual(executor.event_buffer[fail_key], State.FAILED)
+ 
+-        expected = self.TEST_SUCCESS_COMMANDS + 1 if parallelism == 0 else parallelism
++        expected = self.TEST_SUCCESS_TASK_EXECUTION_REQUESTS + 1 if parallelism == 0 else parallelism
+         self.assertEqual(executor.workers_used, expected)
+ 
+     def test_execution_unlimited_parallelism(self):
+diff --git a/tests/jobs/test_scheduler_job.py b/tests/jobs/test_scheduler_job.py
+index 5f86e3372639c..6996021c078cb 100644
+--- a/tests/jobs/test_scheduler_job.py
++++ b/tests/jobs/test_scheduler_job.py
+@@ -1700,10 +1700,10 @@ def test_enqueue_task_instances_with_queued_state(self):
+         session.merge(ti1)
+         session.commit()
+ 
+-        with patch.object(BaseExecutor, 'queue_command') as mock_queue_command:
++        with patch.object(BaseExecutor, '_queue_task_execution_request') as mock_task_execution_request:
+             scheduler._enqueue_task_instances_with_queued_state(dagbag, [ti1])
+ 
+-        assert mock_queue_command.called
++        assert mock_task_execution_request.called
+ 
+     def test_execute_task_instances_nothing(self):
+         dag_id = 'SchedulerJobTest.test_execute_task_instances_nothing'
+diff --git a/tests/task/task_runner/test_standard_task_runner.py b/tests/task/task_runner/test_standard_task_runner.py
+index 05861face319b..bb60eeff039d9 100644
+--- a/tests/task/task_runner/test_standard_task_runner.py
++++ b/tests/task/task_runner/test_standard_task_runner.py
+@@ -74,21 +74,24 @@ def test_start_and_terminate(self):
+         local_task_job = mock.Mock()
+         local_task_job.task_instance = mock.MagicMock()
+         local_task_job.task_instance.run_as_user = None
+-        local_task_job.task_instance.command_as_list.return_value = [
+-            'airflow', 'tasks', 'test', 'test_on_kill', 'task1', '2016-01-01'
+-        ]
+ 
+-        runner = StandardTaskRunner(local_task_job)
+-        runner.start()
+-        time.sleep(0.5)
++        with mock.patch(
++            "airflow.task.task_runner.base_task_runner.BaseTaskRunner.prepare_command",
++            return_value=[
++                'airflow', 'tasks', 'test', 'test_on_kill', 'task1', '2016-01-01'
++            ]
++        ):
++            runner = StandardTaskRunner(local_task_job)
++            runner.start()
++            time.sleep(0.5)
+ 
+-        pgid = os.getpgid(runner.process.pid)
+-        self.assertGreater(pgid, 0)
+-        self.assertNotEqual(pgid, os.getpgid(0), "Task should be in a different process group to us")
++            pgid = os.getpgid(runner.process.pid)
++            self.assertGreater(pgid, 0)
++            self.assertNotEqual(pgid, os.getpgid(0), "Task should be in a different process group to us")
+ 
+-        processes = list(self._procs_in_pgroup(pgid))
++            processes = list(self._procs_in_pgroup(pgid))
+ 
+-        runner.terminate()
++            runner.terminate()
+ 
+         for process in processes:
+             self.assertFalse(psutil.pid_exists(process.pid), "{} is still alive".format(process))
+@@ -99,22 +102,25 @@ def test_start_and_terminate_run_as_user(self):
+         local_task_job = mock.Mock()
+         local_task_job.task_instance = mock.MagicMock()
+         local_task_job.task_instance.run_as_user = getpass.getuser()
+-        local_task_job.task_instance.command_as_list.return_value = [
+-            'airflow', 'tasks', 'test', 'test_on_kill', 'task1', '2016-01-01'
+-        ]
+ 
+-        runner = StandardTaskRunner(local_task_job)
++        with mock.patch(
++            "airflow.task.task_runner.base_task_runner.BaseTaskRunner.prepare_command",
++            return_value=[
++                'airflow', 'tasks', 'test', 'test_on_kill', 'task1', '2016-01-01'
++            ]
++        ):
++            runner = StandardTaskRunner(local_task_job)
+ 
+-        runner.start()
+-        time.sleep(0.5)
++            runner.start()
++            time.sleep(0.5)
+ 
+-        pgid = os.getpgid(runner.process.pid)
+-        self.assertGreater(pgid, 0)
+-        self.assertNotEqual(pgid, os.getpgid(0), "Task should be in a different process group to us")
++            pgid = os.getpgid(runner.process.pid)
++            self.assertGreater(pgid, 0)
++            self.assertNotEqual(pgid, os.getpgid(0), "Task should be in a different process group to us")
+ 
+-        processes = list(self._procs_in_pgroup(pgid))
++            processes = list(self._procs_in_pgroup(pgid))
+ 
+-        runner.terminate()
++            runner.terminate()
+ 
+         for process in processes:
+             self.assertFalse(psutil.pid_exists(process.pid), "{} is still alive".format(process))

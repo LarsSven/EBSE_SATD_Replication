@@ -1,0 +1,382 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index c46c97f95aa0..729227a5b6b6 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -12,7 +12,7 @@ jobs:
+       fail-fast: false
+       matrix:
+         platform: [ubuntu-18.04]
+-        os_name: [linux_openresty, linux_tengine, linux_apisix_master_luarocks, linux_apisix_current_luarocks, linux_openresty_mtls]
++        os_name: [linux_openresty, linux_tengine, linux_apisix_master_luarocks, linux_apisix_current_luarocks, linux_openresty_mtls, linux_apisix_integrationtest]
+         include:
+           - platform: macos-latest
+             os_name: osx_openresty
+diff --git a/.travis/linux_apisix_integrationtest_runner.sh b/.travis/linux_apisix_integrationtest_runner.sh
+new file mode 100755
+index 000000000000..83f5a2d51847
+--- /dev/null
++++ b/.travis/linux_apisix_integrationtest_runner.sh
+@@ -0,0 +1,167 @@
++#!/usr/bin/env bash
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++set -ex
++
++export_or_prefix() {
++    export OPENRESTY_PREFIX="/usr/local/openresty-debug"
++}
++
++create_lua_deps() {
++    echo "Create lua deps cache"
++
++    make deps
++    luarocks install luacov-coveralls --tree=deps --local > build.log 2>&1 || (cat build.log && exit 1)
++
++    sudo rm -rf build-cache/deps
++    sudo cp -r deps build-cache/
++    sudo cp rockspec/apisix-master-0.rockspec build-cache/
++}
++
++before_install() {
++    sudo cpanm --notest Test::Nginx >build.log 2>&1 || (cat build.log && exit 1)
++    docker pull redis:3.0-alpine
++    docker run --rm -itd -p 6379:6379 --name apisix_redis redis:3.0-alpine
++    docker run --rm -itd -e HTTP_PORT=8888 -e HTTPS_PORT=9999 -p 8888:8888 -p 9999:9999 mendhak/http-https-echo
++    # Runs Keycloak version 10.0.2 with inbuilt policies for unit tests
++    docker run --rm -itd -e KEYCLOAK_USER=admin -e KEYCLOAK_PASSWORD=123456 -p 8090:8080 -p 8443:8443 sshniro/keycloak-apisix
++    # spin up kafka cluster for tests (1 zookeper and 1 kafka instance)
++    docker pull bitnami/zookeeper:3.6.0
++    docker pull bitnami/kafka:latest
++    docker network create kafka-net --driver bridge
++    docker run --name zookeeper-server -d -p 2181:2181 --network kafka-net -e ALLOW_ANONYMOUS_LOGIN=yes bitnami/zookeeper:3.6.0
++    docker run --name kafka-server1 -d --network kafka-net -e ALLOW_PLAINTEXT_LISTENER=yes -e KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper-server:2181 -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092 -p 9092:9092 -e KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true bitnami/kafka:latest
++    docker pull bitinit/eureka
++    docker run --name eureka -d -p 8761:8761 --env ENVIRONMENT=apisix --env spring.application.name=apisix-eureka --env server.port=8761 --env eureka.instance.ip-address=127.0.0.1 --env eureka.client.registerWithEureka=true --env eureka.client.fetchRegistry=false --env eureka.client.serviceUrl.defaultZone=http://127.0.0.1:8761/eureka/ bitinit/eureka
++    sleep 5
++    docker exec -i kafka-server1 /opt/bitnami/kafka/bin/kafka-topics.sh --create --zookeeper zookeeper-server:2181 --replication-factor 1 --partitions 1 --topic test2
++}
++
++do_install() {
++    export_or_prefix
++
++    wget -qO - https://openresty.org/package/pubkey.gpg | sudo apt-key add -
++    sudo apt-get -y update --fix-missing
++    sudo apt-get -y install software-properties-common
++    sudo add-apt-repository -y "deb http://openresty.org/package/ubuntu $(lsb_release -sc) main"
++
++    sudo apt-get update
++    sudo apt-get install openresty-debug lua5.1 liblua5.1-0-dev
++
++    wget https://github.com/luarocks/luarocks/archive/v2.4.4.tar.gz
++    tar -xf v2.4.4.tar.gz
++    cd luarocks-2.4.4
++    ./configure --prefix=/usr > build.log 2>&1 || (cat build.log && exit 1)
++    make build > build.log 2>&1 || (cat build.log && exit 1)
++    sudo make install > build.log 2>&1 || (cat build.log && exit 1)
++    cd ..
++    rm -rf luarocks-2.4.4
++
++    sudo luarocks install luacheck > build.log 2>&1 || (cat build.log && exit 1)
++
++    ./utils/install-etcd.sh
++
++    if [ ! -f "build-cache/apisix-master-0.rockspec" ]; then
++        create_lua_deps
++
++    else
++        src=`md5sum rockspec/apisix-master-0.rockspec | awk '{print $1}'`
++        src_cp=`md5sum build-cache/apisix-master-0.rockspec | awk '{print $1}'`
++        if [ "$src" = "$src_cp" ]; then
++            echo "Use lua deps cache"
++            sudo cp -r build-cache/deps ./
++        else
++            create_lua_deps
++        fi
++    fi
++
++    # sudo apt-get install tree -y
++    # tree deps
++
++    git clone https://github.com/iresty/test-nginx.git test-nginx
++    make utils
++
++    git clone https://github.com/apache/openwhisk-utilities.git .travis/openwhisk-utilities
++    cp .travis/ASF* .travis/openwhisk-utilities/scancode/
++
++    ls -l ./
++    if [ ! -f "build-cache/grpc_server_example" ]; then
++        wget https://github.com/iresty/grpc_server_example/releases/download/20200901/grpc_server_example-amd64.tar.gz
++        tar -xvf grpc_server_example-amd64.tar.gz
++        mv grpc_server_example build-cache/
++    fi
++
++    if [ ! -f "build-cache/proto/helloworld.proto" ]; then
++        if [ ! -f "grpc_server_example/main.go" ]; then
++            git clone https://github.com/iresty/grpc_server_example.git grpc_server_example
++        fi
++
++        cd grpc_server_example/
++        mv proto/ ../build-cache/
++        cd ..
++    fi
++
++    if [ ! -f "build-cache/grpcurl" ]; then
++        wget https://github.com/api7/grpcurl/releases/download/20200314/grpcurl-amd64.tar.gz
++        tar -xvf grpcurl-amd64.tar.gz
++        mv grpcurl build-cache/
++    fi
++}
++
++script() {
++    export_or_prefix
++    export PATH=$OPENRESTY_PREFIX/nginx/sbin:$OPENRESTY_PREFIX/luajit/bin:$OPENRESTY_PREFIX/bin:$PATH
++    openresty -V
++    sudo service etcd stop
++    mkdir -p ~/etcd-data
++    etcd --listen-client-urls 'http://0.0.0.0:2379' --advertise-client-urls='http://0.0.0.0:2379' --data-dir ~/etcd-data > /dev/null 2>&1 &
++    etcdctl version
++    sleep 5
++
++    ./bin/apisix start
++
++    #start again  --> fial
++    res=`./bin/apisix start`
++    if [ "$res" != "APISIX is running..." ]; then
++        echo "failed: APISIX runs repeatedly"
++        exit 1
++    fi
++
++    cd t/integrationtest/
++    sudo python runtest.py
++    pytest --force-flaky --max-runs=3 --no-flaky-report -v -s "cases"
++
++}
++
++
++case_opt=$1
++shift
++
++case ${case_opt} in
++before_install)
++    before_install "$@"
++    ;;
++do_install)
++    do_install "$@"
++    ;;
++script)
++    script "$@"
++    ;;
++
++
++esac
+diff --git a/t/integrationtest/cases/nginx.conf b/t/integrationtest/cases/nginx.conf
+new file mode 100644
+index 000000000000..9e261092d50b
+--- /dev/null
++++ b/t/integrationtest/cases/nginx.conf
+@@ -0,0 +1,33 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++worker_processes  1;
++error_log logs/error.log;
++events {
++    worker_connections 4096;
++}
++http {
++    server {
++        listen 9666;
++        location / {
++            default_type text/html;
++            content_by_lua_block {
++                ngx.say("<p>Hello, World!</p>")
++            }
++        }
++    }
++}
+diff --git a/t/integrationtest/cases/test_etcdlinks.py b/t/integrationtest/cases/test_etcdlinks.py
+new file mode 100644
+index 000000000000..2b7594f02719
+--- /dev/null
++++ b/t/integrationtest/cases/test_etcdlinks.py
+@@ -0,0 +1,74 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++#!/usr/bin/env python
++#-*- coding: utf-8 -*-
++import sys,os,time,json,subprocess,signal
++import requests,psutil,grequests
++
++def kill_processtree(id):
++    for pid in psutil.pids():
++        if psutil.Process(int(pid)).ppid()==id:
++            psutil.Process(int(pid)).terminate()
++    psutil.Process(id).terminate()
++
++def get_pid_byname():
++    name = "apisix"
++    cmd = "ps -ef | grep %s/conf | grep master | grep -v grep| awk '{print $2}'"%name
++    p = subprocess.Popen(cmd, stderr = subprocess.PIPE, stdout = subprocess.PIPE, shell = True)
++    p.wait()
++    return p.stdout.read().strip()
++
++def get_workernum(pid):
++    parent = psutil.Process(pid)
++    children = parent.children(recursive=True)
++    return len(children)
++
++def get_etcdlinks():
++    for r in psutil.process_iter():
++        if r.name()=="etcd":
++            return len(psutil.Process(r.pid).connections())
++
++def cur_file_dir():
++    return os.path.split(os.path.realpath(__file__))[0]
++
++def setup_module():
++    global headers,nginx_pid,apisixhost,apisixpid,apisixpath
++    print get_pid_byname()
++    apisixpid = int(get_pid_byname())
++    apisixpath = psutil.Process(apisixpid).cwd()
++    os.chdir(apisixpath)
++    subprocess.call("./bin/apisix stop",shell=True, stdout=subprocess.PIPE)
++    time.sleep(1)
++    subprocess.call("./bin/apisix start",shell=True, stdout=subprocess.PIPE)
++    time.sleep(1)
++    apisixpid = int(get_pid_byname())
++    print("=============APISIX's pid:",apisixpid)
++    apisixhost = "http://127.0.0.1:9080"
++    headers = {"X-API-KEY": "edd1c9f034335f136f87ad84b625c8f1"}
++    confpath = "./t/integrationtest/cases/nginx.conf"
++    try:
++        os.makedirs("./t/integrationtest/cases/logs")
++    except Exception as e:
++        pass
++
++def teardown_module():
++    pass
++
++def test_etcdlinks01():
++    time.sleep(30)
++    assert get_etcdlinks() <= get_workernum(apisixpid) * 7
+diff --git a/t/integrationtest/requirements.txt b/t/integrationtest/requirements.txt
+new file mode 100644
+index 000000000000..d2c1c5fcd3a3
+--- /dev/null
++++ b/t/integrationtest/requirements.txt
+@@ -0,0 +1,10 @@
++pytest==4.0.1
++pytest-metadata==1.7.0
++pytest-html==1.14.2
++futures==3.2.0
++requests==2.21.0
++flaky==3.4.0
++attrs==19.1.0
++psutil==5.7.2
++gevent==1.1b5
++grequests==0.6.0
+\ No newline at end of file
+diff --git a/t/integrationtest/runtest.py b/t/integrationtest/runtest.py
+new file mode 100644
+index 000000000000..689d72ca3c3d
+--- /dev/null
++++ b/t/integrationtest/runtest.py
+@@ -0,0 +1,54 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++#!/usr/bin/env python
++#-*- coding: utf-8 -*-
++
++import random,subprocess,shutil
++import time, datetime
++import sys,os
++import json
++import re
++import base64
++
++def cur_file_dir():
++    return os.path.split(os.path.realpath(__file__))[0]
++
++def runcase(casedirpath):
++    updatepip = "curl https://bootstrap.pypa.io/get-pip.py | python"
++    requirements = "pip install -r %s/requirements.txt"%cur_file_dir()
++
++    r_exc_case_cmd = subprocess.Popen(updatepip, stderr=subprocess.PIPE,shell=True)
++    r_exc_case_cmd.wait()
++    err = r_exc_case_cmd.stderr.read()
++
++    r_exc_case_cmd = subprocess.Popen(requirements, stderr=subprocess.PIPE,shell=True)
++    r_exc_case_cmd.wait()
++    err = r_exc_case_cmd.stderr.read()
++
++    #exc_case_cmd='pytest --force-flaky --max-runs=3 --no-flaky-report -q "%s" --html="%s/result.html" --self-contained-html > "%s/result.log"'%(casedirpath,casedirpath,casedirpath)
++    #exc_case_cmd2='pytest --force-flaky --max-runs=3 --no-flaky-report -v -s "%s" > "%s/result.log"'%(casedirpath,casedirpath)
++    #exc_case_cmd3='pytest --force-flaky --max-runs=3 --no-flaky-report -v -s "%s" '%(casedirpath)
++    #r_exc_case_cmd = subprocess.Popen(exc_case_cmd3, stderr=subprocess.PIPE,shell=True)
++    #r_exc_case_cmd.wait()
++    #err = r_exc_case_cmd.stderr.read()
++
++    #shutil.rmtree(cur_file_dir()+r'/.pytest_cache')
++    #shutil.rmtree(casedirpath+r'/__pycache__')
++
++casepath = cur_file_dir()+"/cases"
++runcase(casepath)

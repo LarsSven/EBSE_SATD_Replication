@@ -1,0 +1,4268 @@
+diff --git a/flink-mesos/src/main/scala/org/apache/flink/mesos/runtime/clusterframework/MesosTaskManager.scala b/flink-mesos/src/main/scala/org/apache/flink/mesos/runtime/clusterframework/MesosTaskManager.scala
+index 19b0c625de10e..3972a579f4efc 100644
+--- a/flink-mesos/src/main/scala/org/apache/flink/mesos/runtime/clusterframework/MesosTaskManager.scala
++++ b/flink-mesos/src/main/scala/org/apache/flink/mesos/runtime/clusterframework/MesosTaskManager.scala
+@@ -23,6 +23,7 @@ import org.apache.flink.runtime.io.disk.iomanager.IOManager
+ import org.apache.flink.runtime.io.network.NetworkEnvironment
+ import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService
+ import org.apache.flink.runtime.memory.MemoryManager
++import org.apache.flink.runtime.metrics.MetricRegistry
+ import org.apache.flink.runtime.taskmanager.{TaskManager, TaskManagerConfiguration, TaskManagerLocation}
+ 
+ /** An extension of the TaskManager that listens for additional Mesos-related
+@@ -36,7 +37,8 @@ class MesosTaskManager(
+     ioManager: IOManager,
+     network: NetworkEnvironment,
+     numberOfSlots: Int,
+-    leaderRetrievalService: LeaderRetrievalService)
++    leaderRetrievalService: LeaderRetrievalService,
++    metricRegistry : MetricRegistry)
+   extends TaskManager(
+     config,
+     resourceID,
+@@ -45,7 +47,8 @@ class MesosTaskManager(
+     ioManager,
+     network,
+     numberOfSlots,
+-    leaderRetrievalService) {
++    leaderRetrievalService,
++    metricRegistry) {
+ 
+   override def handleMessage: Receive = {
+     super.handleMessage
+diff --git a/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/metrics/jmx/JMXReporterTest.java b/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/metrics/jmx/JMXReporterTest.java
+index 913999b4ca32c..089efe3663418 100644
+--- a/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/metrics/jmx/JMXReporterTest.java
++++ b/flink-metrics/flink-metrics-jmx/src/test/java/org/apache/flink/metrics/jmx/JMXReporterTest.java
+@@ -21,13 +21,12 @@
+ import org.apache.flink.configuration.ConfigConstants;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.metrics.Gauge;
+-import org.apache.flink.metrics.Histogram;
+-import org.apache.flink.metrics.HistogramStatistics;
+ import org.apache.flink.metrics.util.TestMeter;
+ import org.apache.flink.metrics.reporter.MetricReporter;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
+ import org.apache.flink.runtime.metrics.groups.TaskManagerMetricGroup;
+ import org.apache.flink.runtime.metrics.util.TestReporter;
++import org.apache.flink.runtime.metrics.util.TestingHistogram;
+ import org.apache.flink.util.TestLogger;
+ import org.junit.Test;
+ 
+@@ -286,57 +285,4 @@ public void testMeterReporting() throws Exception {
+ 			}
+ 		}
+ 	}
+-
+-	static class TestingHistogram implements Histogram {
+-
+-		@Override
+-		public void update(long value) {
+-
+-		}
+-
+-		@Override
+-		public long getCount() {
+-			return 1;
+-		}
+-
+-		@Override
+-		public HistogramStatistics getStatistics() {
+-			return new HistogramStatistics() {
+-				@Override
+-				public double getQuantile(double quantile) {
+-					return quantile;
+-				}
+-
+-				@Override
+-				public long[] getValues() {
+-					return new long[0];
+-				}
+-
+-				@Override
+-				public int size() {
+-					return 3;
+-				}
+-
+-				@Override
+-				public double getMean() {
+-					return 4;
+-				}
+-
+-				@Override
+-				public double getStdDev() {
+-					return 5;
+-				}
+-
+-				@Override
+-				public long getMax() {
+-					return 6;
+-				}
+-
+-				@Override
+-				public long getMin() {
+-					return 7;
+-				}
+-			};
+-		}
+-	}
+ }
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/WebRuntimeMonitor.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/WebRuntimeMonitor.java
+index 2bfbb851b66bd..4dd36e77179c8 100644
+--- a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/WebRuntimeMonitor.java
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/WebRuntimeMonitor.java
+@@ -67,6 +67,11 @@
+ import org.apache.flink.runtime.webmonitor.handlers.SubtasksTimesHandler;
+ import org.apache.flink.runtime.webmonitor.handlers.TaskManagerLogHandler;
+ import org.apache.flink.runtime.webmonitor.handlers.TaskManagersHandler;
++import org.apache.flink.runtime.webmonitor.metrics.JobManagerMetricsHandler;
++import org.apache.flink.runtime.webmonitor.metrics.JobMetricsHandler;
++import org.apache.flink.runtime.webmonitor.metrics.JobVertexMetricsHandler;
++import org.apache.flink.runtime.webmonitor.metrics.MetricFetcher;
++import org.apache.flink.runtime.webmonitor.metrics.TaskManagerMetricsHandler;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import scala.concurrent.ExecutionContext$;
+@@ -133,6 +138,8 @@ public class WebRuntimeMonitor implements WebMonitor {
+ 
+ 	private ExecutorService executorService;
+ 
++	private MetricFetcher metricFetcher;
++
+ 	public WebRuntimeMonitor(
+ 			Configuration config,
+ 			LeaderRetrievalService leaderRetrievalService,
+@@ -206,6 +213,8 @@ public WebRuntimeMonitor(
+ 
+ 		ExecutionContextExecutor context = ExecutionContext$.MODULE$.fromExecutor(executorService);
+ 
++		metricFetcher = new MetricFetcher(actorSystem, retriever, context);
++
+ 		router = new Router()
+ 			// config how to interact with this web server
+ 			.GET("/config", handler(new DashboardConfigHandler(cfg.getRefreshInterval())))
+@@ -235,6 +244,7 @@ public WebRuntimeMonitor(
+ 							currentGraphs,
+ 							backPressureStatsTracker,
+ 							refreshInterval)))
++			.GET("/jobs/:jobid/vertices/:vertexid/metrics", handler(new JobVertexMetricsHandler(metricFetcher)))
+ 			.GET("/jobs/:jobid/vertices/:vertexid/subtasks/accumulators", handler(new SubtasksAllAccumulatorsHandler(currentGraphs)))
+ 			.GET("/jobs/:jobid/vertices/:vertexid/subtasks/:subtasknum", handler(new SubtaskCurrentAttemptDetailsHandler(currentGraphs)))
+ 			.GET("/jobs/:jobid/vertices/:vertexid/subtasks/:subtasknum/attempts/:attempt", handler(new SubtaskExecutionAttemptDetailsHandler(currentGraphs)))
+@@ -245,6 +255,7 @@ public WebRuntimeMonitor(
+ 			.GET("/jobs/:jobid/exceptions", handler(new JobExceptionsHandler(currentGraphs)))
+ 			.GET("/jobs/:jobid/accumulators", handler(new JobAccumulatorsHandler(currentGraphs)))
+ 			.GET("/jobs/:jobid/checkpoints", handler(new JobCheckpointsHandler(currentGraphs)))
++			.GET("/jobs/:jobid/metrics", handler(new JobMetricsHandler(metricFetcher)))
+ 
+ 			.GET("/taskmanagers", handler(new TaskManagersHandler(DEFAULT_REQUEST_TIMEOUT)))
+ 			.GET("/taskmanagers/:" + TaskManagersHandler.TASK_MANAGER_ID_KEY + "/metrics", handler(new TaskManagersHandler(DEFAULT_REQUEST_TIMEOUT)))
+@@ -252,6 +263,7 @@ public WebRuntimeMonitor(
+ 				new TaskManagerLogHandler(retriever, context, jobManagerAddressPromise.future(), timeout, TaskManagerLogHandler.FileMode.LOG, config))
+ 			.GET("/taskmanagers/:" + TaskManagersHandler.TASK_MANAGER_ID_KEY + "/stdout", 
+ 				new TaskManagerLogHandler(retriever, context, jobManagerAddressPromise.future(), timeout, TaskManagerLogHandler.FileMode.STDOUT, config))
++			.GET("/taskmanagers/:" + TaskManagersHandler.TASK_MANAGER_ID_KEY + "/metrics", handler(new TaskManagerMetricsHandler(metricFetcher)))
+ 
+ 			// log and stdout
+ 			.GET("/jobmanager/log", logFiles.logFile == null ? new ConstantTextHandler("(log file unavailable)") :
+@@ -260,6 +272,8 @@ public WebRuntimeMonitor(
+ 			.GET("/jobmanager/stdout", logFiles.stdOutFile == null ? new ConstantTextHandler("(stdout file unavailable)") :
+ 				new StaticFileServerHandler(retriever, jobManagerAddressPromise.future(), timeout, logFiles.stdOutFile))
+ 
++			.GET("/jobmanager/metrics", handler(new JobManagerMetricsHandler(metricFetcher)))
++
+ 			// Cancel a job via GET (for proper integration with YARN this has to be performed via GET)
+ 			.GET("/jobs/:jobid/yarn-cancel", handler(new JobCancellationHandler()))
+ 
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/AbstractMetricsHandler.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/AbstractMetricsHandler.java
+new file mode 100644
+index 0000000000000..54e4b6f5c0230
+--- /dev/null
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/AbstractMetricsHandler.java
+@@ -0,0 +1,124 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import com.fasterxml.jackson.core.JsonGenerator;
++import org.apache.flink.runtime.instance.ActorGateway;
++import org.apache.flink.runtime.webmonitor.handlers.JsonFactory;
++import org.apache.flink.runtime.webmonitor.handlers.RequestHandler;
++import org.apache.flink.util.Preconditions;
++
++import java.io.IOException;
++import java.io.StringWriter;
++import java.util.Map;
++
++/**
++ * Abstract request handler that returns a list of all available metrics or the values for a set of metrics.
++ *
++ * If the query parameters do not contain a "get" parameter the list of all metrics is returned.
++ * {@code [ { "id" : "X" } ] }
++ *
++ * If the query parameters do contain a "get" parameter a comma-separate list of metric names is expected as a value.
++ * {@code /get?X,Y}
++ * The handler will then return a list containing the values of the requested metrics.
++ * {@code [ { "id" : "X", "value" : "S" }, { "id" : "Y", "value" : "T" } ] }
++ */
++public abstract class AbstractMetricsHandler implements RequestHandler {
++	private final MetricFetcher fetcher;
++
++	public AbstractMetricsHandler(MetricFetcher fetcher) {
++		this.fetcher = Preconditions.checkNotNull(fetcher);
++	}
++
++	@Override
++	public String handleRequest(Map<String, String> pathParams, Map<String, String> queryParams, ActorGateway jobManager) throws Exception {
++		fetcher.update();
++		String requestedMetricsList = queryParams.get("get");
++		return requestedMetricsList != null
++			? getMetricsValues(pathParams, requestedMetricsList)
++			: getAvailableMetricsList(pathParams);
++	}
++
++	/**
++	 * Returns a Map containing the metrics belonging to the entity pointed to by the path parameters.
++	 *
++	 * @param pathParams REST path parameters
++	 * @param metrics MetricStore containing all metrics
++	 * @return Map containing metrics, or null if no metric exists
++	 */
++	protected abstract Map<String, Object> getMapFor(Map<String, String> pathParams, MetricStore metrics);
++
++	private String getMetricsValues(Map<String, String> pathParams, String requestedMetricsList) throws IOException {
++		if (requestedMetricsList.isEmpty()) {
++			/**
++			 * The WebInterface doesn't check whether the list of available metrics was empty. This can lead to a 
++			 * request for which the "get" parameter is an empty string.
++			 */
++			return "";
++		}
++		MetricStore metricStore = fetcher.getMetricStore();
++		synchronized (metricStore) {
++			Map<String, Object> metrics = getMapFor(pathParams, metricStore);
++			if (metrics == null) {
++				return "";
++			}
++			String[] requestedMetrics = requestedMetricsList.split(",");
++
++			StringWriter writer = new StringWriter();
++			JsonGenerator gen = JsonFactory.jacksonFactory.createGenerator(writer);
++
++			gen.writeStartArray();
++			for (String requestedMetric : requestedMetrics) {
++				Object metricValue = metrics.get(requestedMetric);
++				if (metricValue != null) {
++					gen.writeStartObject();
++					gen.writeStringField("id", requestedMetric);
++					gen.writeStringField("value", metricValue.toString());
++					gen.writeEndObject();
++				}
++			}
++			gen.writeEndArray();
++
++			gen.close();
++			return writer.toString();
++		}
++	}
++
++	private String getAvailableMetricsList(Map<String, String> pathParams) throws IOException {
++		MetricStore metricStore = fetcher.getMetricStore();
++		synchronized (metricStore) {
++			Map<String, Object> metrics = getMapFor(pathParams, metricStore);
++			if (metrics == null) {
++				return "";
++			}
++			StringWriter writer = new StringWriter();
++			JsonGenerator gen = JsonFactory.jacksonFactory.createGenerator(writer);
++
++			gen.writeStartArray();
++			for (String m : metrics.keySet()) {
++				gen.writeStartObject();
++				gen.writeStringField("id", m);
++				gen.writeEndObject();
++			}
++			gen.writeEndArray();
++
++			gen.close();
++			return writer.toString();
++		}
++	}
++}
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobManagerMetricsHandler.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobManagerMetricsHandler.java
+new file mode 100644
+index 0000000000000..743564315d91d
+--- /dev/null
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobManagerMetricsHandler.java
+@@ -0,0 +1,47 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import java.util.Map;
++
++/**
++ * Request handler that returns for the job manager a list of all available metrics or the values for a set of metrics.
++ *
++ * If the query parameters do not contain a "get" parameter the list of all metrics is returned.
++ * {@code {"available": [ { "name" : "X", "id" : "X" } ] } }
++ *
++ * If the query parameters do contain a "get" parameter a comma-separate list of metric names is expected as a value.
++ * {@code /get?X,Y}
++ * The handler will then return a list containing the values of the requested metrics.
++ * {@code [ { "id" : "X", "value" : "S" }, { "id" : "Y", "value" : "T" } ] }
++ */
++public class JobManagerMetricsHandler extends AbstractMetricsHandler {
++	public JobManagerMetricsHandler(MetricFetcher fetcher) {
++		super(fetcher);
++	}
++
++	@Override
++	protected Map<String, Object> getMapFor(Map<String, String> pathParams, MetricStore metrics) {
++		MetricStore.JobManagerMetricStore jobManager = metrics.jobManager;
++		if (jobManager == null) {
++			return null;
++		} else {
++			return jobManager.metrics;
++		}
++	}
++}
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobMetricsHandler.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobMetricsHandler.java
+new file mode 100644
+index 0000000000000..b54799d62f80f
+--- /dev/null
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobMetricsHandler.java
+@@ -0,0 +1,49 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import java.util.Map;
++
++/**
++ * Request handler that returns for a given job a list of all available metrics or the values for a set of metrics.
++ *
++ * If the query parameters do not contain a "get" parameter the list of all metrics is returned.
++ * {@code {"available": [ { "name" : "X", "id" : "X" } ] } }
++ *
++ * If the query parameters do contain a "get" parameter a comma-separate list of metric names is expected as a value.
++ * {@code /get?X,Y}
++ * The handler will then return a list containing the values of the requested metrics.
++ * {@code [ { "id" : "X", "value" : "S" }, { "id" : "Y", "value" : "T" } ] }
++ */
++public class JobMetricsHandler extends AbstractMetricsHandler {
++	public static final String PARAMETER_JOB_ID = "jobid";
++
++	public JobMetricsHandler(MetricFetcher fetcher) {
++		super(fetcher);
++	}
++
++	@Override
++	protected Map<String, Object> getMapFor(Map<String, String> pathParams, MetricStore metrics) {
++		MetricStore.JobMetricStore job = metrics.jobs.get(pathParams.get(PARAMETER_JOB_ID));
++		if (job == null) {
++			return null;
++		} else {
++			return job.metrics;
++		}
++	}
++}
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobVertexMetricsHandler.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobVertexMetricsHandler.java
+new file mode 100644
+index 0000000000000..73b8bb0496ab5
+--- /dev/null
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/JobVertexMetricsHandler.java
+@@ -0,0 +1,54 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import java.util.Map;
++
++/**
++ * Request handler that returns for a given task a list of all available metrics or the values for a set of metrics.
++ *
++ * If the query parameters do not contain a "get" parameter the list of all metrics is returned.
++ * {@code {"available": [ { "name" : "X", "id" : "X" } ] } }
++ *
++ * If the query parameters do contain a "get" parameter a comma-separate list of metric names is expected as a value.
++ * {@code /get?X,Y}
++ * The handler will then return a list containing the values of the requested metrics.
++ * {@code [ { "id" : "X", "value" : "S" }, { "id" : "Y", "value" : "T" } ] }
++ */
++public class JobVertexMetricsHandler extends AbstractMetricsHandler {
++	public static final String PARAMETER_VERTEX_ID = "vertexid";
++
++	public JobVertexMetricsHandler(MetricFetcher fetcher) {
++		super(fetcher);
++	}
++
++	@Override
++	protected Map<String, Object> getMapFor(Map<String, String> pathParams, MetricStore metrics) {
++		MetricStore.JobMetricStore job = metrics.jobs.get(pathParams.get(JobMetricsHandler.PARAMETER_JOB_ID));
++		if (job == null) {
++			return null;
++		} else {
++			MetricStore.TaskMetricStore task = job.tasks.get(pathParams.get(PARAMETER_VERTEX_ID));
++			if (task == null) {
++				return null;
++			} else {
++				return task.metrics;
++			}
++		}
++	}
++}
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/MetricFetcher.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/MetricFetcher.java
+new file mode 100644
+index 0000000000000..7a39a53dba106
+--- /dev/null
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/MetricFetcher.java
+@@ -0,0 +1,224 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import akka.actor.ActorRef;
++import akka.actor.ActorSystem;
++import akka.dispatch.OnFailure;
++import akka.dispatch.OnSuccess;
++import akka.pattern.Patterns;
++import akka.util.Timeout;
++import org.apache.flink.configuration.ConfigConstants;
++import org.apache.flink.runtime.instance.ActorGateway;
++import org.apache.flink.runtime.instance.Instance;
++import org.apache.flink.runtime.messages.JobManagerMessages;
++import org.apache.flink.runtime.messages.webmonitor.JobDetails;
++import org.apache.flink.runtime.messages.webmonitor.MultipleJobsDetails;
++import org.apache.flink.runtime.messages.webmonitor.RequestJobDetails;
++import org.apache.flink.runtime.metrics.dump.MetricQueryService;
++import org.apache.flink.runtime.metrics.dump.MetricDump;
++import org.apache.flink.runtime.webmonitor.JobManagerRetriever;
++import org.apache.flink.util.Preconditions;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import scala.Option;
++import scala.concurrent.ExecutionContext;
++import scala.concurrent.Future;
++import scala.concurrent.duration.Duration;
++import scala.concurrent.duration.FiniteDuration;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++
++import static org.apache.flink.runtime.metrics.dump.MetricDumpSerialization.MetricDumpDeserializer;
++
++/**
++ * The MetricFetcher can be used to fetch metrics from the JobManager and all registered TaskManagers.
++ *
++ * Metrics will only be fetched when {@link MetricFetcher#update()} is called, provided that a sufficient time since
++ * the last call has passed.
++ */
++public class MetricFetcher {
++	private static final Logger LOG = LoggerFactory.getLogger(MetricFetcher.class);
++
++	private final ActorSystem actorSystem;
++	private final JobManagerRetriever retriever;
++	private final ExecutionContext ctx;
++	private final FiniteDuration timeout = new FiniteDuration(Duration.create(ConfigConstants.DEFAULT_AKKA_ASK_TIMEOUT).toMillis(), TimeUnit.MILLISECONDS);
++
++	private MetricStore metrics = new MetricStore();
++	private MetricDumpDeserializer deserializer = new MetricDumpDeserializer();
++
++	private long lastUpdateTime;
++
++	public MetricFetcher(ActorSystem actorSystem, JobManagerRetriever retriever, ExecutionContext ctx) {
++		this.actorSystem = Preconditions.checkNotNull(actorSystem);
++		this.retriever = Preconditions.checkNotNull(retriever);
++		this.ctx = Preconditions.checkNotNull(ctx);
++	}
++
++	/**
++	 * Returns the MetricStore containing all stored metrics.
++	 *
++	 * @return MetricStore containing all stored metrics;
++	 */
++	public MetricStore getMetricStore() {
++		return metrics;
++	}
++
++	/**
++	 * This method can be used to signal this MetricFetcher that the metrics are still in use and should be updated.
++	 */
++	public void update() {
++		synchronized (this) {
++			long currentTime = System.currentTimeMillis();
++			if (currentTime - lastUpdateTime > 10000) { // 10 seconds have passed since the last update
++				lastUpdateTime = currentTime;
++				fetchMetrics();
++			}
++		}
++	}
++
++	private void fetchMetrics() {
++		try {
++			Option<scala.Tuple2<ActorGateway, Integer>> jobManagerGatewayAndWebPort = retriever.getJobManagerGatewayAndWebPort();
++			if (jobManagerGatewayAndWebPort.isDefined()) {
++				ActorGateway jobManager = jobManagerGatewayAndWebPort.get()._1();
++
++				/**
++				 * Remove all metrics that belong to a job that is not running and no longer archived.
++				 */
++				Future<Object> jobDetailsFuture = jobManager.ask(new RequestJobDetails(true, true), timeout);
++				jobDetailsFuture
++					.onSuccess(new OnSuccess<Object>() {
++						@Override
++						public void onSuccess(Object result) throws Throwable {
++							MultipleJobsDetails details = (MultipleJobsDetails) result;
++							ArrayList<String> toRetain = new ArrayList<>();
++							for (JobDetails job : details.getRunningJobs()) {
++								toRetain.add(job.getJobId().toString());
++							}
++							for (JobDetails job : details.getFinishedJobs()) {
++								toRetain.add(job.getJobId().toString());
++							}
++							synchronized (metrics) {
++								metrics.jobs.keySet().retainAll(toRetain);
++							}
++						}
++					}, ctx);
++				logErrorOnFailure(jobDetailsFuture, "Fetching of JobDetails failed.");
++
++				String jobManagerPath = jobManager.path();
++				String queryServicePath = jobManagerPath.substring(0, jobManagerPath.lastIndexOf('/') + 1) + "MetricQueryService";
++				ActorRef jobManagerQueryService = actorSystem.actorFor(queryServicePath);
++
++				queryMetrics(jobManagerQueryService);
++
++				/**
++				 * We first request the list of all registered task managers from the job manager, and then
++				 * request the respective metric dump from each task manager.
++				 *
++				 * All stored metrics that do not belong to a registered task manager will be removed.
++				 */
++				Future<Object> registeredTaskManagersFuture = jobManager.ask(JobManagerMessages.getRequestRegisteredTaskManagers(), timeout);
++				registeredTaskManagersFuture
++					.onSuccess(new OnSuccess<Object>() {
++						@Override
++						public void onSuccess(Object result) throws Throwable {
++							Iterable<Instance> taskManagers = ((JobManagerMessages.RegisteredTaskManagers) result).asJavaIterable();
++							List<String> activeTaskManagers = new ArrayList<>();
++							for (Instance taskManager : taskManagers) {
++								activeTaskManagers.add(taskManager.getId().toString());
++
++								String taskManagerPath = taskManager.getActorGateway().path();
++								String queryServicePath = taskManagerPath.substring(0, taskManagerPath.lastIndexOf('/') + 1) + "MetricQueryService";
++								ActorRef taskManagerQueryService = actorSystem.actorFor(queryServicePath);
++
++								queryMetrics(taskManagerQueryService);
++							}
++							synchronized (metrics) { // remove all metrics belonging to unregistered task managers
++								metrics.taskManagers.keySet().retainAll(activeTaskManagers);
++							}
++						}
++					}, ctx);
++				logErrorOnFailure(registeredTaskManagersFuture, "Fetchin list of registered TaskManagers failed.");
++			}
++		} catch (Exception e) {
++			LOG.warn("Exception while fetching metrics.", e);
++		}
++	}
++
++	private void logErrorOnFailure(Future<Object> future, final String message) {
++		future.onFailure(new OnFailure() {
++			@Override
++			public void onFailure(Throwable failure) throws Throwable {
++				LOG.warn(message, failure);
++			}
++		}, ctx);
++	}
++
++	/**
++	 * Requests a metric dump from the given actor.
++	 *
++	 * @param actor ActorRef to request the dump from
++     */
++	private void queryMetrics(ActorRef actor) {
++		Future<Object> metricQueryFuture = new BasicGateway(actor).ask(MetricQueryService.getCreateDump(), timeout);
++		metricQueryFuture
++			.onSuccess(new OnSuccess<Object>() {
++				@Override
++				public void onSuccess(Object result) throws Throwable {
++					addMetrics(result);
++				}
++			}, ctx);
++		logErrorOnFailure(metricQueryFuture, "Fetching metrics failed.");
++	}
++
++	private void addMetrics(Object result) throws IOException {
++		byte[] data = (byte[]) result;
++		List<MetricDump> dumpedMetrics = deserializer.deserialize(data);
++		for (MetricDump metric : dumpedMetrics) {
++			metrics.add(metric);
++		}
++	}
++
++	/**
++	 * Helper class that allows mocking of the answer.
++     */
++	static class BasicGateway {
++		private final ActorRef actor;
++
++		private BasicGateway(ActorRef actor) {
++			this.actor = actor;
++		}
++
++		/**
++		 * Sends a message asynchronously and returns its response. The response to the message is
++		 * returned as a future.
++		 *
++		 * @param message Message to be sent
++		 * @param timeout Timeout until the Future is completed with an AskTimeoutException
++		 * @return Future which contains the response to the sent message
++		 */
++		public Future<Object> ask(Object message, FiniteDuration timeout) {
++			return Patterns.ask(actor, message, new Timeout(timeout));
++		}
++	}
++}
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/MetricStore.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/MetricStore.java
+new file mode 100644
+index 0000000000000..41e68cc7bf489
+--- /dev/null
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/MetricStore.java
+@@ -0,0 +1,190 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import org.apache.flink.runtime.metrics.dump.MetricDump;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_COUNTER;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_GAUGE;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_HISTOGRAM;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_METER;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_JM;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_JOB;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_OPERATOR;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_TASK;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_TM;
++
++/**
++ * Nested data-structure to store metrics.
++ *
++ * This structure is not thread-safe.
++ */
++public class MetricStore {
++	private static final Logger LOG = LoggerFactory.getLogger(MetricStore.class);
++
++	final JobManagerMetricStore jobManager = new JobManagerMetricStore();
++	final Map<String, TaskManagerMetricStore> taskManagers = new HashMap<>();
++	final Map<String, JobMetricStore> jobs = new HashMap<>();
++
++	public void add(MetricDump metric) {
++		try {
++			QueryScopeInfo info = metric.scopeInfo;
++			TaskManagerMetricStore tm;
++			JobMetricStore job;
++			TaskMetricStore task;
++
++			String name = info.scope.isEmpty()
++				? metric.name
++				: info.scope + "." + metric.name;
++			
++			if (name.isEmpty()) { // malformed transmission
++				return;
++			}
++
++			switch (info.getCategory()) {
++				case INFO_CATEGORY_JM:
++					addMetric(jobManager.metrics, name, metric);
++				case INFO_CATEGORY_TM:
++					String tmID = ((QueryScopeInfo.TaskManagerQueryScopeInfo) info).taskManagerID;
++					tm = taskManagers.get(tmID);
++					if (tm == null) {
++						tm = new TaskManagerMetricStore();
++						taskManagers.put(tmID, tm);
++					}
++					addMetric(tm.metrics, name, metric);
++					break;
++				case INFO_CATEGORY_JOB:
++					QueryScopeInfo.JobQueryScopeInfo jobInfo = (QueryScopeInfo.JobQueryScopeInfo) info;
++					job = jobs.get(jobInfo.jobID);
++					if (job == null) {
++						job = new JobMetricStore();
++						jobs.put(jobInfo.jobID, job);
++					}
++					addMetric(job.metrics, name, metric);
++					break;
++				case INFO_CATEGORY_TASK:
++					QueryScopeInfo.TaskQueryScopeInfo taskInfo = (QueryScopeInfo.TaskQueryScopeInfo) info;
++					job = jobs.get(taskInfo.jobID);
++					if (job == null) {
++						job = new JobMetricStore();
++						jobs.put(taskInfo.jobID, job);
++					}
++					task = job.tasks.get(taskInfo.vertexID);
++					if (task == null) {
++						task = new TaskMetricStore();
++						job.tasks.put(taskInfo.vertexID, task);
++					}
++					/**
++					 * As the WebInterface task metric queries currently do not account for subtasks we don't 
++					 * divide by subtask and instead use the concatenation of subtask index and metric name as the name. 
++					 */
++					addMetric(task.metrics, taskInfo.subtaskIndex + "." + name, metric);
++					break;
++				case INFO_CATEGORY_OPERATOR:
++					QueryScopeInfo.OperatorQueryScopeInfo operatorInfo = (QueryScopeInfo.OperatorQueryScopeInfo) info;
++					job = jobs.get(operatorInfo.jobID);
++					if (job == null) {
++						job = new JobMetricStore();
++						jobs.put(operatorInfo.jobID, job);
++					}
++					task = job.tasks.get(operatorInfo.vertexID);
++					if (task == null) {
++						task = new TaskMetricStore();
++						job.tasks.put(operatorInfo.vertexID, task);
++					}
++					/**
++					 * As the WebInterface does not account for operators (because it can't) we don't 
++					 * divide by operator and instead use the concatenation of subtask index, operator name and metric name 
++					 * as the name.
++					 */
++					addMetric(task.metrics, operatorInfo.subtaskIndex + "." + operatorInfo.operatorName + "." + name, metric);
++					break;
++				default:
++					LOG.debug("Invalid metric dump category: " + info.getCategory());
++			}
++		} catch (Exception e) {
++			LOG.debug("Malformed metric dump.", e);
++		}
++	}
++
++	private void addMetric(Map<String, Object> target, String name, MetricDump metric) {
++		switch (metric.getCategory()) {
++			case METRIC_CATEGORY_COUNTER:
++				MetricDump.CounterDump counter = (MetricDump.CounterDump) metric;
++				target.put(name, counter.count);
++				break;
++			case METRIC_CATEGORY_GAUGE:
++				MetricDump.GaugeDump gauge = (MetricDump.GaugeDump) metric;
++				target.put(name, gauge.value);
++				break;
++			case METRIC_CATEGORY_HISTOGRAM:
++				MetricDump.HistogramDump histogram = (MetricDump.HistogramDump) metric;
++				target.put(name + "_min", histogram.min);
++				target.put(name + "_max", histogram.max);
++				target.put(name + "_mean", histogram.mean);
++				target.put(name + "_median", histogram.median);
++				target.put(name + "_stddev", histogram.stddev);
++				target.put(name + "_p75", histogram.p75);
++				target.put(name + "_p90", histogram.p90);
++				target.put(name + "_p95", histogram.p95);
++				target.put(name + "_p98", histogram.p98);
++				target.put(name + "_p99", histogram.p99);
++				target.put(name + "_p999", histogram.p999);
++				break;
++			case METRIC_CATEGORY_METER:
++				MetricDump.MeterDump meter = (MetricDump.MeterDump) metric;
++				target.put(name, meter.rate);
++				break;
++		}
++	}
++
++	/**
++	 * Sub-structure containing metrics of the JobManager.
++	 */
++	static class JobManagerMetricStore {
++		public final Map<String, Object> metrics = new HashMap<>();
++	}
++
++	/**
++	 * Sub-structure containing metrics of a single TaskManager.
++	 */
++	static class TaskManagerMetricStore {
++		public final Map<String, Object> metrics = new HashMap<>();
++	}
++
++	/**
++	 * Sub-structure containing metrics of a single Job.
++	 */
++	static class JobMetricStore {
++		public final Map<String, Object> metrics = new HashMap<>();
++		public final Map<String, TaskMetricStore> tasks = new HashMap<>();
++	}
++
++	/**
++	 * Sub-structure containing metrics of a single Task.
++	 */
++	static class TaskMetricStore {
++		public final Map<String, Object> metrics = new HashMap<>();
++	}
++}
+diff --git a/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/TaskManagerMetricsHandler.java b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/TaskManagerMetricsHandler.java
+new file mode 100644
+index 0000000000000..fea3d07978733
+--- /dev/null
++++ b/flink-runtime-web/src/main/java/org/apache/flink/runtime/webmonitor/metrics/TaskManagerMetricsHandler.java
+@@ -0,0 +1,49 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import java.util.Map;
++
++/**
++ * Request handler that returns for a given task manager a list of all available metrics or the values for a set of metrics.
++ *
++ * If the query parameters do not contain a "get" parameter the list of all metrics is returned.
++ * {@code {"available": [ { "name" : "X", "id" : "X" } ] } }
++ *
++ * If the query parameters do contain a "get" parameter a comma-separate list of metric names is expected as a value.
++ * {@code /get?X,Y}
++ * The handler will then return a list containing the values of the requested metrics.
++ * {@code [ { "id" : "X", "value" : "S" }, { "id" : "Y", "value" : "T" } ] }
++ */
++public class TaskManagerMetricsHandler extends AbstractMetricsHandler {
++	public static final String PARAMETER_TM_ID = "tmid";
++
++	public TaskManagerMetricsHandler(MetricFetcher fetcher) {
++		super(fetcher);
++	}
++
++	@Override
++	protected Map<String, Object> getMapFor(Map<String, String> pathParams, MetricStore metrics) {
++		MetricStore.TaskManagerMetricStore taskManager = metrics.taskManagers.get(pathParams.get(PARAMETER_TM_ID));
++		if (taskManager == null) {
++			return null;
++		} else {
++			return taskManager.metrics;
++		}
++	}
++}
+diff --git a/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/AbstractMetricsHandlerTest.java b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/AbstractMetricsHandlerTest.java
+new file mode 100644
+index 0000000000000..483dbf64fda30
+--- /dev/null
++++ b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/AbstractMetricsHandlerTest.java
+@@ -0,0 +1,154 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import akka.actor.ActorSystem;
++import org.apache.flink.runtime.webmonitor.JobManagerRetriever;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++import scala.concurrent.ExecutionContext;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++import static org.powermock.api.mockito.PowerMockito.mock;
++
++public class AbstractMetricsHandlerTest extends TestLogger {
++	/**
++	 * Verifies that the handlers correctly handle expected REST calls
++	 */
++	@Test
++	public void testHandleRequest() throws Exception {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStoreTest.setupStore(fetcher.getMetricStore());
++
++		JobVertexMetricsHandler handler = new JobVertexMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++		Map<String, String> queryParams = new HashMap<>();
++
++		pathParams.put("jobid", "jobid");
++		pathParams.put("vertexid", "taskid");
++
++		// get list of available metrics
++		String availableList = handler.handleRequest(pathParams, queryParams, null);
++
++		assertEquals("[" +
++				"{\"id\":\"8.opname.abc.metric5\"}," +
++				"{\"id\":\"8.abc.metric4\"}" +
++				"]",
++			availableList);
++
++		// get value for a single metric
++		queryParams.put("get", "8.opname.abc.metric5");
++
++		String metricValue = handler.handleRequest(pathParams, queryParams, null);
++
++		assertEquals("[" +
++				"{\"id\":\"8.opname.abc.metric5\",\"value\":\"4\"}" +
++				"]"
++			, metricValue
++		);
++
++		// get values for multiple metrics
++		queryParams.put("get", "8.opname.abc.metric5,8.abc.metric4");
++
++		String metricValues = handler.handleRequest(pathParams, queryParams, null);
++
++		assertEquals("[" +
++				"{\"id\":\"8.opname.abc.metric5\",\"value\":\"4\"}," +
++				"{\"id\":\"8.abc.metric4\",\"value\":\"3\"}" +
++				"]",
++			metricValues
++		);
++	}
++
++	/**
++	 * Verifies that a malformed request for available metrics does not throw an exception.
++	 */
++	@Test
++	public void testInvalidListDoesNotFail() {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStoreTest.setupStore(fetcher.getMetricStore());
++
++		JobVertexMetricsHandler handler = new JobVertexMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++		Map<String, String> queryParams = new HashMap<>();
++
++		pathParams.put("jobid", "jobid");
++		pathParams.put("vertexid", "taskid");
++
++		//-----invalid variable
++		pathParams.put("jobid", "nonexistent");
++
++		try {
++			assertEquals("", handler.handleRequest(pathParams, queryParams, null));
++		} catch (Exception e) {
++			fail();
++		}
++	}
++
++	/**
++	 * Verifies that a malformed request for a metric value does not throw an exception.
++	 */
++	@Test
++	public void testInvalidGetDoesNotFail() {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStoreTest.setupStore(fetcher.getMetricStore());
++
++		JobVertexMetricsHandler handler = new JobVertexMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++		Map<String, String> queryParams = new HashMap<>();
++
++		pathParams.put("jobid", "jobid");
++		pathParams.put("vertexid", "taskid");
++
++		//-----empty string
++		queryParams.put("get", "");
++
++		try {
++			assertEquals("", handler.handleRequest(pathParams, queryParams, null));
++		} catch (Exception e) {
++			fail(e.getMessage());
++		}
++
++		//-----invalid variable
++		pathParams.put("jobid", "nonexistent");
++		queryParams.put("get", "subindex.opname.abc.metric5");
++
++		try {
++			assertEquals("", handler.handleRequest(pathParams, queryParams, null));
++		} catch (Exception e) {
++			fail(e.getMessage());
++		}
++
++		//-----invalid metric
++		pathParams.put("jobid", "nonexistant");
++		queryParams.put("get", "subindex.opname.abc.nonexistant");
++
++		try {
++			assertEquals("", handler.handleRequest(pathParams, queryParams, null));
++		} catch (Exception e) {
++			fail(e.getMessage());
++		}
++	}
++}
+diff --git a/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobManagerMetricsHandlerTest.java b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobManagerMetricsHandlerTest.java
+new file mode 100644
+index 0000000000000..97575749d2d95
+--- /dev/null
++++ b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobManagerMetricsHandlerTest.java
+@@ -0,0 +1,61 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import akka.actor.ActorSystem;
++import org.apache.flink.runtime.webmonitor.JobManagerRetriever;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++import scala.concurrent.ExecutionContext;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.powermock.api.mockito.PowerMockito.mock;
++
++public class JobManagerMetricsHandlerTest extends TestLogger {
++	@Test
++	public void getMapFor() {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = MetricStoreTest.setupStore(fetcher.getMetricStore());
++
++		JobManagerMetricsHandler handler = new JobManagerMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertEquals(0L, metrics.get("abc.metric1"));
++	}
++
++	@Test
++	public void getMapForNull() {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = fetcher.getMetricStore();
++
++		JobManagerMetricsHandler handler = new JobManagerMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertNotNull(metrics);
++	}
++}
+diff --git a/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobMetricsHandlerTest.java b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobMetricsHandlerTest.java
+new file mode 100644
+index 0000000000000..c0cc345dc8c16
+--- /dev/null
++++ b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobMetricsHandlerTest.java
+@@ -0,0 +1,63 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import akka.actor.ActorSystem;
++import org.apache.flink.runtime.webmonitor.JobManagerRetriever;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++import scala.concurrent.ExecutionContext;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.apache.flink.runtime.webmonitor.metrics.JobMetricsHandler.PARAMETER_JOB_ID;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.powermock.api.mockito.PowerMockito.mock;
++
++public class JobMetricsHandlerTest extends TestLogger {
++	@Test
++	public void getMapFor() throws Exception {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = MetricStoreTest.setupStore(fetcher.getMetricStore());
++
++		JobMetricsHandler handler = new JobMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++		pathParams.put(PARAMETER_JOB_ID, "jobid");
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertEquals(2L, metrics.get("abc.metric3"));
++	}
++
++	@Test
++	public void getMapForNull() {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = fetcher.getMetricStore();
++
++		JobMetricsHandler handler = new JobMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertNull(metrics);
++	}
++}
+diff --git a/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobVertexMetricsHandlerTest.java b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobVertexMetricsHandlerTest.java
+new file mode 100644
+index 0000000000000..d6e5ca7a5607e
+--- /dev/null
++++ b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/JobVertexMetricsHandlerTest.java
+@@ -0,0 +1,67 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import akka.actor.ActorSystem;
++import org.apache.flink.runtime.webmonitor.JobManagerRetriever;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++import scala.concurrent.ExecutionContext;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.apache.flink.runtime.webmonitor.metrics.JobMetricsHandler.PARAMETER_JOB_ID;
++import static org.apache.flink.runtime.webmonitor.metrics.JobVertexMetricsHandler.PARAMETER_VERTEX_ID;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.powermock.api.mockito.PowerMockito.mock;
++
++public class JobVertexMetricsHandlerTest extends TestLogger {
++	@Test
++	public void getMapFor() throws Exception {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = MetricStoreTest.setupStore(fetcher.getMetricStore());
++
++		JobVertexMetricsHandler handler = new JobVertexMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++		pathParams.put(PARAMETER_JOB_ID, "jobid");
++		pathParams.put(PARAMETER_VERTEX_ID, "taskid");
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertEquals(3L, metrics.get("8.abc.metric4"));
++
++		assertEquals(4L, metrics.get("8.opname.abc.metric5"));
++	}
++
++	@Test
++	public void getMapForNull() {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = fetcher.getMetricStore();
++
++		JobVertexMetricsHandler handler = new JobVertexMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertNull(metrics);
++	}
++}
+diff --git a/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/MetricFetcherTest.java b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/MetricFetcherTest.java
+new file mode 100644
+index 0000000000000..e0cfe26787904
+--- /dev/null
++++ b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/MetricFetcherTest.java
+@@ -0,0 +1,216 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import akka.actor.ActorRef;
++import akka.actor.ActorSystem;
++import org.apache.flink.api.common.JobID;
++import org.apache.flink.api.java.tuple.Tuple2;
++import org.apache.flink.metrics.Counter;
++import org.apache.flink.metrics.Gauge;
++import org.apache.flink.metrics.Histogram;
++import org.apache.flink.metrics.Meter;
++import org.apache.flink.metrics.SimpleCounter;
++import org.apache.flink.runtime.instance.ActorGateway;
++import org.apache.flink.runtime.instance.Instance;
++import org.apache.flink.runtime.instance.InstanceID;
++import org.apache.flink.runtime.messages.JobManagerMessages;
++import org.apache.flink.runtime.messages.webmonitor.JobDetails;
++import org.apache.flink.runtime.messages.webmonitor.MultipleJobsDetails;
++import org.apache.flink.runtime.messages.webmonitor.RequestJobDetails;
++import org.apache.flink.runtime.metrics.dump.MetricDumpSerialization;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.runtime.metrics.dump.MetricQueryService;
++import org.apache.flink.runtime.metrics.util.TestingHistogram;
++import org.apache.flink.runtime.webmonitor.JobManagerRetriever;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.powermock.core.classloader.annotations.PrepareForTest;
++import org.powermock.modules.junit4.PowerMockRunner;
++import scala.Option;
++import scala.collection.JavaConverters;
++import scala.concurrent.ExecutionContext$;
++import scala.concurrent.ExecutionContextExecutor;
++import scala.concurrent.Future$;
++import scala.concurrent.duration.FiniteDuration;
++
++import java.io.IOException;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.Executor;
++
++import static org.apache.flink.runtime.metrics.dump.MetricQueryService.METRIC_QUERY_SERVICE_NAME;
++import static org.junit.Assert.assertEquals;
++import static org.mockito.Matchers.any;
++import static org.mockito.Matchers.eq;
++import static org.mockito.Matchers.isA;
++import static org.powermock.api.mockito.PowerMockito.mock;
++import static org.powermock.api.mockito.PowerMockito.when;
++import static org.powermock.api.mockito.PowerMockito.whenNew;
++
++@RunWith(PowerMockRunner.class)
++@PrepareForTest(MetricFetcher.class)
++public class MetricFetcherTest extends TestLogger {
++	@Test
++	public void testUpdate() throws Exception {
++		// ========= setup TaskManager =================================================================================
++		JobID jobID = new JobID();
++		InstanceID tmID = new InstanceID();
++		ActorGateway taskManagerGateway = mock(ActorGateway.class);
++		when(taskManagerGateway.path()).thenReturn("/tm/address");
++
++		Instance taskManager = mock(Instance.class);
++		when(taskManager.getActorGateway()).thenReturn(taskManagerGateway);
++		when(taskManager.getId()).thenReturn(tmID);
++
++		// ========= setup JobManager ==================================================================================
++		JobDetails details = mock(JobDetails.class);
++		when(details.getJobId()).thenReturn(jobID);
++
++		ActorGateway jobManagerGateway = mock(ActorGateway.class);
++		Object registeredTaskManagersAnswer = new JobManagerMessages.RegisteredTaskManagers(
++			JavaConverters.collectionAsScalaIterableConverter(Collections.singletonList(taskManager)).asScala());
++
++		when(jobManagerGateway.ask(isA(RequestJobDetails.class), any(FiniteDuration.class)))
++			.thenReturn(Future$.MODULE$.successful((Object) new MultipleJobsDetails(new JobDetails[0], new JobDetails[0])));
++		when(jobManagerGateway.ask(isA(JobManagerMessages.RequestRegisteredTaskManagers$.class), any(FiniteDuration.class)))
++			.thenReturn(Future$.MODULE$.successful(registeredTaskManagersAnswer));
++		when(jobManagerGateway.path()).thenReturn("/jm/address");
++
++		JobManagerRetriever retriever = mock(JobManagerRetriever.class);
++		when(retriever.getJobManagerGatewayAndWebPort())
++			.thenReturn(Option.apply(new scala.Tuple2<ActorGateway, Integer>(jobManagerGateway, 0)));
++
++		// ========= setup QueryServices ================================================================================
++		Object requestMetricsAnswer = createRequestDumpAnswer(tmID, jobID);
++
++		final ActorRef jmQueryService = mock(ActorRef.class);
++		final ActorRef tmQueryService = mock(ActorRef.class);
++
++		ActorSystem actorSystem = mock(ActorSystem.class);
++		when(actorSystem.actorFor(eq("/jm/" + METRIC_QUERY_SERVICE_NAME))).thenReturn(jmQueryService);
++		when(actorSystem.actorFor(eq("/tm/" + METRIC_QUERY_SERVICE_NAME))).thenReturn(tmQueryService);
++
++		MetricFetcher.BasicGateway jmQueryServiceGateway = mock(MetricFetcher.BasicGateway.class);
++		when(jmQueryServiceGateway.ask(any(MetricQueryService.getCreateDump().getClass()), any(FiniteDuration.class)))
++			.thenReturn(Future$.MODULE$.successful((Object) new byte[16]));
++
++		MetricFetcher.BasicGateway tmQueryServiceGateway = mock(MetricFetcher.BasicGateway.class);
++		when(tmQueryServiceGateway.ask(any(MetricQueryService.getCreateDump().getClass()), any(FiniteDuration.class)))
++			.thenReturn(Future$.MODULE$.successful(requestMetricsAnswer));
++
++		whenNew(MetricFetcher.BasicGateway.class)
++			.withArguments(eq(new Object() {
++				@Override
++				public boolean equals(Object o) {
++					return o == jmQueryService;
++				}
++			}))
++			.thenReturn(jmQueryServiceGateway);
++		whenNew(MetricFetcher.BasicGateway.class)
++			.withArguments(eq(new Object() {
++				@Override
++				public boolean equals(Object o) {
++					return o == tmQueryService;
++				}
++			}))
++			.thenReturn(tmQueryServiceGateway);
++
++		// ========= start MetricFetcher testing =======================================================================
++		ExecutionContextExecutor context = ExecutionContext$.MODULE$.fromExecutor(new CurrentThreadExecutor());
++		MetricFetcher fetcher = new MetricFetcher(actorSystem, retriever, context);
++
++		// verify that update fetches metrics and updates the store
++		fetcher.update();
++		MetricStore store = fetcher.getMetricStore();
++		synchronized (store) {
++			assertEquals(7L, store.jobManager.metrics.get("abc.hist_min"));
++			assertEquals(6L, store.jobManager.metrics.get("abc.hist_max"));
++			assertEquals(4.0, store.jobManager.metrics.get("abc.hist_mean"));
++			assertEquals(0.5, store.jobManager.metrics.get("abc.hist_median"));
++			assertEquals(5.0, store.jobManager.metrics.get("abc.hist_stddev"));
++			assertEquals(0.75, store.jobManager.metrics.get("abc.hist_p75"));
++			assertEquals(0.9, store.jobManager.metrics.get("abc.hist_p90"));
++			assertEquals(0.95, store.jobManager.metrics.get("abc.hist_p95"));
++			assertEquals(0.98, store.jobManager.metrics.get("abc.hist_p98"));
++			assertEquals(0.99, store.jobManager.metrics.get("abc.hist_p99"));
++			assertEquals(0.999, store.jobManager.metrics.get("abc.hist_p999"));
++
++			assertEquals("x", store.taskManagers.get(tmID.toString()).metrics.get("abc.gauge"));
++			assertEquals(5.0, store.jobs.get(jobID.toString()).metrics.get("abc.jc"));
++			assertEquals(2L, store.jobs.get(jobID.toString()).tasks.get("taskid").metrics.get("2.abc.tc"));
++			assertEquals(1L, store.jobs.get(jobID.toString()).tasks.get("taskid").metrics.get("2.opname.abc.oc"));
++		}
++	}
++
++	public class CurrentThreadExecutor implements Executor {
++		public void execute(Runnable r) {
++			r.run();
++		}
++	}
++
++	private static byte[] createRequestDumpAnswer(InstanceID tmID, JobID jobID) throws IOException {
++		Map<Counter, Tuple2<QueryScopeInfo, String>> counters = new HashMap<>();
++		Map<Gauge<?>, Tuple2<QueryScopeInfo, String>> gauges = new HashMap<>();
++		Map<Histogram, Tuple2<QueryScopeInfo, String>> histograms = new HashMap<>();
++		Map<Meter, Tuple2<QueryScopeInfo, String>> meters = new HashMap<>();
++
++		SimpleCounter c1 = new SimpleCounter();
++		SimpleCounter c2 = new SimpleCounter();
++		
++		c1.inc(1);
++		c2.inc(2);
++
++		counters.put(c1, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.OperatorQueryScopeInfo(jobID.toString(), "taskid", 2, "opname", "abc"), "oc"));
++		counters.put(c2, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.TaskQueryScopeInfo(jobID.toString(), "taskid", 2, "abc"), "tc"));
++		meters.put(new Meter() {
++			@Override
++			public void markEvent() {
++			}
++
++			@Override
++			public void markEvent(long n) {
++			}
++
++			@Override
++			public double getRate() {
++				return 5;
++			}
++
++			@Override
++			public long getCount() {
++				return 10;
++			}
++		}, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.JobQueryScopeInfo(jobID.toString(), "abc"), "jc"));
++		gauges.put(new Gauge<String>() {
++			@Override
++			public String getValue() {
++				return "x";
++			}
++		}, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.TaskManagerQueryScopeInfo(tmID.toString(), "abc"), "gauge"));
++		histograms.put(new TestingHistogram(), new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.JobManagerQueryScopeInfo("abc"), "hist"));
++
++		MetricDumpSerialization.MetricDumpSerializer serializer = new MetricDumpSerialization.MetricDumpSerializer();
++		byte[] dump = serializer.serialize(counters, gauges, histograms, meters);
++		serializer.close();
++
++		return dump;
++	}
++}
+diff --git a/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/MetricStoreTest.java b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/MetricStoreTest.java
+new file mode 100644
+index 0000000000000..9dc292981524f
+--- /dev/null
++++ b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/MetricStoreTest.java
+@@ -0,0 +1,83 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import org.apache.flink.runtime.metrics.dump.MetricDump;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++
++import java.io.IOException;
++
++import static org.junit.Assert.assertEquals;
++
++public class MetricStoreTest extends TestLogger {
++	@Test
++	public void testAdd() throws IOException {
++		MetricStore store = setupStore(new MetricStore());
++
++		assertEquals(0L, store.jobManager.metrics.get("abc.metric1"));
++		assertEquals(1L, store.taskManagers.get("tmid").metrics.get("abc.metric2"));
++		assertEquals(2L, store.jobs.get("jobid").metrics.get("abc.metric3"));
++		assertEquals(3L, store.jobs.get("jobid").tasks.get("taskid").metrics.get("8.abc.metric4"));
++		assertEquals(4L, store.jobs.get("jobid").tasks.get("taskid").metrics.get("8.opname.abc.metric5"));
++	}
++
++	@Test
++	public void testMalformedNameHandling() {
++		MetricStore store = new MetricStore();
++		//-----verify that no exceptions are thrown
++		
++		// null
++		store.add(null);
++		// empty name
++		QueryScopeInfo.JobManagerQueryScopeInfo info = new QueryScopeInfo.JobManagerQueryScopeInfo("");
++		MetricDump.CounterDump cd = new MetricDump.CounterDump(info, "", 0);
++		store.add(cd);
++
++		//-----verify that no side effects occur
++		assertEquals(0, store.jobManager.metrics.size());
++		assertEquals(0, store.taskManagers.size());
++		assertEquals(0, store.jobs.size());
++	}
++
++	public static MetricStore setupStore(MetricStore store) {
++		QueryScopeInfo.JobManagerQueryScopeInfo jm = new QueryScopeInfo.JobManagerQueryScopeInfo("abc");
++		MetricDump.CounterDump cd1 = new MetricDump.CounterDump(jm, "metric1", 0);
++
++		QueryScopeInfo.TaskManagerQueryScopeInfo tm = new QueryScopeInfo.TaskManagerQueryScopeInfo("tmid", "abc");
++		MetricDump.CounterDump cd2 = new MetricDump.CounterDump(tm, "metric2", 1);
++
++		QueryScopeInfo.JobQueryScopeInfo job = new QueryScopeInfo.JobQueryScopeInfo("jobid", "abc");
++		MetricDump.CounterDump cd3 = new MetricDump.CounterDump(job, "metric3", 2);
++
++		QueryScopeInfo.TaskQueryScopeInfo task = new QueryScopeInfo.TaskQueryScopeInfo("jobid", "taskid", 8, "abc");
++		MetricDump.CounterDump cd4 = new MetricDump.CounterDump(task, "metric4", 3);
++
++		QueryScopeInfo.OperatorQueryScopeInfo operator = new QueryScopeInfo.OperatorQueryScopeInfo("jobid", "taskid", 8, "opname", "abc");
++		MetricDump.CounterDump cd5 = new MetricDump.CounterDump(operator, "metric5", 4);
++
++		store.add(cd1);
++		store.add(cd2);
++		store.add(cd3);
++		store.add(cd4);
++		store.add(cd5);
++		
++		return store;
++	}
++}
+diff --git a/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/TaskManagerMetricsHandlerTest.java b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/TaskManagerMetricsHandlerTest.java
+new file mode 100644
+index 0000000000000..6299a5629d555
+--- /dev/null
++++ b/flink-runtime-web/src/test/java/org/apache/flink/runtime/webmonitor/metrics/TaskManagerMetricsHandlerTest.java
+@@ -0,0 +1,63 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.webmonitor.metrics;
++
++import akka.actor.ActorSystem;
++import org.apache.flink.runtime.webmonitor.JobManagerRetriever;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++import scala.concurrent.ExecutionContext;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.apache.flink.runtime.webmonitor.metrics.TaskManagerMetricsHandler.PARAMETER_TM_ID;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.powermock.api.mockito.PowerMockito.mock;
++
++public class TaskManagerMetricsHandlerTest extends TestLogger {
++	@Test
++	public void getMapFor() throws Exception {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = MetricStoreTest.setupStore(fetcher.getMetricStore());
++
++		TaskManagerMetricsHandler handler = new TaskManagerMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++		pathParams.put(PARAMETER_TM_ID, "tmid");
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertEquals(1L, metrics.get("abc.metric2"));
++	}
++
++	@Test
++	public void getMapForNull() {
++		MetricFetcher fetcher = new MetricFetcher(mock(ActorSystem.class), mock(JobManagerRetriever.class), mock(ExecutionContext.class));
++		MetricStore store = fetcher.getMetricStore();
++
++		TaskManagerMetricsHandler handler = new TaskManagerMetricsHandler(fetcher);
++
++		Map<String, String> pathParams = new HashMap<>();
++
++		Map<String, Object> metrics = handler.getMapFor(pathParams, store);
++
++		assertNull(metrics);
++	}
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/MetricRegistry.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/MetricRegistry.java
+index 763ea6662a578..9c96858310c26 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/MetricRegistry.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/MetricRegistry.java
+@@ -18,6 +18,8 @@
+ 
+ package org.apache.flink.runtime.metrics;
+ 
++import akka.actor.ActorRef;
++import akka.actor.ActorSystem;
+ import org.apache.flink.configuration.ConfigConstants;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.configuration.DelegatingConfiguration;
+@@ -26,6 +28,8 @@
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.metrics.reporter.MetricReporter;
+ import org.apache.flink.metrics.reporter.Scheduled;
++import org.apache.flink.runtime.metrics.dump.MetricQueryService;
++import org.apache.flink.runtime.metrics.groups.AbstractMetricGroup;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormats;
+ import org.slf4j.Logger;
+@@ -47,6 +51,7 @@ public class MetricRegistry {
+ 	
+ 	private List<MetricReporter> reporters;
+ 	private ScheduledExecutorService executor;
++	private ActorRef queryService;
+ 
+ 	private final ScopeFormats scopeFormats;
+ 
+@@ -144,6 +149,19 @@ public MetricRegistry(Configuration config) {
+ 		}
+ 	}
+ 
++	/**
++	 * Initializes the MetricQueryService.
++	 * 
++	 * @param actorSystem ActorSystem to create the MetricQueryService on
++     */
++	public void startQueryService(ActorSystem actorSystem) {
++		try {
++			queryService = MetricQueryService.startMetricQueryService(actorSystem);
++		} catch (Exception e) {
++			LOG.warn("Could not start MetricDumpActor. No metrics will be submitted to the WebInterface.", e);
++		}
++	}
++
+ 	public char getDelimiter() {
+ 		return this.delimiter;
+ 	}
+@@ -207,6 +225,9 @@ public void register(Metric metric, String metricName, MetricGroup group) {
+ 					}
+ 				}
+ 			}
++			if (queryService != null) {
++				MetricQueryService.notifyOfAddedMetric(queryService, metric, metricName, (AbstractMetricGroup) group);
++			}
+ 		} catch (Exception e) {
+ 			LOG.error("Error while registering metric.", e);
+ 		}
+@@ -228,6 +249,9 @@ public void unregister(Metric metric, String metricName, MetricGroup group) {
+ 					}
+ 				}
+ 			}
++			if (queryService != null) {
++				MetricQueryService.notifyOfRemovedMetric(queryService, metric);
++			}
+ 		} catch (Exception e) {
+ 			LOG.error("Error while registering metric.", e);
+ 		}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricDump.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricDump.java
+new file mode 100644
+index 0000000000000..2239b5026d7dc
+--- /dev/null
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricDump.java
+@@ -0,0 +1,138 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++import org.apache.flink.util.Preconditions;
++
++/**
++ * A container for a dumped metric that contains the scope, name and value(s) of the metric.
++ */
++public abstract class MetricDump {
++	/** Categories to be returned by {@link MetricDump#getCategory()} to avoid instanceof checks. */
++	public static final byte METRIC_CATEGORY_COUNTER = 0;
++	public static final byte METRIC_CATEGORY_GAUGE = 1;
++	public static final byte METRIC_CATEGORY_HISTOGRAM = 2;
++	public static final byte METRIC_CATEGORY_METER = 3;
++
++	/** The scope information for the stored metric. */
++	public final QueryScopeInfo scopeInfo;
++	/** The name of the stored metric. */
++	public final String name;
++
++	private MetricDump(QueryScopeInfo scopeInfo, String name) {
++		this.scopeInfo = Preconditions.checkNotNull(scopeInfo);
++		this.name = Preconditions.checkNotNull(name);
++	}
++
++	/**
++	 * Returns the category for this MetricDump.
++	 *
++	 * @return category
++	 */
++	public abstract byte getCategory();
++
++	/**
++	 * Container for the value of a {@link org.apache.flink.metrics.Counter}.
++	 */
++	public static class CounterDump extends MetricDump {
++		public final long count;
++
++		public CounterDump(QueryScopeInfo scopeInfo, String name, long count) {
++			super(scopeInfo, name);
++			this.count = count;
++		}
++
++		@Override
++		public byte getCategory() {
++			return METRIC_CATEGORY_COUNTER;
++		}
++	}
++
++	/**
++	 * Container for the value of a {@link org.apache.flink.metrics.Gauge} as a string.
++	 */
++	public static class GaugeDump extends MetricDump {
++		public final String value;
++
++		public GaugeDump(QueryScopeInfo scopeInfo, String name, String value) {
++			super(scopeInfo, name);
++			this.value = Preconditions.checkNotNull(value);
++		}
++
++		@Override
++		public byte getCategory() {
++			return METRIC_CATEGORY_GAUGE;
++		}
++	}
++
++	/**
++	 * Container for the values of a {@link org.apache.flink.metrics.Histogram}.
++	 */
++	public static class HistogramDump extends MetricDump {
++		public long min;
++		public long max;
++		public double mean;
++		public double median;
++		public double stddev;
++		public double p75;
++		public double p90;
++		public double p95;
++		public double p98;
++		public double p99;
++		public double p999;
++
++		public HistogramDump(QueryScopeInfo scopeInfo, String name,
++			long min, long max, double mean, double median, double stddev,
++			double p75, double p90, double p95, double p98, double p99, double p999) {
++
++			super(scopeInfo, name);
++			this.min = min;
++			this.max = max;
++			this.mean = mean;
++			this.median = median;
++			this.stddev = stddev;
++			this.p75 = p75;
++			this.p90 = p90;
++			this.p95 = p95;
++			this.p98 = p98;
++			this.p99 = p99;
++			this.p999 = p999;
++		}
++
++		@Override
++		public byte getCategory() {
++			return METRIC_CATEGORY_HISTOGRAM;
++		}
++	}
++
++	/**
++	 * Container for the rate of a {@link org.apache.flink.metrics.Meter}. 
++	 */
++	public static class MeterDump extends MetricDump {
++		public final double rate;
++
++		public MeterDump(QueryScopeInfo scopeInfo, String name, double rate) {
++			super(scopeInfo, name);
++			this.rate = rate;
++		}
++		@Override
++		public byte getCategory() {
++			return METRIC_CATEGORY_METER;
++		}
++	}
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricDumpSerialization.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricDumpSerialization.java
+new file mode 100644
+index 0000000000000..143faafa018df
+--- /dev/null
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricDumpSerialization.java
+@@ -0,0 +1,302 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++import org.apache.commons.io.output.ByteArrayOutputStream;
++import org.apache.flink.api.java.tuple.Tuple2;
++import org.apache.flink.metrics.Counter;
++import org.apache.flink.metrics.Gauge;
++import org.apache.flink.metrics.Histogram;
++import org.apache.flink.metrics.HistogramStatistics;
++import org.apache.flink.metrics.Meter;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.ByteArrayInputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_JM;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_JOB;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_OPERATOR;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_TASK;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_TM;
++
++/**
++ * Utility class for the serialization of metrics.
++ */
++public class MetricDumpSerialization {
++	private static final Logger LOG = LoggerFactory.getLogger(MetricDumpSerialization.class);
++
++	private MetricDumpSerialization() {
++	}
++
++	//-------------------------------------------------------------------------
++	// Serialization
++	//-------------------------------------------------------------------------
++	public static class MetricDumpSerializer {
++		private ByteArrayOutputStream baos = new ByteArrayOutputStream(4096);
++		private DataOutputStream dos = new DataOutputStream(baos);
++
++		/**
++		 * Serializes the given metrics and returns the resulting byte array.
++		 *
++		 * @param counters   counters to serialize
++		 * @param gauges     gauges to serialize
++		 * @param histograms histograms to serialize
++		 * @return byte array containing the serialized metrics
++		 * @throws IOException
++		 */
++		public byte[] serialize(
++			Map<Counter, Tuple2<QueryScopeInfo, String>> counters,
++			Map<Gauge<?>, Tuple2<QueryScopeInfo, String>> gauges,
++			Map<Histogram, Tuple2<QueryScopeInfo, String>> histograms,
++			Map<Meter, Tuple2<QueryScopeInfo, String>> meters) throws IOException {
++				
++			baos.reset();
++			dos.writeInt(counters.size());
++			dos.writeInt(gauges.size());
++			dos.writeInt(histograms.size());
++			dos.writeInt(meters.size());
++
++			for (Map.Entry<Counter, Tuple2<QueryScopeInfo, String>> entry : counters.entrySet()) {
++				serializeMetricInfo(dos, entry.getValue().f0);
++				serializeString(dos, entry.getValue().f1);
++				serializeCounter(dos, entry.getKey());
++			}
++
++			for (Map.Entry<Gauge<?>, Tuple2<QueryScopeInfo, String>> entry : gauges.entrySet()) {
++				serializeMetricInfo(dos, entry.getValue().f0);
++				serializeString(dos, entry.getValue().f1);
++				serializeGauge(dos, entry.getKey());
++			}
++
++			for (Map.Entry<Histogram, Tuple2<QueryScopeInfo, String>> entry : histograms.entrySet()) {
++				serializeMetricInfo(dos, entry.getValue().f0);
++				serializeString(dos, entry.getValue().f1);
++				serializeHistogram(dos, entry.getKey());
++			}
++
++			for (Map.Entry<Meter, Tuple2<QueryScopeInfo, String>> entry : meters.entrySet()) {
++				serializeMetricInfo(dos, entry.getValue().f0);
++				serializeString(dos, entry.getValue().f1);
++				serializeMeter(dos, entry.getKey());
++			}
++			return baos.toByteArray();
++		}
++
++		public void close() {
++			try {
++				dos.close();
++			} catch (Exception e) {
++				LOG.debug("Failed to close OutputStream.", e);
++			}
++			try {
++				baos.close();
++			} catch (Exception e) {
++				LOG.debug("Failed to close OutputStream.", e);
++			}
++		}
++	}
++
++	private static void serializeMetricInfo(DataOutputStream dos, QueryScopeInfo info) throws IOException {
++		serializeString(dos, info.scope);
++		dos.writeByte(info.getCategory());
++		switch (info.getCategory()) {
++			case INFO_CATEGORY_JM:
++				break;
++			case INFO_CATEGORY_TM:
++				String tmID = ((QueryScopeInfo.TaskManagerQueryScopeInfo) info).taskManagerID;
++				serializeString(dos, tmID);
++				break;
++			case INFO_CATEGORY_JOB:
++				QueryScopeInfo.JobQueryScopeInfo jobInfo = (QueryScopeInfo.JobQueryScopeInfo) info;
++				serializeString(dos, jobInfo.jobID);
++				break;
++			case INFO_CATEGORY_TASK:
++				QueryScopeInfo.TaskQueryScopeInfo taskInfo = (QueryScopeInfo.TaskQueryScopeInfo) info;
++				serializeString(dos, taskInfo.jobID);
++				serializeString(dos, taskInfo.vertexID);
++				dos.writeInt(taskInfo.subtaskIndex);
++				break;
++			case INFO_CATEGORY_OPERATOR:
++				QueryScopeInfo.OperatorQueryScopeInfo operatorInfo = (QueryScopeInfo.OperatorQueryScopeInfo) info;
++				serializeString(dos, operatorInfo.jobID);
++				serializeString(dos, operatorInfo.vertexID);
++				dos.writeInt(operatorInfo.subtaskIndex);
++				serializeString(dos, operatorInfo.operatorName);
++				break;
++		}
++	}
++
++	private static void serializeString(DataOutputStream dos, String string) throws IOException {
++		byte[] bytes = string.getBytes();
++		dos.writeInt(bytes.length);
++		dos.write(bytes);
++	}
++
++	private static void serializeCounter(DataOutputStream dos, Counter counter) throws IOException {
++		dos.writeLong(counter.getCount());
++	}
++
++	private static void serializeGauge(DataOutputStream dos, Gauge<?> gauge) throws IOException {
++		serializeString(dos, gauge.getValue().toString());
++	}
++
++	private static void serializeHistogram(DataOutputStream dos, Histogram histogram) throws IOException {
++		HistogramStatistics stat = histogram.getStatistics();
++
++		dos.writeLong(stat.getMin());
++		dos.writeLong(stat.getMax());
++		dos.writeDouble(stat.getMean());
++		dos.writeDouble(stat.getQuantile(0.5));
++		dos.writeDouble(stat.getStdDev());
++		dos.writeDouble(stat.getQuantile(0.75));
++		dos.writeDouble(stat.getQuantile(0.90));
++		dos.writeDouble(stat.getQuantile(0.95));
++		dos.writeDouble(stat.getQuantile(0.98));
++		dos.writeDouble(stat.getQuantile(0.99));
++		dos.writeDouble(stat.getQuantile(0.999));
++	}
++
++	private static void serializeMeter(DataOutputStream dos, Meter meter) throws IOException {
++		dos.writeDouble(meter.getRate());
++	}
++
++	//-------------------------------------------------------------------------
++	// Deserialization
++	//-------------------------------------------------------------------------
++	public static class MetricDumpDeserializer {
++		/**
++		 * De-serializes metrics from the given byte array and returns them as a list of {@link MetricDump}.
++		 *
++		 * @param data serialized metrics
++		 * @return A list containing the deserialized metrics.
++		 * @throws IOException
++		 */
++		public List<MetricDump> deserialize(byte[] data) throws IOException {
++			ByteArrayInputStream bais = new ByteArrayInputStream(data);
++			DataInputStream dis = new DataInputStream(bais);
++
++			int numCounters = dis.readInt();
++			int numGauges = dis.readInt();
++			int numHistograms = dis.readInt();
++			int numMeters = dis.readInt();
++
++			List<MetricDump> metrics = new ArrayList<>(numCounters + numGauges + numHistograms);
++
++			for (int x = 0; x < numCounters; x++) {
++				metrics.add(deserializeCounter(dis));
++			}
++
++			for (int x = 0; x < numGauges; x++) {
++				metrics.add(deserializeGauge(dis));
++			}
++
++			for (int x = 0; x < numHistograms; x++) {
++				metrics.add(deserializeHistogram(dis));
++			}
++
++			for (int x = 0; x < numMeters; x++) {
++				metrics.add(deserializeMeter(dis));
++			}
++
++			return metrics;
++		}
++	}
++
++	private static String deserializeString(DataInputStream dis) throws IOException {
++		int stringLength = dis.readInt();
++		byte[] bytes = new byte[stringLength];
++		dis.readFully(bytes);
++		return new String(bytes);
++	}
++
++	private static MetricDump.CounterDump deserializeCounter(DataInputStream dis) throws IOException {
++		QueryScopeInfo scope = deserializeMetricInfo(dis);
++		String name = deserializeString(dis);
++		return new MetricDump.CounterDump(scope, name, dis.readLong());
++	}
++
++	private static MetricDump.GaugeDump deserializeGauge(DataInputStream dis) throws IOException {
++		QueryScopeInfo scope = deserializeMetricInfo(dis);
++		String name = deserializeString(dis);
++		String value = deserializeString(dis);
++		return new MetricDump.GaugeDump(scope, name, value);
++	}
++
++	private static MetricDump.HistogramDump deserializeHistogram(DataInputStream dis) throws IOException {
++		QueryScopeInfo info = deserializeMetricInfo(dis);
++		String name = deserializeString(dis);
++		long min = dis.readLong();
++		long max = dis.readLong();
++		double mean = dis.readDouble();
++		double median = dis.readDouble();
++		double stddev = dis.readDouble();
++		double p75 = dis.readDouble();
++		double p90 = dis.readDouble();
++		double p95 = dis.readDouble();
++		double p98 = dis.readDouble();
++		double p99 = dis.readDouble();
++		double p999 = dis.readDouble();
++		return new MetricDump.HistogramDump(info, name, min, max, mean, median, stddev, p75, p90, p95, p98, p99, p999);
++	}
++
++	private static MetricDump.MeterDump deserializeMeter(DataInputStream dis) throws IOException {
++		QueryScopeInfo info = deserializeMetricInfo(dis);
++		String name = deserializeString(dis);
++		double rate = dis.readDouble();
++		return new MetricDump.MeterDump(info, name, rate);
++	}
++
++	private static QueryScopeInfo deserializeMetricInfo(DataInputStream dis) throws IOException {
++		String jobID;
++		String vertexID;
++		int subtaskIndex;
++
++		String scope = deserializeString(dis);
++		byte cat = dis.readByte();
++		switch (cat) {
++			case INFO_CATEGORY_JM:
++				return new QueryScopeInfo.JobManagerQueryScopeInfo(scope);
++			case INFO_CATEGORY_TM:
++				String tmID = deserializeString(dis);
++				return new QueryScopeInfo.TaskManagerQueryScopeInfo(tmID, scope);
++			case INFO_CATEGORY_JOB:
++				jobID = deserializeString(dis);
++				return new QueryScopeInfo.JobQueryScopeInfo(jobID, scope);
++			case INFO_CATEGORY_TASK:
++				jobID = deserializeString(dis);
++				vertexID = deserializeString(dis);
++				subtaskIndex = dis.readInt();
++				return new QueryScopeInfo.TaskQueryScopeInfo(jobID, vertexID, subtaskIndex, scope);
++			case INFO_CATEGORY_OPERATOR:
++				jobID = deserializeString(dis);
++				vertexID = deserializeString(dis);
++				subtaskIndex = dis.readInt();
++				String operatorName = deserializeString(dis);
++				return new QueryScopeInfo.OperatorQueryScopeInfo(jobID, vertexID, subtaskIndex, operatorName, scope);
++			default:
++				throw new IOException("sup");
++		}
++	}
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricQueryService.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricQueryService.java
+new file mode 100644
+index 0000000000000..6e0b443091231
+--- /dev/null
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/MetricQueryService.java
+@@ -0,0 +1,217 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++import akka.actor.ActorRef;
++import akka.actor.ActorSystem;
++import akka.actor.Props;
++import akka.actor.Status;
++import akka.actor.UntypedActor;
++import org.apache.flink.api.java.tuple.Tuple2;
++import org.apache.flink.metrics.CharacterFilter;
++import org.apache.flink.metrics.Counter;
++import org.apache.flink.metrics.Gauge;
++import org.apache.flink.metrics.Histogram;
++import org.apache.flink.metrics.Meter;
++import org.apache.flink.metrics.Metric;
++import org.apache.flink.runtime.metrics.groups.AbstractMetricGroup;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++import java.io.Serializable;
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.apache.flink.runtime.metrics.dump.MetricDumpSerialization.MetricDumpSerializer;
++
++/**
++ * The MetricQueryService creates a key-value representation of all metrics currently registered with Flink when queried.
++ *
++ * It is realized as an actor and can be notified of
++ * - an added metric by calling {@link MetricQueryService#notifyOfAddedMetric(ActorRef, Metric, String, AbstractMetricGroup)}
++ * - a removed metric by calling {@link MetricQueryService#notifyOfRemovedMetric(ActorRef, Metric)}
++ * - a metric dump request by sending the return value of {@link MetricQueryService#getCreateDump()}
++ */
++public class MetricQueryService extends UntypedActor {
++	private static final Logger LOG = LoggerFactory.getLogger(MetricQueryService.class);
++
++	public static final String METRIC_QUERY_SERVICE_NAME = "MetricQueryService";
++
++	private static final CharacterFilter FILTER = new CharacterFilter() {
++		@Override
++		public String filterCharacters(String input) {
++			return replaceInvalidChars(input);
++		}
++	};
++
++	private final MetricDumpSerializer serializer = new MetricDumpSerializer();
++
++	private final Map<Gauge<?>, Tuple2<QueryScopeInfo, String>> gauges = new HashMap<>();
++	private final Map<Counter, Tuple2<QueryScopeInfo, String>> counters = new HashMap<>();
++	private final Map<Histogram, Tuple2<QueryScopeInfo, String>> histograms = new HashMap<>();
++	private final Map<Meter, Tuple2<QueryScopeInfo, String>> meters = new HashMap<>();
++
++	@Override
++	public void postStop() {
++		serializer.close();
++	}
++
++	@Override
++	public void onReceive(Object message) {
++		try {
++			if (message instanceof AddMetric) {
++				AddMetric added = (AddMetric) message;
++
++				String metricName = added.metricName;
++				Metric metric = added.metric;
++				AbstractMetricGroup group = added.group;
++
++				QueryScopeInfo info = group.getQueryServiceMetricInfo(FILTER);
++
++				if (metric instanceof Counter) {
++					counters.put((Counter) metric, new Tuple2<>(info, FILTER.filterCharacters(metricName)));
++				} else if (metric instanceof Gauge) {
++					gauges.put((Gauge<?>) metric, new Tuple2<>(info, FILTER.filterCharacters(metricName)));
++				} else if (metric instanceof Histogram) {
++					histograms.put((Histogram) metric, new Tuple2<>(info, FILTER.filterCharacters(metricName)));
++				} else if (metric instanceof Meter) {
++					meters.put((Meter) metric, new Tuple2<>(info, FILTER.filterCharacters(metricName)));
++				}
++			} else if (message instanceof RemoveMetric) {
++				Metric metric = (((RemoveMetric) message).metric);
++				if (metric instanceof Counter) {
++					this.counters.remove(metric);
++				} else if (metric instanceof Gauge) {
++					this.gauges.remove(metric);
++				} else if (metric instanceof Histogram) {
++					this.histograms.remove(metric);
++				} else if (metric instanceof Meter) {
++					this.meters.remove(metric);
++				}
++			} else if (message instanceof CreateDump) {
++				byte[] dump = serializer.serialize(counters, gauges, histograms, meters);
++				getSender().tell(dump, getSelf());
++			} else {
++				LOG.warn("MetricQueryServiceActor received an invalid message. " + message.toString());
++				getSender().tell(new Status.Failure(new IOException("MetricQueryServiceActor received an invalid message. " + message.toString())), getSelf());
++			}
++		} catch (Exception e) {
++			LOG.warn("An exception occurred while processing a message.", e);
++		}
++	}
++
++	/**
++	 * Lightweight method to replace unsupported characters.
++	 * If the string does not contain any unsupported characters, this method creates no
++	 * new string (and in fact no new objects at all).
++	 *
++	 * <p>Replacements:
++	 *
++	 * <ul>
++	 *     <li>{@code space : . ,} are replaced by {@code _} (underscore)</li>
++	 * </ul>
++	 */
++	static String replaceInvalidChars(String str) {
++		char[] chars = null;
++		final int strLen = str.length();
++		int pos = 0;
++
++		for (int i = 0; i < strLen; i++) {
++			final char c = str.charAt(i);
++			switch (c) {
++				case ' ':
++				case '.':
++				case ':':
++				case ',':
++					if (chars == null) {
++						chars = str.toCharArray();
++					}
++					chars[pos++] = '_';
++					break;
++				default:
++					if (chars != null) {
++						chars[pos] = c;
++					}
++					pos++;
++			}
++		}
++
++		return chars == null ? str : new String(chars, 0, pos);
++	}
++
++	/**
++	 * Starts the MetricQueryService actor in the given actor system.
++	 *
++	 * @param actorSystem The actor system running the MetricQueryService
++	 * @return actor reference to the MetricQueryService
++	 */
++	public static ActorRef startMetricQueryService(ActorSystem actorSystem) {
++		return actorSystem.actorOf(Props.create(MetricQueryService.class), METRIC_QUERY_SERVICE_NAME);
++	}
++
++	/**
++	 * Utility method to notify a MetricQueryService of an added metric.
++	 *
++	 * @param service    MetricQueryService to notify
++	 * @param metric     added metric
++	 * @param metricName metric name
++	 * @param group      group the metric was added on
++	 */
++	public static void notifyOfAddedMetric(ActorRef service, Metric metric, String metricName, AbstractMetricGroup group) {
++		service.tell(new AddMetric(metricName, metric, group), null);
++	}
++
++	/**
++	 * Utility method to notify a MetricQueryService of a removed metric.
++	 *
++	 * @param service MetricQueryService to notify
++	 * @param metric  removed metric
++	 */
++	public static void notifyOfRemovedMetric(ActorRef service, Metric metric) {
++		service.tell(new RemoveMetric(metric), null);
++	}
++
++	private static class AddMetric {
++		private final String metricName;
++		private final Metric metric;
++		private final AbstractMetricGroup group;
++
++		private AddMetric(String metricName, Metric metric, AbstractMetricGroup group) {
++			this.metricName = metricName;
++			this.metric = metric;
++			this.group = group;
++		}
++	}
++
++	private static class RemoveMetric {
++		private final Metric metric;
++
++		private RemoveMetric(Metric metric) {
++			this.metric = metric;
++		}
++	}
++
++	public static Object getCreateDump() {
++		return CreateDump.INSTANCE;
++	}
++
++	private static class CreateDump implements Serializable {
++		private static CreateDump INSTANCE = new CreateDump();
++	}
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/QueryScopeInfo.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/QueryScopeInfo.java
+new file mode 100644
+index 0000000000000..df5c2bf2fd87e
+--- /dev/null
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/dump/QueryScopeInfo.java
+@@ -0,0 +1,189 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++/**
++ * Container for scope related information as required by the MetricQueryService.
++ */
++public abstract class QueryScopeInfo {
++	/** Categories to be returned by {@link QueryScopeInfo#getCategory()} to avoid instanceof checks. */
++	public static final byte INFO_CATEGORY_JM = 0;
++	public static final byte INFO_CATEGORY_TM = 1;
++	public static final byte INFO_CATEGORY_JOB = 2;
++	public static final byte INFO_CATEGORY_TASK = 3;
++	public static final byte INFO_CATEGORY_OPERATOR = 4;
++
++	/** The remaining scope not covered by specific fields */
++	public final String scope;
++
++	private QueryScopeInfo(String scope) {
++		this.scope = scope;
++	}
++
++	/**
++	 * Create a copy of this QueryScopeInfo and append the given scope.
++	 *
++	 * @param userScope scope to append
++	 * @return modified copy of this QueryScopeInfo
++	 */
++	public abstract QueryScopeInfo copy(String userScope);
++
++	/**
++	 * Returns the category for this QueryScopeInfo.
++	 * 
++	 * @return category
++     */
++	public abstract byte getCategory();
++
++	/**
++	 * Container for the job manager scope. Stores no additional information.
++     */
++	public static class JobManagerQueryScopeInfo extends QueryScopeInfo {
++		public JobManagerQueryScopeInfo() {
++			super("");
++		}
++
++		public JobManagerQueryScopeInfo(String scope) {
++			super(scope);
++		}
++
++		@Override
++		public JobManagerQueryScopeInfo copy(String additionalScope) {
++			return new JobManagerQueryScopeInfo(this.scope + additionalScope);
++		}
++
++		@Override
++		public byte getCategory() {
++			return INFO_CATEGORY_JM;
++		}
++	}
++
++	/**
++	 * Container for the task manager scope. Stores the ID of the task manager.
++     */
++	public static class TaskManagerQueryScopeInfo extends QueryScopeInfo {
++		public final String taskManagerID;
++
++		public TaskManagerQueryScopeInfo(String taskManagerId) {
++			this(taskManagerId, "");
++		}
++
++		public TaskManagerQueryScopeInfo(String taskManagerId, String scope) {
++			super(scope);
++			this.taskManagerID = taskManagerId;
++		}
++
++		@Override
++		public TaskManagerQueryScopeInfo copy(String additionalScope) {
++			return new TaskManagerQueryScopeInfo(this.taskManagerID, this.scope + additionalScope);
++		}
++
++		@Override
++		public byte getCategory() {
++			return INFO_CATEGORY_TM;
++		}
++	}
++
++	/**
++	 * Container for the job scope. Stores the ID of the job.
++     */
++	public static class JobQueryScopeInfo extends QueryScopeInfo {
++		public final String jobID;
++
++		public JobQueryScopeInfo(String jobID) {
++			this(jobID, "");
++		}
++
++		public JobQueryScopeInfo(String jobID, String scope) {
++			super(scope);
++			this.jobID = jobID;
++		}
++
++		@Override
++		public JobQueryScopeInfo copy(String additionalScope) {
++			return new JobQueryScopeInfo(this.jobID, this.scope + additionalScope);
++		}
++
++		@Override
++		public byte getCategory() {
++			return INFO_CATEGORY_JOB;
++		}
++	}
++
++	/**
++	 * Container for the task scope. Stores the ID of the job/vertex and subtask index.
++     */
++	public static class TaskQueryScopeInfo extends QueryScopeInfo {
++		public final String jobID;
++		public final String vertexID;
++		public final int subtaskIndex;
++
++		public TaskQueryScopeInfo(String jobID, String vertexid, int subtaskIndex) {
++			this(jobID, vertexid, subtaskIndex, "");
++		}
++
++		public TaskQueryScopeInfo(String jobID, String vertexid, int subtaskIndex, String scope) {
++			super(scope);
++			this.jobID = jobID;
++			this.vertexID = vertexid;
++			this.subtaskIndex = subtaskIndex;
++		}
++
++		@Override
++		public TaskQueryScopeInfo copy(String additionalScope) {
++			return new TaskQueryScopeInfo(this.jobID, this.vertexID, this.subtaskIndex, this.scope + additionalScope);
++		}
++
++		@Override
++		public byte getCategory() {
++			return INFO_CATEGORY_TASK;
++		}
++	}
++
++	/**
++	 * Container for the operator scope. Stores the ID of the job/vertex, the subtask index and the name of the operator.
++     */
++	public static class OperatorQueryScopeInfo extends QueryScopeInfo {
++		public final String jobID;
++		public final String vertexID;
++		public final int subtaskIndex;
++		public final String operatorName;
++
++		public OperatorQueryScopeInfo(String jobID, String vertexid, int subtaskIndex, String operatorName) {
++			this(jobID, vertexid, subtaskIndex, operatorName, "");
++		}
++
++		public OperatorQueryScopeInfo(String jobID, String vertexid, int subtaskIndex, String operatorName, String scope) {
++			super(scope);
++			this.jobID = jobID;
++			this.vertexID = vertexid;
++			this.subtaskIndex = subtaskIndex;
++			this.operatorName = operatorName;
++		}
++
++		@Override
++		public OperatorQueryScopeInfo copy(String additionalScope) {
++			return new OperatorQueryScopeInfo(this.jobID, this.vertexID, this.subtaskIndex, this.operatorName, this.scope + additionalScope);
++		}
++
++		@Override
++		public byte getCategory() {
++			return INFO_CATEGORY_OPERATOR;
++		}
++	}
++}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroup.java
+index 89fe3cde069eb..d9338ec4d1be7 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroup.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
+ import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.metrics.Counter;
+ import org.apache.flink.metrics.Gauge;
+@@ -27,6 +28,7 @@
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.metrics.SimpleCounter;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -56,6 +58,7 @@
+  * 
+  * @param <A> The type of the parent MetricGroup
+  */
++@Internal
+ public abstract class AbstractMetricGroup<A extends AbstractMetricGroup<?>> implements MetricGroup {
+ 
+ 	/** shared logger */
+@@ -86,6 +89,9 @@
+ 	 * For example: "host-7.taskmanager-2.window_word_count.my-mapper" */
+ 	private String scopeString;
+ 
++	/** The metrics query service scope represented by this group, lazily computed. */
++	protected QueryScopeInfo queryServiceScopeInfo;
++
+ 	/** Flag indicating whether this group has been closed */
+ 	private volatile boolean closed;
+ 
+@@ -122,6 +128,27 @@ public String[] getScopeComponents() {
+ 		return scopeComponents;
+ 	}
+ 
++	/**
++	 * Returns the metric query service scope for this group.
++	 * 
++	 * @param filter character filter
++	 * @return query service scope
++     */
++	public QueryScopeInfo getQueryServiceMetricInfo(CharacterFilter filter) {
++		if (queryServiceScopeInfo == null) {
++			queryServiceScopeInfo = createQueryServiceMetricInfo(filter);
++		}
++		return queryServiceScopeInfo;
++	}
++
++	/**
++	 * Creates the metric query service scope for this group.
++	 *
++	 * @param filter character filter
++	 * @return query service scope
++     */
++	protected abstract QueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter);
++
+ 	/**
+ 	 * Returns the fully qualified metric name, for example
+ 	 * {@code "host-7.taskmanager-2.window_word_count.my-mapper.metricName"}
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/ComponentMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/ComponentMetricGroup.java
+index 9a93fbdd3a90e..9f0f4838dd7a2 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/ComponentMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/ComponentMetricGroup.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
+ 
+ import java.util.HashMap;
+@@ -38,6 +39,7 @@
+  * 
+  * @param <P> The type of the parent MetricGroup.
+  */
++@Internal
+ public abstract class ComponentMetricGroup<P extends AbstractMetricGroup<?>> extends AbstractMetricGroup<P> {
+ 
+ 	/**
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/GenericMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/GenericMetricGroup.java
+index 569ad0f3fdd20..54fbed46765bd 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/GenericMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/GenericMetricGroup.java
+@@ -18,16 +18,28 @@
+ 
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ 
+ /**
+  * A simple named {@link org.apache.flink.metrics.MetricGroup} that is used to hold
+  * subgroups of metrics.
+  */
++@Internal
+ public class GenericMetricGroup extends AbstractMetricGroup<AbstractMetricGroup<?>> {
++	/** The name of this group */
++	private String name;
+ 
+ 	public GenericMetricGroup(MetricRegistry registry, AbstractMetricGroup parent, String name) {
+ 		super(registry, makeScopeComponents(parent, name), parent);
++		this.name = name;
++	}
++
++	@Override
++	protected QueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++		return parent.getQueryServiceMetricInfo(filter).copy(filter.filterCharacters(this.name));
+ 	}
+ 
+ 	// ------------------------------------------------------------------------
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerJobMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerJobMetricGroup.java
+index 9d384d8fcbf9f..c4902e8dc7545 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerJobMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerJobMetricGroup.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
+ import org.apache.flink.api.common.JobID;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
+ 
+@@ -29,6 +30,7 @@
+  * Special {@link org.apache.flink.metrics.MetricGroup} representing everything belonging to
+  * a specific job, running on the JobManager.
+  */
++@Internal
+ public class JobManagerJobMetricGroup extends JobMetricGroup<JobManagerMetricGroup> {
+ 	public JobManagerJobMetricGroup(
+ 			MetricRegistry registry,
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerMetricGroup.java
+index da0d8f82204c4..2f6b07a9d6a04 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobManagerMetricGroup.java
+@@ -18,8 +18,10 @@
+ package org.apache.flink.runtime.metrics.groups;
+ 
+ import org.apache.flink.api.common.JobID;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.runtime.jobgraph.JobGraph;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+ 
+ import java.util.HashMap;
+@@ -46,6 +48,11 @@ public String hostname() {
+ 		return hostname;
+ 	}
+ 
++	@Override
++	protected QueryScopeInfo.JobManagerQueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++		return new QueryScopeInfo.JobManagerQueryScopeInfo();
++	}
++
+ 	// ------------------------------------------------------------------------
+ 	//  job groups
+ 	// ------------------------------------------------------------------------
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobMetricGroup.java
+index e101d2fc2e19c..091807f5bcc71 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/JobMetricGroup.java
+@@ -20,7 +20,9 @@
+ 
+ import org.apache.flink.annotation.Internal;
+ import org.apache.flink.api.common.JobID;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+ 
+ import javax.annotation.Nullable;
+@@ -65,6 +67,11 @@ public String jobName() {
+ 		return jobName;
+ 	}
+ 
++	@Override
++	protected QueryScopeInfo.JobQueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++		return new QueryScopeInfo.JobQueryScopeInfo(this.jobId.toString());
++	}
++
+ 	// ------------------------------------------------------------------------
+ 	//  Component Metric Group Specifics
+ 	// ------------------------------------------------------------------------
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/OperatorMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/OperatorMetricGroup.java
+index 9352faf2df38c..f1354b577d217 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/OperatorMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/OperatorMetricGroup.java
+@@ -18,7 +18,10 @@
+ 
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+ 
+ import java.util.Collections;
+@@ -29,6 +32,7 @@
+ /**
+  * Special {@link org.apache.flink.metrics.MetricGroup} representing an Operator.
+  */
++@Internal
+ public class OperatorMetricGroup extends ComponentMetricGroup<TaskMetricGroup> {
+ 	private final String operatorName;
+ 
+@@ -42,6 +46,15 @@ public OperatorMetricGroup(MetricRegistry registry, TaskMetricGroup parent, Stri
+ 	public final TaskMetricGroup parent() {
+ 		return parent;
+ 	}
++
++	@Override
++	protected QueryScopeInfo.OperatorQueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++		return new QueryScopeInfo.OperatorQueryScopeInfo(
++			this.parent.parent.jobId.toString(),
++			this.parent.vertexId.toString(),
++			this.parent.subtaskIndex,
++			filter.filterCharacters(this.operatorName));
++	}
+ 	
+ 	// ------------------------------------------------------------------------
+ 	//  Component Metric Group Specifics
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobMetricGroup.java
+index 1f852c72bdca9..3961c14503373 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobMetricGroup.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
+ import org.apache.flink.api.common.JobID;
+ import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
+@@ -34,6 +35,7 @@
+  *
+  * <p>Contains extra logic for adding Tasks ({@link TaskMetricGroup}).
+  */
++@Internal
+ public class TaskManagerJobMetricGroup extends JobMetricGroup<TaskManagerMetricGroup> {
+ 
+ 	/** Map from execution attempt ID (task identifier) to task metrics */
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerMetricGroup.java
+index 8f81cfdb543da..a8fa82825610a 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskManagerMetricGroup.java
+@@ -18,9 +18,12 @@
+ 
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
+ import org.apache.flink.api.common.JobID;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+ 
+ import java.util.HashMap;
+@@ -32,6 +35,7 @@
+  * <p>Contains extra logic for adding jobs with tasks, and removing jobs when they do
+  * not contain tasks any more
+  */
++@Internal
+ public class TaskManagerMetricGroup extends ComponentMetricGroup<TaskManagerMetricGroup> {
+ 
+ 	private final Map<JobID, TaskManagerJobMetricGroup> jobs = new HashMap<>();
+@@ -55,6 +59,11 @@ public String taskManagerId() {
+ 		return taskManagerId;
+ 	}
+ 
++	@Override
++	protected QueryScopeInfo.TaskManagerQueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++		return new QueryScopeInfo.TaskManagerQueryScopeInfo(this.taskManagerId);
++	}
++
+ 	// ------------------------------------------------------------------------
+ 	//  job groups
+ 	// ------------------------------------------------------------------------
+diff --git a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroup.java b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroup.java
+index 78fec97e704a2..5082fd81d913f 100644
+--- a/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroup.java
++++ b/flink-runtime/src/main/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroup.java
+@@ -18,7 +18,10 @@
+ 
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.annotation.Internal;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
+ import org.apache.flink.util.AbstractID;
+ 
+@@ -33,6 +36,7 @@
+  * 
+  * <p>Contains extra logic for adding operators.
+  */
++@Internal
+ public class TaskMetricGroup extends ComponentMetricGroup<TaskManagerJobMetricGroup> {
+ 
+ 	private final Map<String, OperatorMetricGroup> operators = new HashMap<>();
+@@ -43,12 +47,12 @@ public class TaskMetricGroup extends ComponentMetricGroup<TaskManagerJobMetricGr
+ 	private final AbstractID executionId;
+ 
+ 	@Nullable
+-	private final AbstractID vertexId;
++	protected final AbstractID vertexId;
+ 	
+ 	@Nullable
+ 	private final String taskName;
+ 
+-	private final int subtaskIndex;
++	protected final int subtaskIndex;
+ 
+ 	private final int attemptNumber;
+ 
+@@ -113,6 +117,14 @@ public IOMetricGroup getIOMetricGroup() {
+ 		return ioMetrics;
+ 	}
+ 
++	@Override
++	protected QueryScopeInfo.TaskQueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++		return new QueryScopeInfo.TaskQueryScopeInfo(
++			this.parent.jobId.toString(),
++			this.vertexId.toString(),
++			this.subtaskIndex);
++	}
++
+ 	// ------------------------------------------------------------------------
+ 	//  operators and cleanup
+ 	// ------------------------------------------------------------------------
+diff --git a/flink-runtime/src/main/scala/org/apache/flink/runtime/jobmanager/JobManager.scala b/flink-runtime/src/main/scala/org/apache/flink/runtime/jobmanager/JobManager.scala
+index f67be0ed370b2..1c68874df88c5 100644
+--- a/flink-runtime/src/main/scala/org/apache/flink/runtime/jobmanager/JobManager.scala
++++ b/flink-runtime/src/main/scala/org/apache/flink/runtime/jobmanager/JobManager.scala
+@@ -2750,6 +2750,12 @@ object JobManager {
+       case Some(actorName) => actorSystem.actorOf(jobManagerProps, actorName)
+       case None => actorSystem.actorOf(jobManagerProps)
+     }
++    
++    metricsRegistry match {
++      case Some(registry) =>
++        registry.startQueryService(actorSystem)
++      case None =>
++    }
+ 
+     (jobManager, archive)
+   }
+diff --git a/flink-runtime/src/main/scala/org/apache/flink/runtime/minicluster/LocalFlinkMiniCluster.scala b/flink-runtime/src/main/scala/org/apache/flink/runtime/minicluster/LocalFlinkMiniCluster.scala
+index cac5d91716cb0..27c9dd91faba0 100644
+--- a/flink-runtime/src/main/scala/org/apache/flink/runtime/minicluster/LocalFlinkMiniCluster.scala
++++ b/flink-runtime/src/main/scala/org/apache/flink/runtime/minicluster/LocalFlinkMiniCluster.scala
+@@ -203,7 +203,8 @@ class LocalFlinkMiniCluster(
+     memoryManager,
+     ioManager,
+     network,
+-    leaderRetrievalService) = TaskManager.createTaskManagerComponents(
++    leaderRetrievalService,
++    metricsRegistry) = TaskManager.createTaskManagerComponents(
+       config,
+       resourceID,
+       hostname, // network interface to bind to
+@@ -218,7 +219,10 @@ class LocalFlinkMiniCluster(
+       memoryManager,
+       ioManager,
+       network,
+-      leaderRetrievalService)
++      leaderRetrievalService,
++      metricsRegistry)
++
++    metricsRegistry.startQueryService(system)
+ 
+     system.actorOf(props, taskManagerActorName)
+   }
+@@ -274,7 +278,8 @@ class LocalFlinkMiniCluster(
+     memoryManager: MemoryManager,
+     ioManager: IOManager,
+     networkEnvironment: NetworkEnvironment,
+-    leaderRetrievalService: LeaderRetrievalService): Props = {
++    leaderRetrievalService: LeaderRetrievalService,
++    metricsRegistry: MetricRegistry): Props = {
+ 
+     TaskManager.getTaskManagerProps(
+       taskManagerClass,
+@@ -284,7 +289,8 @@ class LocalFlinkMiniCluster(
+       memoryManager,
+       ioManager,
+       networkEnvironment,
+-      leaderRetrievalService)
++      leaderRetrievalService,
++      metricsRegistry)
+   }
+ 
+   def getResourceManagerProps(
+diff --git a/flink-runtime/src/main/scala/org/apache/flink/runtime/taskmanager/TaskManager.scala b/flink-runtime/src/main/scala/org/apache/flink/runtime/taskmanager/TaskManager.scala
+index 8ebdd803bd9af..c882631958fb6 100644
+--- a/flink-runtime/src/main/scala/org/apache/flink/runtime/taskmanager/TaskManager.scala
++++ b/flink-runtime/src/main/scala/org/apache/flink/runtime/taskmanager/TaskManager.scala
+@@ -132,7 +132,8 @@ class TaskManager(
+     protected val ioManager: IOManager,
+     protected val network: NetworkEnvironment,
+     protected val numberOfSlots: Int,
+-    protected val leaderRetrievalService: LeaderRetrievalService)
++    protected val leaderRetrievalService: LeaderRetrievalService,
++    protected val metricsRegistry: FlinkMetricRegistry)
+   extends FlinkActor
+   with LeaderSessionMessageFilter // Mixin order is important: We want to filter after logging
+   with LogMessages // Mixin order is important: first we want to support message logging
+@@ -158,7 +159,6 @@ class TaskManager(
+   /** Registry of metrics periodically transmitted to the JobManager */
+   private val metricRegistry = TaskManager.createMetricsRegistry()
+ 
+-  private var metricsRegistry : FlinkMetricRegistry = _
+   private var taskManagerMetricGroup : TaskManagerMetricGroup = _
+ 
+   /** Metric serialization */
+@@ -276,11 +276,7 @@ class TaskManager(
+     
+     // failsafe shutdown of the metrics registry
+     try {
+-      val reg = metricsRegistry
+-      metricsRegistry = null
+-      if (reg != null) {
+-        reg.shutdown()
+-      }
++      metricsRegistry.shutdown()
+     } catch {
+       case t: Exception => log.error("MetricRegistry did not shutdown properly.", t)
+     }
+@@ -985,8 +981,6 @@ class TaskManager(
+     else {
+       libraryCacheManager = Some(new FallbackLibraryCacheManager)
+     }
+-
+-    metricsRegistry = new FlinkMetricRegistry(config.configuration)
+     
+     taskManagerMetricGroup = 
+       new TaskManagerMetricGroup(metricsRegistry, this.runtimeInfo.getHostname, id.toString)
+@@ -1064,9 +1058,12 @@ class TaskManager(
+       network.getKvStateRegistry.unregisterListener()
+     }
+     
+-    // stop the metrics reporters
+-    metricsRegistry.shutdown()
+-    metricsRegistry = null
++    // failsafe shutdown of the metrics registry
++    try {
++      metricsRegistry.shutdown()
++    } catch {
++      case t: Exception => log.error("MetricRegistry did not shutdown properly.", t)
++    }
+   }
+ 
+   protected def handleJobManagerDisconnect(jobManager: ActorRef, msg: String): Unit = {
+@@ -1849,7 +1846,8 @@ object TaskManager {
+       memoryManager,
+       ioManager,
+       network,
+-      leaderRetrievalService) = createTaskManagerComponents(
++      leaderRetrievalService,
++      metricsRegistry) = createTaskManagerComponents(
+       configuration,
+       resourceID,
+       taskManagerHostname,
+@@ -1865,7 +1863,10 @@ object TaskManager {
+       memoryManager,
+       ioManager,
+       network,
+-      leaderRetrievalService)
++      leaderRetrievalService,
++      metricsRegistry)
++
++    metricsRegistry.startQueryService(actorSystem)
+ 
+     taskManagerActorName match {
+       case Some(actorName) => actorSystem.actorOf(tmProps, actorName)
+@@ -1881,7 +1882,8 @@ object TaskManager {
+     memoryManager: MemoryManager,
+     ioManager: IOManager,
+     networkEnvironment: NetworkEnvironment,
+-    leaderRetrievalService: LeaderRetrievalService
++    leaderRetrievalService: LeaderRetrievalService,
++    metricsRegistry: FlinkMetricRegistry
+   ): Props = {
+     Props(
+       taskManagerClass,
+@@ -1892,7 +1894,8 @@ object TaskManager {
+       ioManager,
+       networkEnvironment,
+       taskManagerConfig.numberOfSlots,
+-      leaderRetrievalService)
++      leaderRetrievalService,
++      metricsRegistry)
+   }
+ 
+   def createTaskManagerComponents(
+@@ -1906,7 +1909,8 @@ object TaskManager {
+       MemoryManager,
+       IOManager,
+       NetworkEnvironment,
+-      LeaderRetrievalService) = {
++      LeaderRetrievalService,
++      FlinkMetricRegistry) = {
+ 
+     val (taskManagerConfig : TaskManagerConfiguration,
+     netConfig: NetworkEnvironmentConfiguration,
+@@ -2081,12 +2085,15 @@ object TaskManager {
+       case None => LeaderRetrievalUtils.createLeaderRetrievalService(configuration)
+     }
+ 
++    val metricsRegistry = new FlinkMetricRegistry(configuration)
++
+     (taskManagerConfig,
+       taskManagerLocation,
+       memoryManager,
+       ioManager,
+       network,
+-      leaderRetrievalService)
++      leaderRetrievalService,
++      metricsRegistry)
+   }
+ 
+ 
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricDumpSerializerTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricDumpSerializerTest.java
+new file mode 100644
+index 0000000000000..bc0f005715a8d
+--- /dev/null
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricDumpSerializerTest.java
+@@ -0,0 +1,178 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++import org.apache.flink.api.java.tuple.Tuple2;
++import org.apache.flink.metrics.Counter;
++import org.apache.flink.metrics.Gauge;
++import org.apache.flink.metrics.Histogram;
++import org.apache.flink.metrics.Meter;
++import org.apache.flink.metrics.SimpleCounter;
++import org.apache.flink.runtime.metrics.util.TestingHistogram;
++import org.junit.Test;
++
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_COUNTER;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_GAUGE;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_HISTOGRAM;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_METER;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++
++public class MetricDumpSerializerTest {
++	@Test
++	public void testSerialization() throws IOException {
++		MetricDumpSerialization.MetricDumpSerializer serializer = new MetricDumpSerialization.MetricDumpSerializer();
++		MetricDumpSerialization.MetricDumpDeserializer deserializer = new MetricDumpSerialization.MetricDumpDeserializer();
++
++		Map<Counter, Tuple2<QueryScopeInfo, String>> counters = new HashMap<>();
++		Map<Gauge<?>, Tuple2<QueryScopeInfo, String>> gauges = new HashMap<>();
++		Map<Histogram, Tuple2<QueryScopeInfo, String>> histograms = new HashMap<>();
++		Map<Meter, Tuple2<QueryScopeInfo, String>> meters = new HashMap<>();
++
++		SimpleCounter c1 = new SimpleCounter();
++		SimpleCounter c2 = new SimpleCounter();
++		SimpleCounter c3 = new SimpleCounter();
++
++		c1.inc(1);
++		c2.inc(2);
++
++		Gauge<Integer> g1 = new Gauge<Integer>() {
++			@Override
++			public Integer getValue() {
++				return 4;
++			}
++		};
++
++		Histogram h1 = new TestingHistogram();
++
++		Meter m1 = new Meter() {
++			@Override
++			public void markEvent() {
++			}
++
++			@Override
++			public void markEvent(long n) {
++			}
++
++			@Override
++			public double getRate() {
++				return 5;
++			}
++
++			@Override
++			public long getCount() {
++				return 10;
++			}
++		};
++
++		counters.put(c1, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.JobManagerQueryScopeInfo("A"), "c1"));
++		counters.put(c2, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.TaskManagerQueryScopeInfo("tmid", "B"), "c2"));
++		meters.put(m1, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.JobQueryScopeInfo("jid", "C"), "c3"));
++		gauges.put(g1, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.TaskQueryScopeInfo("jid", "vid", 2, "D"), "g1"));
++		histograms.put(h1, new Tuple2<QueryScopeInfo, String>(new QueryScopeInfo.OperatorQueryScopeInfo("jid", "vid", 2, "opname", "E"), "h1"));
++
++		byte[] serialized = serializer.serialize(counters, gauges, histograms, meters);
++		List<MetricDump> deserialized = deserializer.deserialize(serialized);
++
++		// ===== Counters ==============================================================================================
++		assertEquals(5, deserialized.size());
++
++		for (MetricDump metric : deserialized) {
++			switch (metric.getCategory()) {
++				case METRIC_CATEGORY_COUNTER:
++					MetricDump.CounterDump counterDump = (MetricDump.CounterDump) metric;
++					switch ((byte) counterDump.count) {
++						case 1:
++							assertTrue(counterDump.scopeInfo instanceof QueryScopeInfo.JobManagerQueryScopeInfo);
++							assertEquals("A", counterDump.scopeInfo.scope);
++							assertEquals("c1", counterDump.name);
++							counters.remove(c1);
++							break;
++						case 2:
++							assertTrue(counterDump.scopeInfo instanceof QueryScopeInfo.TaskManagerQueryScopeInfo);
++							assertEquals("B", counterDump.scopeInfo.scope);
++							assertEquals("c2", counterDump.name);
++							assertEquals("tmid", ((QueryScopeInfo.TaskManagerQueryScopeInfo) counterDump.scopeInfo).taskManagerID);
++							counters.remove(c2);
++							break;
++						default:
++							fail();
++					}
++					break;
++				case METRIC_CATEGORY_GAUGE:
++					MetricDump.GaugeDump gaugeDump = (MetricDump.GaugeDump) metric;
++					assertEquals("4", gaugeDump.value);
++					assertEquals("g1", gaugeDump.name);
++
++					assertTrue(gaugeDump.scopeInfo instanceof QueryScopeInfo.TaskQueryScopeInfo);
++					QueryScopeInfo.TaskQueryScopeInfo taskInfo = (QueryScopeInfo.TaskQueryScopeInfo) gaugeDump.scopeInfo;
++					assertEquals("D", taskInfo.scope);
++					assertEquals("jid", taskInfo.jobID);
++					assertEquals("vid", taskInfo.vertexID);
++					assertEquals(2, taskInfo.subtaskIndex);
++					gauges.remove(g1);
++					break;
++				case METRIC_CATEGORY_HISTOGRAM:
++					MetricDump.HistogramDump histogramDump = (MetricDump.HistogramDump) metric;
++					assertEquals("h1", histogramDump.name);
++					assertEquals(0.5, histogramDump.median, 0.1);
++					assertEquals(0.75, histogramDump.p75, 0.1);
++					assertEquals(0.90, histogramDump.p90, 0.1);
++					assertEquals(0.95, histogramDump.p95, 0.1);
++					assertEquals(0.98, histogramDump.p98, 0.1);
++					assertEquals(0.99, histogramDump.p99, 0.1);
++					assertEquals(0.999, histogramDump.p999, 0.1);
++					assertEquals(4, histogramDump.mean, 0.1);
++					assertEquals(5, histogramDump.stddev, 0.1);
++					assertEquals(6, histogramDump.max);
++					assertEquals(7, histogramDump.min);
++
++					assertTrue(histogramDump.scopeInfo instanceof QueryScopeInfo.OperatorQueryScopeInfo);
++					QueryScopeInfo.OperatorQueryScopeInfo opInfo = (QueryScopeInfo.OperatorQueryScopeInfo) histogramDump.scopeInfo;
++					assertEquals("E", opInfo.scope);
++					assertEquals("jid", opInfo.jobID);
++					assertEquals("vid", opInfo.vertexID);
++					assertEquals(2, opInfo.subtaskIndex);
++					assertEquals("opname", opInfo.operatorName);
++					histograms.remove(h1);
++					break;
++				case METRIC_CATEGORY_METER:
++					MetricDump.MeterDump meterDump = (MetricDump.MeterDump) metric;
++					assertEquals(5.0, meterDump.rate, 0.1);
++
++					assertTrue(meterDump.scopeInfo instanceof QueryScopeInfo.JobQueryScopeInfo);
++					assertEquals("C", meterDump.scopeInfo.scope);
++					assertEquals("c3", meterDump.name);
++					assertEquals("jid", ((QueryScopeInfo.JobQueryScopeInfo) meterDump.scopeInfo).jobID);
++					break;
++				default:
++					fail();
++			}
++		}
++		assertTrue(counters.isEmpty());
++		assertTrue(gauges.isEmpty());
++		assertTrue(histograms.isEmpty());
++	}
++}
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricDumpTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricDumpTest.java
+new file mode 100644
+index 0000000000000..3b65184ae5590
+--- /dev/null
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricDumpTest.java
+@@ -0,0 +1,86 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++import org.junit.Test;
++
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_COUNTER;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_GAUGE;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_HISTOGRAM;
++import static org.apache.flink.runtime.metrics.dump.MetricDump.METRIC_CATEGORY_METER;
++import static org.junit.Assert.assertEquals;
++
++public class MetricDumpTest {
++	@Test
++	public void testDumpedCounter() {
++		QueryScopeInfo info = new QueryScopeInfo.JobManagerQueryScopeInfo();
++
++		MetricDump.CounterDump cd = new MetricDump.CounterDump(info, "counter", 4);
++
++		assertEquals("counter", cd.name);
++		assertEquals(4, cd.count);
++		assertEquals(info, cd.scopeInfo);
++		assertEquals(METRIC_CATEGORY_COUNTER, cd.getCategory());
++	}
++
++	@Test
++	public void testDumpedGauge() {
++		QueryScopeInfo info = new QueryScopeInfo.JobManagerQueryScopeInfo();
++
++		MetricDump.GaugeDump gd = new MetricDump.GaugeDump(info, "gauge", "hello");
++
++		assertEquals("gauge", gd.name);
++		assertEquals("hello", gd.value);
++		assertEquals(info, gd.scopeInfo);
++		assertEquals(METRIC_CATEGORY_GAUGE, gd.getCategory());
++	}
++
++	@Test
++	public void testDumpedHistogram() {
++		QueryScopeInfo info = new QueryScopeInfo.JobManagerQueryScopeInfo();
++
++		MetricDump.HistogramDump hd = new MetricDump.HistogramDump(info, "hist", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
++
++		assertEquals("hist", hd.name);
++		assertEquals(1, hd.min);
++		assertEquals(2, hd.max);
++		assertEquals(3, hd.mean, 0.1);
++		assertEquals(4, hd.median, 0.1);
++		assertEquals(5, hd.stddev, 0.1);
++		assertEquals(6, hd.p75, 0.1);
++		assertEquals(7, hd.p90, 0.1);
++		assertEquals(8, hd.p95, 0.1);
++		assertEquals(9, hd.p98, 0.1);
++		assertEquals(10, hd.p99, 0.1);
++		assertEquals(11, hd.p999, 0.1);
++		assertEquals(info, hd.scopeInfo);
++		assertEquals(METRIC_CATEGORY_HISTOGRAM, hd.getCategory());
++	}
++
++	@Test
++	public void testDumpedMeter() {
++		QueryScopeInfo info = new QueryScopeInfo.JobManagerQueryScopeInfo();
++
++		MetricDump.MeterDump md = new MetricDump.MeterDump(info, "meter", 5.0);
++
++		assertEquals("meter", md.name);
++		assertEquals(5.0, md.rate, 0.1);
++		assertEquals(info, md.scopeInfo);
++		assertEquals(METRIC_CATEGORY_METER, md.getCategory());
++	}
++}
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricQueryServiceTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricQueryServiceTest.java
+new file mode 100644
+index 0000000000000..91563ecbe89be
+--- /dev/null
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/MetricQueryServiceTest.java
+@@ -0,0 +1,133 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++import akka.actor.ActorRef;
++import akka.actor.ActorSystem;
++import akka.actor.Props;
++import akka.actor.UntypedActor;
++import akka.testkit.TestActorRef;
++import org.apache.flink.configuration.Configuration;
++import org.apache.flink.metrics.Counter;
++import org.apache.flink.metrics.Gauge;
++import org.apache.flink.metrics.Histogram;
++import org.apache.flink.metrics.Meter;
++import org.apache.flink.metrics.SimpleCounter;
++import org.apache.flink.runtime.akka.AkkaUtils;
++import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.groups.TaskManagerMetricGroup;
++import org.apache.flink.runtime.metrics.util.TestingHistogram;
++import org.apache.flink.util.TestLogger;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++public class MetricQueryServiceTest extends TestLogger {
++	@Test
++	public void testCreateDump() throws Exception {
++
++		ActorSystem s = AkkaUtils.createLocalActorSystem(new Configuration());
++		ActorRef serviceActor = MetricQueryService.startMetricQueryService(s);
++		TestActorRef testActorRef = TestActorRef.create(s, Props.create(TestActor.class));
++		TestActor testActor = (TestActor) testActorRef.underlyingActor();
++
++		final Counter c = new SimpleCounter();
++		final Gauge<String> g = new Gauge<String>() {
++			@Override
++			public String getValue() {
++				return "Hello";
++			}
++		};
++		final Histogram h = new TestingHistogram();
++		final Meter m = new Meter() {
++
++			@Override
++			public void markEvent() {
++			}
++
++			@Override
++			public void markEvent(long n) {
++			}
++
++			@Override
++			public double getRate() {
++				return 5;
++			}
++
++			@Override
++			public long getCount() {
++				return 10;
++			}
++		};
++
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		final TaskManagerMetricGroup tm = new TaskManagerMetricGroup(registry, "host", "id");
++
++		MetricQueryService.notifyOfAddedMetric(serviceActor, c, "counter", tm);
++		MetricQueryService.notifyOfAddedMetric(serviceActor, g, "gauge", tm);
++		MetricQueryService.notifyOfAddedMetric(serviceActor, h, "histogram", tm);
++		MetricQueryService.notifyOfAddedMetric(serviceActor, m, "meter", tm);
++
++		// these metrics will be removed *after* the first query
++		MetricQueryService.notifyOfRemovedMetric(serviceActor, c);
++		MetricQueryService.notifyOfRemovedMetric(serviceActor, g);
++		MetricQueryService.notifyOfRemovedMetric(serviceActor, h);
++		MetricQueryService.notifyOfRemovedMetric(serviceActor, m);
++
++		serviceActor.tell(MetricQueryService.getCreateDump(), testActorRef);
++		synchronized (testActor.lock) {
++			if (testActor.message == null) {
++				testActor.lock.wait();
++			}
++		}
++
++		byte[] dump = (byte[]) testActor.message;
++		testActor.message = null;
++		assertTrue(dump.length > 0);
++
++		serviceActor.tell(MetricQueryService.getCreateDump(), testActorRef);
++		synchronized (testActor.lock) {
++			if (testActor.message == null) {
++				testActor.lock.wait();
++			}
++		}
++
++		byte[] emptyDump = (byte[]) testActor.message;
++		testActor.message = null;
++		assertEquals(16, emptyDump.length);
++		for (int x = 0; x < 16; x++) {
++			assertEquals(0, emptyDump[x]);
++		}
++
++		s.shutdown();
++	}
++
++	private static class TestActor extends UntypedActor {
++		public Object message;
++		public Object lock = new Object();
++
++		@Override
++		public void onReceive(Object message) throws Exception {
++			synchronized (lock) {
++				this.message = message;
++				lock.notifyAll();
++			}
++		}
++	}
++}
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/QueryScopeInfoTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/QueryScopeInfoTest.java
+new file mode 100644
+index 0000000000000..597e376a5fbc4
+--- /dev/null
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/dump/QueryScopeInfoTest.java
+@@ -0,0 +1,73 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.dump;
++
++import org.junit.Test;
++
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_JM;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_JOB;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_OPERATOR;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_TASK;
++import static org.apache.flink.runtime.metrics.dump.QueryScopeInfo.INFO_CATEGORY_TM;
++import static org.junit.Assert.assertEquals;
++
++public class QueryScopeInfoTest {
++	@Test
++	public void testJobManagerMetricInfo() {
++		QueryScopeInfo.JobManagerQueryScopeInfo info = new QueryScopeInfo.JobManagerQueryScopeInfo("abc");
++		assertEquals("abc", info.scope);
++		assertEquals(INFO_CATEGORY_JM, info.getCategory());
++	}
++
++	@Test
++	public void testTaskManagerMetricInfo() {
++		QueryScopeInfo.TaskManagerQueryScopeInfo info = new QueryScopeInfo.TaskManagerQueryScopeInfo("tmid", "abc");
++		assertEquals("abc", info.scope);
++		assertEquals("tmid", info.taskManagerID);
++		assertEquals(INFO_CATEGORY_TM, info.getCategory());
++	}
++
++	@Test
++	public void testJobMetricInfo() {
++		QueryScopeInfo.JobQueryScopeInfo info = new QueryScopeInfo.JobQueryScopeInfo("jobid", "abc");
++		assertEquals("abc", info.scope);
++		assertEquals("jobid", info.jobID);
++		assertEquals(INFO_CATEGORY_JOB, info.getCategory());
++	}
++
++	@Test
++	public void testTaskMetricInfo() {
++		QueryScopeInfo.TaskQueryScopeInfo info = new QueryScopeInfo.TaskQueryScopeInfo("jid", "vid", 2, "abc");
++		assertEquals("abc", info.scope);
++		assertEquals("jid", info.jobID);
++		assertEquals("vid", info.vertexID);
++		assertEquals(2, info.subtaskIndex);
++		assertEquals(INFO_CATEGORY_TASK, info.getCategory());
++	}
++
++	@Test
++	public void testOperatorMetricInfo() {
++		QueryScopeInfo.OperatorQueryScopeInfo info = new QueryScopeInfo.OperatorQueryScopeInfo("jid", "vid", 2, "opname", "abc");
++		assertEquals("abc", info.scope);
++		assertEquals("jid", info.jobID);
++		assertEquals("vid", info.vertexID);
++		assertEquals("opname", info.operatorName);
++		assertEquals(2, info.subtaskIndex);
++		assertEquals(INFO_CATEGORY_OPERATOR, info.getCategory());
++	}
++}
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroupTest.java
+index d9b1ebe3550da..78aac6423363a 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/AbstractMetricGroupTest.java
+@@ -18,7 +18,9 @@
+ package org.apache.flink.runtime.metrics.groups;
+ 
+ import org.apache.flink.configuration.Configuration;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertTrue;
+@@ -33,6 +35,10 @@ public void testGetAllVariables() {
+ 		MetricRegistry registry = new MetricRegistry(new Configuration());
+ 
+ 		AbstractMetricGroup group = new AbstractMetricGroup<AbstractMetricGroup<?>>(registry, new String[0], null) {
++			@Override
++			protected QueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++				return null;
++			}
+ 		};
+ 		assertTrue(group.getAllVariables().isEmpty());
+ 		
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerGroupTest.java
+index faf42ea7aa5f6..1b9b24f9c76af 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerGroupTest.java
+@@ -22,13 +22,16 @@
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.runtime.jobgraph.JobGraph;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
++import org.apache.flink.util.TestLogger;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ 
+-public class JobManagerGroupTest {
++public class JobManagerGroupTest extends TestLogger {
+ 
+ 	// ------------------------------------------------------------------------
+ 	//  adding and removing jobs
+@@ -116,4 +119,13 @@ public void testGenerateScopeCustom() {
+ 
+ 		registry.shutdown();
+ 	}
++
++	@Test
++	public void testCreateQueryServiceMetricInfo() {
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		JobManagerMetricGroup jm = new JobManagerMetricGroup(registry, "host");
++
++		QueryScopeInfo.JobManagerQueryScopeInfo info = jm.createQueryServiceMetricInfo(new DummyCharacterFilter());
++		assertEquals("", info.scope);
++	}
+ }
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerJobGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerJobGroupTest.java
+index 45f37ac9e2894..c3443f27079b0 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerJobGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/JobManagerJobGroupTest.java
+@@ -22,12 +22,15 @@
+ import org.apache.flink.configuration.ConfigConstants;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
++import org.apache.flink.util.TestLogger;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ 
+-public class JobManagerJobGroupTest {
++public class JobManagerJobGroupTest extends TestLogger {
+ 
+ 	@Test
+ 	public void testGenerateScopeDefault() {
+@@ -92,4 +95,16 @@ public void testGenerateScopeCustomWildcard() {
+ 
+ 		registry.shutdown();
+ 	}
++
++	@Test
++	public void testCreateQueryServiceMetricInfo() {
++		JobID jid = new JobID();
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		JobManagerMetricGroup jm = new JobManagerMetricGroup(registry, "host");
++		JobManagerJobMetricGroup jmj = new JobManagerJobMetricGroup(registry, jm, jid, "jobname");
++
++		QueryScopeInfo.JobQueryScopeInfo info = jmj.createQueryServiceMetricInfo(new DummyCharacterFilter());
++		assertEquals("", info.scope);
++		assertEquals(jid.toString(), info.jobID);
++	}
+ }
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/MetricGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/MetricGroupTest.java
+index a27206d3b956d..3fe8d7533bf8a 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/MetricGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/MetricGroupTest.java
+@@ -18,19 +18,25 @@
+ 
+ package org.apache.flink.runtime.metrics.groups;
+ 
++import org.apache.flink.api.common.JobID;
+ import org.apache.flink.configuration.Configuration;
++import org.apache.flink.metrics.CharacterFilter;
+ import org.apache.flink.metrics.Gauge;
+ import org.apache.flink.metrics.Metric;
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
+ 
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
++import org.apache.flink.util.AbstractID;
++import org.apache.flink.util.TestLogger;
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.*;
+ 
+-public class MetricGroupTest {
++public class MetricGroupTest extends TestLogger {
+ 	
+ 	private MetricRegistry registry;
+ 
+@@ -110,6 +116,24 @@ public void tolerateMetricAndGroupNameCollisions() {
+ 		assertNotNull(group.addGroup(name));
+ 		assertNotNull(group.counter(name));
+ 	}
++
++	@Test
++	public void testCreateQueryServiceMetricInfo() {
++		JobID jid = new JobID();
++		AbstractID vid = new AbstractID();
++		AbstractID eid = new AbstractID();
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		TaskManagerMetricGroup tm = new TaskManagerMetricGroup(registry, "host", "id");
++		TaskManagerJobMetricGroup job = new TaskManagerJobMetricGroup(registry, tm, jid, "jobname");
++		TaskMetricGroup task = new TaskMetricGroup(registry, job, vid, eid, "taskName", 4, 5);
++		GenericMetricGroup userGroup = new GenericMetricGroup(registry, task, "hello");
++
++		QueryScopeInfo.TaskQueryScopeInfo info = (QueryScopeInfo.TaskQueryScopeInfo) userGroup.createQueryServiceMetricInfo(new DummyCharacterFilter());
++		assertEquals("hello", info.scope);
++		assertEquals(jid.toString(), info.jobID);
++		assertEquals(vid.toString(), info.vertexID);
++		assertEquals(4, info.subtaskIndex);
++	}
+ 	
+ 	// ------------------------------------------------------------------------
+ 	
+@@ -138,6 +162,11 @@ public DummyAbstractMetricGroup(MetricRegistry registry) {
+ 			super(registry, new String[0], null);
+ 		}
+ 
++		@Override
++		protected QueryScopeInfo createQueryServiceMetricInfo(CharacterFilter filter) {
++			return null;
++		}
++
+ 		@Override
+ 		protected void addMetric(String name, Metric metric) {}
+ 
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/OperatorGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/OperatorGroupTest.java
+index c193ac8191498..23579362745dd 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/OperatorGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/OperatorGroupTest.java
+@@ -21,9 +21,12 @@
+ import org.apache.flink.api.common.JobID;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
+ import org.apache.flink.runtime.metrics.scope.ScopeFormat;
++import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
+ import org.apache.flink.util.AbstractID;
+ 
++import org.apache.flink.util.TestLogger;
+ import org.junit.Test;
+ 
+ import java.util.Map;
+@@ -31,9 +34,8 @@
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+-import static org.junit.Assert.assertNull;
+ 
+-public class OperatorGroupTest {
++public class OperatorGroupTest extends TestLogger {
+ 
+ 	@Test
+ 	public void testGenerateScopeDefault() {
+@@ -91,4 +93,23 @@ private static void testVariable(Map<String, String> variables, String key, Stri
+ 		assertNotNull(actualValue);
+ 		assertEquals(expectedValue, actualValue);
+ 	}
++
++	@Test
++	public void testCreateQueryServiceMetricInfo() {
++		JobID jid = new JobID();
++		AbstractID vid = new AbstractID();
++		AbstractID eid = new AbstractID();
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		TaskManagerMetricGroup tm = new TaskManagerMetricGroup(registry, "host", "id");
++		TaskManagerJobMetricGroup job = new TaskManagerJobMetricGroup(registry, tm, jid, "jobname");
++		TaskMetricGroup task = new TaskMetricGroup(registry, job, vid, eid, "taskName", 4, 5);
++		OperatorMetricGroup operator = new OperatorMetricGroup(registry, task, "operator");
++
++		QueryScopeInfo.OperatorQueryScopeInfo info = operator.createQueryServiceMetricInfo(new DummyCharacterFilter());
++		assertEquals("", info.scope);
++		assertEquals(jid.toString(), info.jobID);
++		assertEquals(vid.toString(), info.vertexID);
++		assertEquals(4, info.subtaskIndex);
++		assertEquals("operator", info.operatorName);
++	}
+ }
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerGroupTest.java
+index b2c5dc7fbc42c..a68e59da787ee 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerGroupTest.java
+@@ -29,9 +29,12 @@
+ import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+ import org.apache.flink.runtime.jobgraph.JobVertexID;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
+ import org.apache.flink.util.AbstractID;
+ 
+ import org.apache.flink.util.SerializedValue;
++import org.apache.flink.util.TestLogger;
+ import org.junit.Test;
+ 
+ import java.io.IOException;
+@@ -40,7 +43,7 @@
+ 
+ import static org.junit.Assert.*;
+ 
+-public class TaskManagerGroupTest {
++public class TaskManagerGroupTest extends TestLogger {
+ 
+ 	// ------------------------------------------------------------------------
+ 	//  adding and removing jobs
+@@ -269,4 +272,14 @@ public void testGenerateScopeCustom() {
+ 		assertEquals("constant.host.foo.host.name", group.getMetricIdentifier("name"));
+ 		registry.shutdown();
+ 	}
++
++	@Test
++	public void testCreateQueryServiceMetricInfo() {
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		TaskManagerMetricGroup tm = new TaskManagerMetricGroup(registry, "host", "id");
++
++		QueryScopeInfo.TaskManagerQueryScopeInfo info = tm.createQueryServiceMetricInfo(new DummyCharacterFilter());
++		assertEquals("", info.scope);
++		assertEquals("id", info.taskManagerID);
++	}
+ }
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobGroupTest.java
+index c96af45d634c7..175ded177736b 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskManagerJobGroupTest.java
+@@ -23,12 +23,15 @@
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
+ 
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
++import org.apache.flink.util.TestLogger;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ 
+-public class TaskManagerJobGroupTest {
++public class TaskManagerJobGroupTest extends TestLogger {
+ 
+ 	@Test
+ 	public void testGenerateScopeDefault() {
+@@ -90,4 +93,16 @@ public void testGenerateScopeCustomWildcard() {
+ 				jmGroup.getMetricIdentifier("name"));
+ 		registry.shutdown();
+ 	}
++
++	@Test
++	public void testCreateQueryServiceMetricInfo() {
++		JobID jid = new JobID();
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		TaskManagerMetricGroup tm = new TaskManagerMetricGroup(registry, "host", "id");
++		TaskManagerJobMetricGroup job = new TaskManagerJobMetricGroup(registry, tm, jid, "jobname");
++
++		QueryScopeInfo.JobQueryScopeInfo info = job.createQueryServiceMetricInfo(new DummyCharacterFilter());
++		assertEquals("", info.scope);
++		assertEquals(jid.toString(), info.jobID);
++	}
+ }
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroupTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroupTest.java
+index da07f8f8aa94e..c65c1daf65272 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroupTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/groups/TaskMetricGroupTest.java
+@@ -24,15 +24,17 @@
+ import org.apache.flink.metrics.Metric;
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.runtime.metrics.MetricRegistry;
++import org.apache.flink.runtime.metrics.dump.QueryScopeInfo;
++import org.apache.flink.runtime.metrics.util.DummyCharacterFilter;
+ import org.apache.flink.util.AbstractID;
+-
++import org.apache.flink.util.TestLogger;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ 
+-public class TaskMetricGroupTest {
++public class TaskMetricGroupTest extends TestLogger {
+ 
+ 	// ------------------------------------------------------------------------
+ 	//  scope tests
+@@ -109,6 +111,23 @@ public void testGenerateScopeWilcard() {
+ 		registry.shutdown();
+ 	}
+ 
++	@Test
++	public void testCreateQueryServiceMetricInfo() {
++		JobID jid = new JobID();
++		AbstractID vid = new AbstractID();
++		AbstractID eid = new AbstractID();
++		MetricRegistry registry = new MetricRegistry(new Configuration());
++		TaskManagerMetricGroup tm = new TaskManagerMetricGroup(registry, "host", "id");
++		TaskManagerJobMetricGroup job = new TaskManagerJobMetricGroup(registry, tm, jid, "jobname");
++		TaskMetricGroup task = new TaskMetricGroup(registry, job, vid, eid, "taskName", 4, 5);
++
++		QueryScopeInfo.TaskQueryScopeInfo info = task.createQueryServiceMetricInfo(new DummyCharacterFilter());
++		assertEquals("", info.scope);
++		assertEquals(jid.toString(), info.jobID);
++		assertEquals(vid.toString(), info.vertexID);
++		assertEquals(4, info.subtaskIndex);
++	}
++
+ 	@Test
+ 	public void testTaskMetricGroupCleanup() {
+ 		CountingMetricRegistry registry = new CountingMetricRegistry(new Configuration());
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/util/DummyCharacterFilter.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/util/DummyCharacterFilter.java
+new file mode 100644
+index 0000000000000..601f7348b5e84
+--- /dev/null
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/util/DummyCharacterFilter.java
+@@ -0,0 +1,27 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.util;
++
++import org.apache.flink.metrics.CharacterFilter;
++
++public class DummyCharacterFilter implements CharacterFilter {
++	@Override
++	public String filterCharacters(String input) {
++		return input;
++	}
++}
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/util/TestingHistogram.java b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/util/TestingHistogram.java
+new file mode 100644
+index 0000000000000..82f8504a6e0b1
+--- /dev/null
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/metrics/util/TestingHistogram.java
+@@ -0,0 +1,73 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.runtime.metrics.util;
++
++import org.apache.flink.metrics.Histogram;
++import org.apache.flink.metrics.HistogramStatistics;
++
++public class TestingHistogram implements Histogram {
++
++	@Override
++	public void update(long value) {
++	}
++
++	@Override
++	public long getCount() {
++		return 1;
++	}
++
++	@Override
++	public HistogramStatistics getStatistics() {
++		return new HistogramStatistics() {
++			@Override
++			public double getQuantile(double quantile) {
++				return quantile;
++			}
++
++			@Override
++			public long[] getValues() {
++				return new long[0];
++			}
++
++			@Override
++			public int size() {
++				return 3;
++			}
++
++			@Override
++			public double getMean() {
++				return 4;
++			}
++
++			@Override
++			public double getStdDev() {
++				return 5;
++			}
++
++			@Override
++			public long getMax() {
++				return 6;
++			}
++
++			@Override
++			public long getMin() {
++				return 7;
++			}
++		};
++	}
++}
+diff --git a/flink-runtime/src/test/java/org/apache/flink/runtime/taskmanager/TaskManagerComponentsStartupShutdownTest.java b/flink-runtime/src/test/java/org/apache/flink/runtime/taskmanager/TaskManagerComponentsStartupShutdownTest.java
+index bda41748432ea..bc83db95afbd0 100644
+--- a/flink-runtime/src/test/java/org/apache/flink/runtime/taskmanager/TaskManagerComponentsStartupShutdownTest.java
++++ b/flink-runtime/src/test/java/org/apache/flink/runtime/taskmanager/TaskManagerComponentsStartupShutdownTest.java
+@@ -47,6 +47,7 @@
+ import org.apache.flink.runtime.leaderretrieval.StandaloneLeaderRetrievalService;
+ import org.apache.flink.runtime.memory.MemoryManager;
+ import org.apache.flink.runtime.messages.TaskManagerMessages;
++import org.apache.flink.runtime.metrics.MetricRegistry;
+ import org.apache.flink.runtime.query.KvStateRegistry;
+ import org.apache.flink.runtime.util.LeaderRetrievalUtils;
+ 
+@@ -138,7 +139,8 @@ public void testComponentsStartupShutdown() {
+ 				ioManager,
+ 				network,
+ 				numberOfSlots,
+-				leaderRetrievalService);
++				leaderRetrievalService,
++				new MetricRegistry(config));
+ 
+ 			final ActorRef taskManager = actorSystem.actorOf(tmProps);
+ 
+diff --git a/flink-runtime/src/test/scala/org/apache/flink/runtime/testingUtils/TestingTaskManager.scala b/flink-runtime/src/test/scala/org/apache/flink/runtime/testingUtils/TestingTaskManager.scala
+index 9b5a147360389..707401b14855b 100644
+--- a/flink-runtime/src/test/scala/org/apache/flink/runtime/testingUtils/TestingTaskManager.scala
++++ b/flink-runtime/src/test/scala/org/apache/flink/runtime/testingUtils/TestingTaskManager.scala
+@@ -23,6 +23,7 @@ import org.apache.flink.runtime.io.disk.iomanager.IOManager
+ import org.apache.flink.runtime.io.network.NetworkEnvironment
+ import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService
+ import org.apache.flink.runtime.memory.MemoryManager
++import org.apache.flink.runtime.metrics.MetricRegistry
+ import org.apache.flink.runtime.taskmanager.{TaskManagerLocation, TaskManager, TaskManagerConfiguration}
+ 
+ import scala.language.postfixOps
+@@ -37,7 +38,8 @@ class TestingTaskManager(
+                           ioManager: IOManager,
+                           network: NetworkEnvironment,
+                           numberOfSlots: Int,
+-                          leaderRetrievalService: LeaderRetrievalService)
++                          leaderRetrievalService: LeaderRetrievalService,
++                          metricRegistry : MetricRegistry)
+   extends TaskManager(
+     config,
+     resourceID,
+@@ -46,7 +48,8 @@ class TestingTaskManager(
+     ioManager,
+     network,
+     numberOfSlots,
+-    leaderRetrievalService)
++    leaderRetrievalService,
++    metricRegistry)
+   with TestingTaskManagerLike {
+ 
+   def this(
+@@ -56,7 +59,8 @@ class TestingTaskManager(
+             ioManager: IOManager,
+             network: NetworkEnvironment,
+             numberOfSlots: Int,
+-            leaderRetrievalService: LeaderRetrievalService) {
++            leaderRetrievalService: LeaderRetrievalService,
++            metricRegistry : MetricRegistry) {
+     this(
+       config,
+       ResourceID.generate(),
+@@ -65,6 +69,7 @@ class TestingTaskManager(
+       ioManager,
+       network,
+       numberOfSlots,
+-      leaderRetrievalService)
++      leaderRetrievalService,
++      metricRegistry)
+   }
+ }
+diff --git a/flink-yarn-tests/src/test/scala/org/apache/flink/yarn/TestingYarnTaskManager.scala b/flink-yarn-tests/src/test/scala/org/apache/flink/yarn/TestingYarnTaskManager.scala
+index f9f294b91d017..1010432a7856e 100644
+--- a/flink-yarn-tests/src/test/scala/org/apache/flink/yarn/TestingYarnTaskManager.scala
++++ b/flink-yarn-tests/src/test/scala/org/apache/flink/yarn/TestingYarnTaskManager.scala
+@@ -23,7 +23,8 @@ import org.apache.flink.runtime.io.disk.iomanager.IOManager
+ import org.apache.flink.runtime.io.network.NetworkEnvironment
+ import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService
+ import org.apache.flink.runtime.memory.MemoryManager
+-import org.apache.flink.runtime.taskmanager.{TaskManagerLocation, TaskManagerConfiguration}
++import org.apache.flink.runtime.metrics.MetricRegistry
++import org.apache.flink.runtime.taskmanager.{TaskManagerConfiguration, TaskManagerLocation}
+ import org.apache.flink.runtime.testingUtils.TestingTaskManagerLike
+ 
+ /** [[YarnTaskManager]] implementation which mixes in the [[TestingTaskManagerLike]] mixin.
+@@ -49,7 +50,8 @@ class TestingYarnTaskManager(
+                               ioManager: IOManager,
+                               network: NetworkEnvironment,
+                               numberOfSlots: Int,
+-                              leaderRetrievalService: LeaderRetrievalService)
++                              leaderRetrievalService: LeaderRetrievalService,
++                              metricRegistry : MetricRegistry)
+   extends YarnTaskManager(
+     config,
+     resourceID,
+@@ -58,7 +60,8 @@ class TestingYarnTaskManager(
+     ioManager,
+     network,
+     numberOfSlots,
+-    leaderRetrievalService)
++    leaderRetrievalService,
++    metricRegistry)
+   with TestingTaskManagerLike {
+ 
+   object YarnTaskManager {
+diff --git a/flink-yarn/src/main/scala/org/apache/flink/yarn/YarnTaskManager.scala b/flink-yarn/src/main/scala/org/apache/flink/yarn/YarnTaskManager.scala
+index 0c6264ed7229d..2ab9b20f089d8 100644
+--- a/flink-yarn/src/main/scala/org/apache/flink/yarn/YarnTaskManager.scala
++++ b/flink-yarn/src/main/scala/org/apache/flink/yarn/YarnTaskManager.scala
+@@ -24,6 +24,7 @@ import org.apache.flink.runtime.io.network.NetworkEnvironment
+ import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService
+ import org.apache.flink.runtime.memory.MemoryManager
+ import org.apache.flink.runtime.taskmanager.{TaskManager, TaskManagerConfiguration, TaskManagerLocation}
++import org.apache.flink.runtime.metrics.MetricRegistry
+ 
+ /** An extension of the TaskManager that listens for additional YARN related
+   * messages.
+@@ -36,7 +37,8 @@ class YarnTaskManager(
+     ioManager: IOManager,
+     network: NetworkEnvironment,
+     numberOfSlots: Int,
+-    leaderRetrievalService: LeaderRetrievalService)
++    leaderRetrievalService: LeaderRetrievalService,
++    metricRegistry : MetricRegistry)
+   extends TaskManager(
+     config,
+     resourceID,
+@@ -45,7 +47,8 @@ class YarnTaskManager(
+     ioManager,
+     network,
+     numberOfSlots,
+-    leaderRetrievalService) {
++    leaderRetrievalService,
++    metricRegistry) {
+ 
+   override def handleMessage: Receive = {
+     super.handleMessage

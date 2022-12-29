@@ -1,0 +1,506 @@
+diff --git a/thirdeye/thirdeye-frontend/app/pods/components/rootcause-chart/component.js b/thirdeye/thirdeye-frontend/app/pods/components/rootcause-chart/component.js
+index 2f2b31aab6f..0e08fd9aab0 100644
+--- a/thirdeye/thirdeye-frontend/app/pods/components/rootcause-chart/component.js
++++ b/thirdeye/thirdeye-frontend/app/pods/components/rootcause-chart/component.js
+@@ -85,7 +85,9 @@ export default Ember.Component.extend({
+           show: true
+         },
+         y2: {
+-          show: false
++          show: false,
++          min: 0,
++          max: 1
+         },
+         x: {
+           type: 'timeseries',
+@@ -120,13 +122,59 @@ export default Ember.Component.extend({
+     }
+   ),
+ 
++  _eventValues: Ember.computed(
++    'entities',
++    'selectedUrns',
++    'analysisRange',
++    function () {
++      const { entities, selectedUrns, analysisRange } =
++        this.getProperties('entities', 'selectedUrns', 'analysisRange');
++
++      const selectedEvents = [...selectedUrns].filter(urn => entities[urn] && entities[urn].type == 'event').map(urn => entities[urn]);
++
++      const starts = selectedEvents.map(e => [e.start, e.urn]);
++      const ends = selectedEvents.map(e => [e.end + 1, e.urn]); // no overlap
++      const sorted = starts.concat(ends).sort();
++
++      //
++      // automated layouting for event time ranges based on 'swimlanes'.
++      // events are assigned to different lanes such that their time ranges do not overlap visually
++      // the swimlanes are then converted to y values between [0.0, 1.0]
++      //
++      const lanes = {};
++      const urn2lane = {};
++      let max = 10; // default value
++      sorted.forEach(t => {
++        const urn = t[1];
++
++        if (!(urn in urn2lane)) {
++          // add
++          let i;
++          for (i = 0; (i in lanes); i++);
++          lanes[i] = urn;
++          urn2lane[urn] = i;
++          max = i > max ? i : max;
++
++        } else {
++          // remove
++          delete lanes[urn2lane[urn]];
++
++        }
++      });
++
++      const normalized = {};
++      Object.keys(urn2lane).forEach(urn => normalized[urn] = 1 - 1.0 * urn2lane[urn] / max);
++
++      return normalized;
++    }
++  ),
++
+   _filterDisplayable(urns) {
+     const { entities, timeseries } = this.getProperties('entities', 'timeseries');
+ 
+     return [...urns]
+-      .filter(urn => entities[urn])
+-      .filter(urn => ['metric', 'event'].includes(entities[urn].type))
+-      .filter(urn => entities[urn].type != 'metric' || timeseries[urn]);
++      .filter(urn => entities[urn] && ['metric', 'event', 'frontend:baseline:metric'].includes(entities[urn].type))
++      .filter(urn => (entities[urn].type != 'metric' && entities[urn].type != 'frontend:baseline:metric') || timeseries[urn]);
+   },
+ 
+   _entityToLabel(entity) {
+@@ -144,15 +192,27 @@ export default Ember.Component.extend({
+         axis: 'y'
+       };
+ 
++    } else if (entity.type == 'frontend:baseline:metric') {
++      const { timeseries } = this.getProperties('timeseries');
++
++      return {
++        timestamps: timeseries[entity.urn].timestamps,
++        values: timeseries[entity.urn].values,
++        type: 'scatter',
++        axis: 'y'
++      };
++
+     } else if (entity.type == 'dimension') {
+       // TODO requires support for urn with metric id + filter
+       return {};
+ 
+     } else if (entity.type == 'event') {
++      const { _eventValues } = this.getProperties('_eventValues');
+       // console.log(entity.urn, 'timestamps', entity.start, entity.end);
++      const val = _eventValues[entity.urn];
+       return {
+         timestamps: [entity.start, entity.end || entity.start],
+-        values: [1, 1],
++        values: [val, val],
+         type: 'line',
+         axis: 'y2'
+       };
+diff --git a/thirdeye/thirdeye-frontend/app/pods/components/rootcause-heatmap/component.js b/thirdeye/thirdeye-frontend/app/pods/components/rootcause-heatmap/component.js
+new file mode 100644
+index 00000000000..d92685754d6
+--- /dev/null
++++ b/thirdeye/thirdeye-frontend/app/pods/components/rootcause-heatmap/component.js
+@@ -0,0 +1,94 @@
++import Ember from 'ember';
++
++export default Ember.Component.extend({
++  current: //null, // {}
++  {
++    country: {
++      us: 100,
++      cn: 100,
++      ca: 150
++    },
++    browser: {
++      chrome:  250,
++      firefox: 100
++    }
++  },
++
++  baseline: // null, // {}
++  {
++    country: {
++      us: 90,
++      cn: 90,
++      ca: 70
++    },
++    browser: {
++      chrome:  180,
++      firefox: 70
++    }
++  },
++
++  mode: null, // 'change', 'contributionDiff', 'contributionToDiff'
++
++  values: Ember.computed(
++    'current',
++    'baseline',
++    'mode',
++    function () {
++      const { current, baseline, mode } = this.getProperties('current', 'baseline', 'mode');
++
++      // collect all dimension names
++      const dimNames = new Set(Object.keys(current).concat(Object.keys(baseline)));
++
++      // collect all dimension values for all dimension names
++      const dimValues = {};
++      [...dimNames].forEach(n => dimValues[n] = new Set());
++      [...dimNames].filter(n => n in current).forEach(n => Object.keys(current[n]).forEach(v => dimValues[n].add(v)));
++      [...dimNames].filter(n => n in baseline).forEach(n => Object.keys(baseline[n]).forEach(v => dimValues[n].add(v)));
++
++      // tranformation
++      const transformation = this._makeTransformation(mode);
++
++      const values = {};
++      [...dimNames].forEach(n => {
++        const currTotal = this._makeSum(current[n]);
++        const baseTotal = this._makeSum(baseline[n]);
++        values[n] = {};
++
++        [...dimValues[n]].forEach(v => {
++          const curr = current[n][v] || 0;
++          const base = baseline[n][v] || 0;
++
++          values[n][v] = transformation(curr, base, currTotal, baseTotal);
++        });
++      });
++
++      return values;
++    }
++  ),
++
++  _makeTransformation(mode) {
++    switch (mode) {
++      case 'change':
++        return (curr, base, currTotal, baseTotal) => curr / base - 1;
++      case 'contributionDiff':
++        return (curr, base, currTotal, baseTotal) => curr / currTotal - base / baseTotal;
++      case 'contributionToDiff':
++        return (curr, base, currTotal, baseTotal) => (curr - base) / (currTotal - baseTotal);
++    }
++    return (curr, base, currTotal, baseTotal) => 0;
++  },
++
++  _makeSum(dimNameObj) {
++    if (!dimNameObj) {
++      return 0;
++    }
++    return Object.values(dimNameObj).reduce((agg, x) => agg + x, 0);
++  },
++
++  actions: {
++    setMode(mode) {
++      this.set('mode', mode);
++    }
++  }
++
++});
+diff --git a/thirdeye/thirdeye-frontend/app/pods/components/rootcause-heatmap/template.hbs b/thirdeye/thirdeye-frontend/app/pods/components/rootcause-heatmap/template.hbs
+new file mode 100644
+index 00000000000..a2dd43b8a69
+--- /dev/null
++++ b/thirdeye/thirdeye-frontend/app/pods/components/rootcause-heatmap/template.hbs
+@@ -0,0 +1,17 @@
++<button {{action "setMode" "change"}}>change</button> |
++<button {{action "setMode" "contributionDiff"}}>contribution diff</button> |
++<button {{action "setMode" "contributionToDiff"}}>contribution to diff</button>
++
++<ol>
++  {{#each-in values as |dimName dimValues|}}
++    <li>{{dimName}}
++        {{#each-in dimValues as |dimValue value|}}
++          | {{dimValue}} ({{value}})
++        {{else}}
++          | No values
++        {{/each-in}}
++    </li>
++  {{else}}
++    <li>No dimensions</li>
++  {{/each-in}}
++</ol>
+diff --git a/thirdeye/thirdeye-frontend/app/pods/components/timeseries-chart/component.js b/thirdeye/thirdeye-frontend/app/pods/components/timeseries-chart/component.js
+index 63ca022d1b8..cba51d78f18 100644
+--- a/thirdeye/thirdeye-frontend/app/pods/components/timeseries-chart/component.js
++++ b/thirdeye/thirdeye-frontend/app/pods/components/timeseries-chart/component.js
+@@ -123,9 +123,9 @@ export default Ember.Component.extend({
+     this._super(...arguments);
+     const series = this.get('series') || {};
+     const cache = this.get('cache') || {};
+-    
++
+     if (!_.isEqual(series, cache)) {
+-      this._updateChart();
++      Ember.run.debounce(this, this._updateChart, 250);
+     }
+   },
+ 
+diff --git a/thirdeye/thirdeye-frontend/app/pods/rootcause/controller.js b/thirdeye/thirdeye-frontend/app/pods/rootcause/controller.js
+index 35098b6daeb..6922a9bccf9 100644
+--- a/thirdeye/thirdeye-frontend/app/pods/rootcause/controller.js
++++ b/thirdeye/thirdeye-frontend/app/pods/rootcause/controller.js
+@@ -1,6 +1,7 @@
+ import Ember from 'ember';
+-import { makeIterable, filterObject } from 'thirdeye-frontend/helpers/utils';
++import { checkStatus, makeIterable, filterObject } from 'thirdeye-frontend/helpers/utils';
+ import EVENT_TABLE_COLUMNS from 'thirdeye-frontend/mocks/eventTableColumns';
++import fetch from 'fetch';
+ 
+ //
+ // Controller
+@@ -64,11 +65,13 @@ export default Ember.Controller.extend({
+       const { entities, selectedUrns, invisibleUrns, context } =
+         this.getProperties('entities', 'selectedUrns', 'invisibleUrns', 'context');
+ 
+-      const output = new Set(selectedUrns);
+-      [...invisibleUrns].forEach(urn => output.delete(urn));
+-      [...context.urns].filter(urn => entities[urn] && entities[urn].type == 'metric').forEach(urn => output.add(urn));
++      const selectedMetricUrns = new Set(selectedUrns);
++      [...invisibleUrns].forEach(urn => selectedMetricUrns.delete(urn));
++      [...context.urns].filter(urn => entities[urn] && entities[urn].type == 'metric').forEach(urn => selectedMetricUrns.add(urn));
+ 
+-      return output;
++      const selectedBaselineUrns = [...selectedMetricUrns].filter(urn => entities[urn] && entities[urn].type == 'metric').map(urn => this._makeMetricBaselineUrn(urn));
++
++      return new Set([...selectedMetricUrns].concat(selectedBaselineUrns));
+     }
+   ),
+ 
+@@ -161,37 +164,40 @@ export default Ember.Controller.extend({
+     frameworks.forEach(framework => {
+       const url = this._makeFrameworkUrl(framework, context);
+       fetch(url)
+-        .then(res => res.json())
+-        .then(json => this._completeRequestEntities(this, json, framework));
++        .then(checkStatus)
++        .then(this._resultToEntities)
++        .then(json => this._completeRequestEntities(json, framework));
+     });
+ 
+   },
+ 
+-  _completeRequestEntities(that, incoming, framework) {
++  _completeRequestEntities(incoming, framework) {
+     console.log('_completeRequestEntities()');
+     const { selectedUrns, _pendingEntitiesRequests: pending, _entitiesCache: entitiesCache, _timeseriesCache: timeseriesCache } =
+       this.getProperties('selectedUrns', '_pendingEntitiesRequests', '_entitiesCache', '_timeseriesCache');
+ 
+-    // NOTE: potential race condition?
+-
+     // update pending requests
+     pending.delete(framework);
+ 
+     // timeseries eviction
+     // TODO optimize for same time range reload
+-    incoming.forEach(e => delete timeseriesCache[e.urn]);
++    Object.keys(incoming).forEach(urn => delete timeseriesCache[urn]);
++    Object.keys(incoming).forEach(urn => delete timeseriesCache[this._makeMetricBaselineUrn(urn)]);
+ 
+     // entities eviction
+-    const candidates = that._entitiesEvictionUrns(entitiesCache, framework);
++    const candidates = this._entitiesEvictionUrns(entitiesCache, framework);
+     [...candidates].filter(urn => !selectedUrns.has(urn)).forEach(urn => delete entitiesCache[urn]);
+ 
++    // augmentation
++    const augmented = Object.assign({}, incoming, this._entitiesMetricsAugmentation(incoming));
++
+     // update entities cache
+-    incoming.forEach(e => entitiesCache[e.urn] = e);
++    Object.keys(augmented).forEach(urn => entitiesCache[urn] = augmented[urn]);
+ 
+-    that.setProperties({ _entitiesCache: entitiesCache, _timeseriesCache: timeseriesCache, _pendingEntitiesRequests: pending });
+-    that.notifyPropertyChange('_timeseriesCache');
+-    that.notifyPropertyChange('_entitiesCache');
+-    that.notifyPropertyChange('_pendingEntitiesRequests');
++    this.setProperties({ _entitiesCache: entitiesCache, _timeseriesCache: timeseriesCache, _pendingEntitiesRequests: pending });
++    this.notifyPropertyChange('_timeseriesCache');
++    this.notifyPropertyChange('_entitiesCache');
++    this.notifyPropertyChange('_pendingEntitiesRequests');
+   },
+ 
+   _entitiesEvictionUrns(cache, framework) {
+@@ -206,6 +212,20 @@ export default Ember.Controller.extend({
+     }
+   },
+ 
++  _entitiesMetricsAugmentation(incoming) {
++    console.log('_entitiesMetricsAugmentation()');
++    const entities = {};
++    Object.keys(incoming).filter(urn => incoming[urn].type == 'metric').forEach(urn => {
++      const baselineUrn = this._makeMetricBaselineUrn(urn);
++      entities[baselineUrn] = {
++        urn: baselineUrn,
++        type: 'frontend:baseline:metric',
++        label: incoming[urn].label + ' (baseline)'
++      };
++    });
++    return entities;
++  },
++
+   _makeFrameworkUrl(framework, context) {
+     const urnString = [...context.urns].join(',');
+     return `/rootcause/query?framework=${framework}` +
+@@ -215,6 +235,12 @@ export default Ember.Controller.extend({
+       `&urns=${urnString}`;
+   },
+ 
++  _resultToEntities(res) {
++    const entities = {};
++    res.forEach(e => entities[e.urn] = e);
++    return entities;
++  },
++
+   //
+   // Timeseries loading
+   //
+@@ -226,8 +252,9 @@ export default Ember.Controller.extend({
+       const { entities, cache } = this.getProperties('entities', '_timeseriesCache');
+ 
+       const metricUrns = Object.keys(entities).filter(urn => entities[urn] && entities[urn].type == 'metric');
++      const baselineUrns = metricUrns.map(urn => this._makeMetricBaselineUrn(urn));
+ 
+-      this._startRequestMissingTimeseries(metricUrns);
++      this._startRequestMissingTimeseries(metricUrns.concat(baselineUrns));
+ 
+       return cache;
+     }
+@@ -246,43 +273,52 @@ export default Ember.Controller.extend({
+       return;
+     }
+ 
+-    // NOTE: potential race condition?
+     [...missing].forEach(urn => pending.add(urn));
+ 
+     this.setProperties({_pendingTimeseriesRequests: pending});
+     this.notifyPropertyChange('_pendingTimeseriesRequests');
+ 
+-    console.log('_startRequestMissingTimeseries: set pending', pending);
++    // metrics
++    const metricUrns = [...missing].filter(urn => urn.startsWith('thirdeye:metric:'));
++    const metricIdString = metricUrns.map(urn => urn.split(":")[2]).join(',');
++    const metricUrl = `/timeseries/query?metricIds=${metricIdString}&ranges=${context.analysisRange[0]}:${context.analysisRange[1]}&granularity=15_MINUTES&transformations=timestamp`;
++
++    fetch(metricUrl)
++      .then(checkStatus)
++      .then(this._extractTimeseries)
++      .then(timeseries => this._completeRequestMissingTimeseries(timeseries));
+ 
+-    const metricIds = [...missing].map(urn => urn.split(":")[2]);
++    // baselines
++    const baselineOffset = context.anomalyRange[0] - context.baselineRange[0];
++    const baselineDisplayStart = context.analysisRange[0] - baselineOffset;
++    const baselineDisplayEnd = context.analysisRange[1] - baselineOffset;
+ 
+-    const idString = metricIds.join(',');
+-    const url = `/timeseries/query?metricIds=${idString}&ranges=${context.analysisRange[0]}:${context.analysisRange[1]}&granularity=15_MINUTES&transformations=timestamp,relative`;
++    const baselineUrns = [...missing].filter(urn => urn.startsWith('frontend:baseline:metric:'));
++    const baselineIdString = baselineUrns.map(urn => urn.split(":")[3]).join(',');
++    const baselineUrl = `/timeseries/query?metricIds=${baselineIdString}&ranges=${baselineDisplayStart}:${baselineDisplayEnd}&granularity=15_MINUTES&transformations=timestamp`;
+ 
+-    fetch(url)
+-      .then(res => res.json())
++    fetch(baselineUrl)
++      .then(checkStatus)
+       .then(this._extractTimeseries)
+-      .then(incoming => this._completeRequestMissingTimeseries(this, incoming));
++      .then(timeseries => this._convertMetricToBaseline(timeseries, baselineOffset))
++      .then(timeseries => this._completeRequestMissingTimeseries(timeseries));
+ 
+   },
+ 
+-  _completeRequestMissingTimeseries(that, incoming) {
++  _completeRequestMissingTimeseries(incoming) {
+     console.log('_completeRequestMissingTimeseries()');
+-    const { _pendingTimeseriesRequests: pending, _timeseriesCache: cache } = that.getProperties('_pendingTimeseriesRequests', '_timeseriesCache');
+-
+-    console.log('_completeRequestMissingTimeseries: incoming', Object.keys(incoming));
++    const { _pendingTimeseriesRequests: pending, _timeseriesCache: cache } =
++      this.getProperties('_pendingTimeseriesRequests', '_timeseriesCache');
+ 
+-    // NOTE: potential race condition?
+     Object.keys(incoming).forEach(urn => pending.delete(urn));
+     Object.keys(incoming).forEach(urn => cache[urn] = incoming[urn]);
+ 
+-    console.log('_completeRequestMissingTimeseries: merging cache');
+-    that.setProperties({ _pendingTimeseriesRequests: pending, _timeseriesCache: cache });
+-    that.notifyPropertyChange('_timeseriesCache');
+-    that.notifyPropertyChange('_pendingTimeseriesRequests');
++    this.setProperties({ _pendingTimeseriesRequests: pending, _timeseriesCache: cache });
++    this.notifyPropertyChange('_timeseriesCache');
++    this.notifyPropertyChange('_pendingTimeseriesRequests');
+   },
+ 
+-  _extractTimeseries: function(json) {
++  _extractTimeseries(json) {
+     const timeseries = {};
+     Object.keys(json).forEach(range =>
+       Object.keys(json[range]).filter(sid => sid != 'timestamp').forEach(sid => {
+@@ -308,6 +344,23 @@ export default Ember.Controller.extend({
+     return timeseries;
+   },
+ 
++  _convertMetricToBaseline(timeseries, offset) {
++    const baseline = {};
++    Object.keys(timeseries).forEach(urn => {
++      const baselineUrn = this._makeMetricBaselineUrn(urn);
++      baseline[baselineUrn] = {
++        values: timeseries[urn].values,
++        timestamps: timeseries[urn].timestamps.map(t => t + offset)
++      };
++    });
++    return baseline;
++  },
++
++  _makeMetricBaselineUrn(urn) {
++    const mid = urn.split(':')[2];
++    return `frontend:baseline:metric:${mid}`;
++  },
++
+   //
+   // Actions
+   //
+@@ -342,20 +395,17 @@ export default Ember.Controller.extend({
+     filterOnSelect(urns) {
+       console.log('filterOnSelect()');
+       this.set('filteredUrns', new Set(urns));
+-      this.notifyPropertyChange('filteredUrns');
+     },
+ 
+     chartOnHover(urns) {
+       console.log('chartOnHover()');
+       this.set('hoverUrns', new Set(urns));
+-      this.notifyPropertyChange('hoverUrns');
+     },
+ 
+     loadtestSelectedUrns() {
+       console.log('loadtestSelected()');
+       const { entities } = this.getProperties('entities');
+       this.set('selectedUrns', new Set(Object.keys(entities)));
+-      this.notifyPropertyChange('selectedUrns');
+     },
+ 
+     settingsOnChange(context) {
+diff --git a/thirdeye/thirdeye-frontend/app/pods/rootcause/template.hbs b/thirdeye/thirdeye-frontend/app/pods/rootcause/template.hbs
+index c9b88789549..feeec85efe1 100644
+--- a/thirdeye/thirdeye-frontend/app/pods/rootcause/template.hbs
++++ b/thirdeye/thirdeye-frontend/app/pods/rootcause/template.hbs
+@@ -59,4 +59,9 @@ urns
+   columns=eventTableColumns
+   selectedUrns=selectedUrns
+   onSelect=(action "tableOnSelect")
++}}
++
++<h3>This is the heatmap.</h3>
++{{rootcause-heatmap
++  mode="change"
+ }}
+\ No newline at end of file

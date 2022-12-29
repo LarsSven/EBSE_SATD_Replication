@@ -1,0 +1,317 @@
+diff --git a/doc/admin-guide/files/parent.config.en.rst b/doc/admin-guide/files/parent.config.en.rst
+index c3df0651f2c..9578a9dbd20 100644
+--- a/doc/admin-guide/files/parent.config.en.rst
++++ b/doc/admin-guide/files/parent.config.en.rst
+@@ -222,9 +222,63 @@ The following list shows the possible actions and their allowed values.
+ ``qstring``
+     One of the following values:
+ 
+-    -  ``consider`` - Use the query string when finding a parent.
++    -  ``consider`` - Use the query string when finding a parent (default).
+     -  ``ignore`` - Do not consider the query string when finding a parent.
+ 
++.. _parent-config-format-fname:
++
++``fname``
++    One of the following values:
++
++    - ``consider`` - Use the file name string when finding a parent (default).
++    - ``ignore`` - Do not consider the file name string when finding a parent.
++
++    NOTE: If set to ``ignore`` then this forces ``qstring=ignore``.
++    EXAMPLE::
++        Original: ``http://server.bogus/index.html`` --> ``http://server.bogus/``
++
++.. _parent-config-format-maxdirs:
++
++``maxdirs``
++    One of the following values:
++
++    - ``0`` - Do not filter the directories when finding a parent.
++    - ``<int>`` - Filter the directories when finding a parent.
++                - Use a positive integer to include that number of slashes from the start of the path.
++                - Use a negative integer to exclude beyond that number of slashes from the end of the path.
++                - Note that (internal to ATS) the path string does NOT contain a leading slash
++                  so the slash at the start of the path is not counted in the above.
++                - If set to non-zero then this also implies ``fname=ignore`` and ``qstring=ignore``.
++
++    HASH COMPUTATION COMPONENTS::
++
++        +--+ /
++        !
++        +--+ PATH from path_get() and consists of:
++        !  !
++        !  +-- DIRECTORIES
++        !  +-- FILE NAME                    [ not included if maxdirs !=0 or fname = ignore ]
++        !
++        +--+ ?                              [ not included if maxdirs !=0 or qstring = ignore ]
++        !
++        +--+ QUERY from query_get()         [ not included if maxdirs !=0 or qstring = ignore ]
++
++    EXAMPLE::
++
++        Given the request ``http://localhost/a/b/c/d/e/index.html?a=1?b=2`` --
++            MAXDIRS --> HASH COMPUTATION COMPONENTS
++                  6 --> ``/`` + ``a/b/c/d/e/``
++                  5 --> ``/`` + ``a/b/c/d/e/``
++                  4 --> ``/`` + ``a/b/c/d/``
++                  2 --> ``/`` + ``a/b/``
++                  1 --> ``/`` + ``a/``
++                  0 --> ``/`` + ``a/b/c/d/e/index.html`` + ``?`` + ``a=1?b=2``
++                 -1 --> ``/`` + ``a/b/c/d/e/``
++                 -2 --> ``/`` + ``a/b/c/d/``
++                 -4 --> ``/`` + ``a/b/``
++                 -5 --> ``/`` + ``a/``
++                 -6 --> ``/`` + ````
++
+ Examples
+ ========
+ 
+diff --git a/proxy/ParentConsistentHash.cc b/proxy/ParentConsistentHash.cc
+index 40b4440a213..429ad094a23 100644
+--- a/proxy/ParentConsistentHash.cc
++++ b/proxy/ParentConsistentHash.cc
+@@ -30,6 +30,8 @@ ParentConsistentHash::ParentConsistentHash(ParentRecord *parent_record)
+   parents[PRIMARY]   = parent_record->parents;
+   parents[SECONDARY] = parent_record->secondary_parents;
+   ignore_query       = parent_record->ignore_query;
++  ignore_fname       = parent_record->ignore_fname;
++  max_dirs           = parent_record->max_dirs;
+   ink_zero(foundParents);
+ 
+   chash[PRIMARY] = new ATSConsistentHash();
+@@ -63,21 +65,88 @@ ParentConsistentHash::getPathHash(HttpRequestData *hrdata, ATSHash64 *h)
+ {
+   const char *tmp = NULL;
+   int len;
+-  URL *url = hrdata->hdr->url_get();
++  URL *url     = hrdata->hdr->url_get();
++  int num_dirs = 0;
+ 
+   // Always hash on '/' because paths returned by ATS are always stripped of it
+   h->update("/", 1);
+ 
+   tmp = url->path_get(&len);
+-  if (tmp) {
++
++  if (tmp && len > 0) {
++    // Print the Original path.
++    Debug("parent_select", "Original Path='%.*s'.", len, tmp);
++
++    // Process the 'maxdirs' directive.
++    if (max_dirs != 0) {
++      // Determine number of directory components in the path.
++      // NOTE: Leading '/' is gone already.
++      for (int x = 0; x < len; x++) {
++        if (tmp[x] == '/') {
++          num_dirs++;
++        }
++      }
++      // If max_dirs positive , include directory components from the left up to max_dirs.
++      // If max_dirs negative , include directory components from the left up to num_dirs - ( abs(max_dirs) - 1 ).
++      int limit = 0;
++      if (max_dirs > 0) {
++        limit = max_dirs;
++      } else if (max_dirs < 0) {
++        int md = abs(max_dirs) - 1;
++        if (md < num_dirs) {
++          limit = num_dirs - md;
++        } else {
++          limit = 0;
++        }
++      }
++      if (limit > 0) {
++        int count = 0;
++        for (int x = 0; x < len; x++) {
++          if (tmp[x] == '/') {
++            count++;
++          }
++          if (count == limit) {
++            len = x + 1;
++            break;
++          }
++        }
++      } else {
++        len = 0;
++      }
++    }
++
++    // Print the post 'maxdirs' path.
++    Debug("parent_select", "Post-maxdirs Path='%.*s'.", len, tmp);
++
++    // Process the 'fname' directive.
++    // The file name (if any) is filtered out if set to ignore the file name or max_dirs was non-zero.
++    // The file name (if any) consists of the characters at the end of the path beyond the final '/'.
++    // The length of the path string (to be passed to the hash generator) is shortened to accomplish the filtering.
++    if (ignore_fname || max_dirs != 0) {
++      for (int x = len - 1; x >= 0; x--) {
++        if (tmp[x] == '/') {
++          len = x + 1;
++          break;
++        }
++      }
++    }
++
++    // Print the post 'fname' path.
++    Debug("parent_select", "Post-fname Path='%.*s'.", len, tmp);
++
+     h->update(tmp, len);
+   }
+ 
+-  if (!ignore_query) {
++  // Process the 'qstring' directive.
++  // The query string (if any) is not used if set to ignore the query string or set to ignore the file name or
++  // max_dirs is non-zero.
++  if (!ignore_query && !ignore_fname && max_dirs == 0) {
+     tmp = url->query_get(&len);
+     if (tmp) {
+       h->update("?", 1);
+       h->update(tmp, len);
++      // Print the query string if used.
++      Debug("parent_select", "Query='%.*s'.", len, tmp);
+     }
+   }
+ 
+diff --git a/proxy/ParentConsistentHash.h b/proxy/ParentConsistentHash.h
+index 23b9c540ecd..db627367779 100644
+--- a/proxy/ParentConsistentHash.h
++++ b/proxy/ParentConsistentHash.h
+@@ -46,6 +46,8 @@ class ParentConsistentHash : public ParentSelectionStrategy
+   pRecord *parents[2];
+   bool foundParents[2][MAX_PARENTS];
+   bool ignore_query;
++  bool ignore_fname;
++  int max_dirs;
+ 
+ public:
+   static const int PRIMARY   = 0;
+diff --git a/proxy/ParentSelection.cc b/proxy/ParentSelection.cc
+index c7d2eb0145c..7bee8b5928e 100644
+--- a/proxy/ParentSelection.cc
++++ b/proxy/ParentSelection.cc
+@@ -486,6 +486,8 @@ ParentRecord::DefaultInit(char *val)
+ 
+   this->go_direct       = true;
+   this->ignore_query    = false;
++  this->ignore_fname    = false;
++  this->max_dirs        = 0;
+   this->scheme          = NULL;
+   this->parent_is_proxy = true;
+   errPtr                = ProcessParents(val, true);
+@@ -570,6 +572,18 @@ ParentRecord::Init(matcher_line *line_info)
+         this->ignore_query = false;
+       }
+       used = true;
++    } else if (strcasecmp(label, "fname") == 0) {
++      // fname=ignore | consider
++      if (strcasecmp(val, "ignore") == 0) {
++        this->ignore_fname = true;
++      } else {
++        this->ignore_fname = false;
++      }
++      used = true;
++    } else if (strcasecmp(label, "maxdirs") == 0) {
++      // maxdirs=<int> maximum number of directories to include in hash
++      this->max_dirs = atoi(val);
++      used           = true;
+     } else if (strcasecmp(label, "parent_is_proxy") == 0) {
+       if (strcasecmp(val, "false") == 0) {
+         parent_is_proxy = false;
+@@ -1280,6 +1294,73 @@ EXCLUSIVE_REGRESSION_TEST(PARENTSELECTION)(RegressionTest * /* t ATS_UNUSED */,
+   sleep(1);
+   RE(verify(result, PARENT_FAIL, NULL, 80), 177);
+ 
++  // Test 178 -- Parent Consistent Hash Selection (qstring, fname, maxdirs)
++  const char *rabbit = "http://i.am.rabbit.net/a/b/c/d/e/index.html?f=1&g=2";
++  tbl[0]             = '\0';
++  T("dest_domain=rabbit.net parent=fuzzy:80;fluffy:80 "
++    "round_robin=consistent_hash ");
++  ST(178);
++  REBUILD;
++  REINIT;
++  br(request, "i.am.rabbit.net");
++  request->hdr->url_set(rabbit, strlen(rabbit));
++  FP;
++  sleep(1);
++  RE(verify(result, PARENT_SPECIFIED, "fuzzy", 80), 178);
++
++  // Test 179
++  tbl[0] = '\0';
++  T("dest_domain=rabbit.net parent=fuzzy:80;fluffy:80 "
++    "round_robin=consistent_hash qstring=ignore");
++  ST(179);
++  REBUILD;
++  REINIT;
++  br(request, "i.am.rabbit.net");
++  request->hdr->url_set(rabbit, strlen(rabbit));
++  FP;
++  sleep(1);
++  RE(verify(result, PARENT_SPECIFIED, "fuzzy", 80), 179);
++
++  // Test 180
++  tbl[0] = '\0';
++  T("dest_domain=rabbit.net parent=fuzzy:80;fluffy:80 "
++    "round_robin=consistent_hash fname=ignore");
++  ST(180);
++  REBUILD;
++  REINIT;
++  br(request, "i.am.rabbit.net");
++  request->hdr->url_set(rabbit, strlen(rabbit));
++  FP;
++  sleep(1);
++  RE(verify(result, PARENT_SPECIFIED, "fluffy", 80), 180);
++
++  // Test 181
++  tbl[0] = '\0';
++  T("dest_domain=rabbit.net parent=fuzzy:80;fluffy:80 "
++    "round_robin=consistent_hash maxdirs=3");
++  ST(181);
++  REBUILD;
++  REINIT;
++  br(request, "i.am.rabbit.net");
++  request->hdr->url_set(rabbit, strlen(rabbit));
++  FP;
++  sleep(1);
++  RE(verify(result, PARENT_SPECIFIED, "fluffy", 80), 181);
++
++  // Test 182
++  tbl[0] = '\0';
++  T("dest_domain=rabbit.net parent=fuzzy:80;fluffy:80 "
++    "round_robin=consistent_hash maxdirs=-2");
++  ST(182);
++  REBUILD;
++  REINIT;
++  br(request, "i.am.rabbit.net");
++  request->hdr->url_set(rabbit, strlen(rabbit));
++  FP;
++  sleep(1);
++  RE(verify(result, PARENT_SPECIFIED, "fluffy", 80), 182);
++
++  // Clean-Up and Results Summary
+   delete request;
+   delete result;
+   delete params;
+diff --git a/proxy/ParentSelection.h b/proxy/ParentSelection.h
+index 3fd282632b5..181635f7ebc 100644
+--- a/proxy/ParentSelection.h
++++ b/proxy/ParentSelection.h
+@@ -126,7 +126,9 @@ class ParentRecord : public ControlBase
+       unavailable_server_retry_responses(NULL),
+       parent_retry(PARENT_RETRY_NONE),
+       max_simple_retries(1),
+-      max_unavailable_server_retries(1)
++      max_unavailable_server_retries(1),
++      ignore_fname(false),
++      max_dirs(0)
+   {
+   }
+ 
+@@ -159,6 +161,8 @@ class ParentRecord : public ControlBase
+   ParentRetry_t parent_retry;
+   int max_simple_retries;
+   int max_unavailable_server_retries;
++  bool ignore_fname;
++  int max_dirs;
+ };
+ 
+ // If the parent was set by the external customer api,

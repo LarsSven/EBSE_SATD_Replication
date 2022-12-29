@@ -1,0 +1,615 @@
+diff --git a/runners/spark/pom.xml b/runners/spark/pom.xml
+index 2a389230f821..e434bcc33260 100644
+--- a/runners/spark/pom.xml
++++ b/runners/spark/pom.xml
+@@ -221,17 +221,6 @@
+         </exclusion>
+       </exclusions>
+     </dependency>
+-    <dependency>
+-      <groupId>org.apache.beam</groupId>
+-      <artifactId>beam-examples-java</artifactId>
+-      <exclusions>
+-        <!-- Use Hadoop/Spark's backend logger instead of jdk14 for tests -->
+-        <exclusion>
+-          <groupId>org.slf4j</groupId>
+-          <artifactId>slf4j-jdk14</artifactId>
+-        </exclusion>
+-      </exclusions>
+-    </dependency>
+     <dependency>
+       <groupId>org.apache.avro</groupId>
+       <artifactId>avro-mapred</artifactId>
+diff --git a/runners/spark/src/main/java/org/apache/beam/runners/spark/examples/WordCount.java b/runners/spark/src/main/java/org/apache/beam/runners/spark/examples/WordCount.java
+new file mode 100644
+index 000000000000..4951043e808f
+--- /dev/null
++++ b/runners/spark/src/main/java/org/apache/beam/runners/spark/examples/WordCount.java
+@@ -0,0 +1,137 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.beam.runners.spark.examples;
++
++import org.apache.beam.sdk.Pipeline;
++import org.apache.beam.sdk.io.TextIO;
++import org.apache.beam.sdk.options.Default;
++import org.apache.beam.sdk.options.Description;
++import org.apache.beam.sdk.options.PipelineOptions;
++import org.apache.beam.sdk.options.PipelineOptionsFactory;
++import org.apache.beam.sdk.transforms.Aggregator;
++import org.apache.beam.sdk.transforms.Count;
++import org.apache.beam.sdk.transforms.DoFn;
++import org.apache.beam.sdk.transforms.MapElements;
++import org.apache.beam.sdk.transforms.PTransform;
++import org.apache.beam.sdk.transforms.ParDo;
++import org.apache.beam.sdk.transforms.SimpleFunction;
++import org.apache.beam.sdk.transforms.Sum;
++import org.apache.beam.sdk.values.KV;
++import org.apache.beam.sdk.values.PCollection;
++
++/**
++ * Duplicated to avoid dependency on beam-examples.
++ */
++public class WordCount {
++
++  /**
++   * Concept #2: You can make your pipeline code less verbose by defining your DoFns statically out-
++   * of-line. This DoFn tokenizes lines of text into individual words; we pass it to a ParDo in the
++   * pipeline.
++   */
++  static class ExtractWordsFn extends DoFn<String, String> {
++    private final Aggregator<Long, Long> emptyLines =
++        createAggregator("emptyLines", new Sum.SumLongFn());
++
++    @Override
++    public void processElement(ProcessContext c) {
++      if (c.element().trim().isEmpty()) {
++        emptyLines.addValue(1L);
++      }
++
++      // Split the line into words.
++      String[] words = c.element().split("[^a-zA-Z']+");
++
++      // Output each word encountered into the output PCollection.
++      for (String word : words) {
++        if (!word.isEmpty()) {
++          c.output(word);
++        }
++      }
++    }
++  }
++
++  /** A SimpleFunction that converts a Word and Count into a printable string. */
++  public static class FormatAsTextFn extends SimpleFunction<KV<String, Long>, String> {
++    @Override
++    public String apply(KV<String, Long> input) {
++      return input.getKey() + ": " + input.getValue();
++    }
++  }
++
++  /**
++   * A PTransform that converts a PCollection containing lines of text into a PCollection of
++   * formatted word counts.
++   *
++   * <p>Concept #3: This is a custom composite transform that bundles two transforms (ParDo and
++   * Count) as a reusable PTransform subclass. Using composite transforms allows for easy reuse,
++   * modular testing, and an improved monitoring experience.
++   */
++  public static class CountWords extends PTransform<PCollection<String>,
++      PCollection<KV<String, Long>>> {
++    @Override
++    public PCollection<KV<String, Long>> apply(PCollection<String> lines) {
++
++      // Convert lines of text into individual words.
++      PCollection<String> words = lines.apply(
++          ParDo.of(new ExtractWordsFn()));
++
++      // Count the number of times each word occurs.
++      PCollection<KV<String, Long>> wordCounts =
++          words.apply(Count.<String>perElement());
++
++      return wordCounts;
++    }
++  }
++
++  /**
++   * Options supported by {@link WordCount}.
++   *
++   * <p>Concept #4: Defining your own configuration options. Here, you can add your own arguments
++   * to be processed by the command-line parser, and specify default values for them. You can then
++   * access the options values in your pipeline code.
++   *
++   * <p>Inherits standard configuration options.
++   */
++  public static interface WordCountOptions extends PipelineOptions {
++    @Description("Path of the file to read from")
++    @Default.String("gs://dataflow-samples/shakespeare/kinglear.txt")
++    String getInputFile();
++    void setInputFile(String value);
++
++    @Description("Path of the file to write to")
++    String getOutput();
++    void setOutput(String value);
++  }
++
++  public static void main(String[] args) {
++    WordCountOptions options = PipelineOptionsFactory.fromArgs(args).withValidation()
++      .as(WordCountOptions.class);
++    Pipeline p = Pipeline.create(options);
++
++    // Concepts #2 and #3: Our pipeline applies the composite CountWords transform, and passes the
++    // static FormatAsTextFn() to the ParDo transform.
++    //TODO: remove withoutValidation once possible
++    p.apply("ReadLines", TextIO.Read.from(options.getInputFile()).withoutValidation())
++     .apply(new CountWords())
++     .apply(MapElements.via(new FormatAsTextFn()))
++     .apply("WriteCounts", TextIO.Write.to(options.getOutput()));
++
++    p.run();
++  }
++}
+diff --git a/runners/spark/src/test/java/org/apache/beam/runners/spark/SimpleWordCountTest.java b/runners/spark/src/test/java/org/apache/beam/runners/spark/SimpleWordCountTest.java
+index 6a3edd7e3cd5..6f5ce5e49bfb 100644
+--- a/runners/spark/src/test/java/org/apache/beam/runners/spark/SimpleWordCountTest.java
++++ b/runners/spark/src/test/java/org/apache/beam/runners/spark/SimpleWordCountTest.java
+@@ -21,19 +21,14 @@
+ import static org.hamcrest.Matchers.containsInAnyOrder;
+ import static org.junit.Assert.assertThat;
+ 
++import org.apache.beam.runners.spark.examples.WordCount;
+ import org.apache.beam.sdk.Pipeline;
+ import org.apache.beam.sdk.coders.StringUtf8Coder;
+ import org.apache.beam.sdk.io.TextIO;
+ import org.apache.beam.sdk.options.PipelineOptionsFactory;
+ import org.apache.beam.sdk.testing.PAssert;
+-import org.apache.beam.sdk.transforms.Aggregator;
+-import org.apache.beam.sdk.transforms.Count;
+ import org.apache.beam.sdk.transforms.Create;
+-import org.apache.beam.sdk.transforms.DoFn;
+-import org.apache.beam.sdk.transforms.PTransform;
+-import org.apache.beam.sdk.transforms.ParDo;
+-import org.apache.beam.sdk.transforms.Sum;
+-import org.apache.beam.sdk.values.KV;
++import org.apache.beam.sdk.transforms.MapElements;
+ import org.apache.beam.sdk.values.PCollection;
+ 
+ import com.google.common.collect.ImmutableSet;
+@@ -48,7 +43,6 @@
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.Set;
+-import java.util.regex.Pattern;
+ 
+ /**
+  * Simple word count test.
+@@ -68,7 +62,8 @@ public void testInMem() throws Exception {
+     Pipeline p = Pipeline.create(options);
+     PCollection<String> inputWords = p.apply(Create.of(WORDS).withCoder(StringUtf8Coder
+         .of()));
+-    PCollection<String> output = inputWords.apply(new CountWords());
++    PCollection<String> output = inputWords.apply(new WordCount.CountWords())
++        .apply(MapElements.via(new WordCount.FormatAsTextFn()));
+ 
+     PAssert.that(output).containsInAnyOrder(EXPECTED_COUNT_SET);
+ 
+@@ -86,7 +81,8 @@ public void testOutputFile() throws Exception {
+     Pipeline p = Pipeline.create(options);
+     PCollection<String> inputWords = p.apply(Create.of(WORDS).withCoder(StringUtf8Coder
+         .of()));
+-    PCollection<String> output = inputWords.apply(new CountWords());
++    PCollection<String> output = inputWords.apply(new WordCount.CountWords())
++        .apply(MapElements.via(new WordCount.FormatAsTextFn()));
+ 
+     File outputFile = testFolder.newFile();
+     output.apply("WriteCounts", TextIO.Write.to(outputFile.getAbsolutePath()).withoutSharding());
+@@ -97,64 +93,4 @@ public void testOutputFile() throws Exception {
+     assertThat(Sets.newHashSet(FileUtils.readLines(outputFile)),
+         containsInAnyOrder(EXPECTED_COUNT_SET.toArray()));
+   }
+-
+-  /**
+-   * A DoFn that tokenizes lines of text into individual words.
+-   */
+-  static class ExtractWordsFn extends DoFn<String, String> {
+-    private static final Pattern WORD_BOUNDARY = Pattern.compile("[^a-zA-Z']+");
+-    private final Aggregator<Long, Long> emptyLines =
+-        createAggregator("emptyLines", new Sum.SumLongFn());
+-
+-    @Override
+-    public void processElement(ProcessContext c) {
+-      // Split the line into words.
+-      String[] words = WORD_BOUNDARY.split(c.element());
+-
+-      // Keep track of the number of lines without any words encountered while tokenizing.
+-      // This aggregator is visible in the monitoring UI when run using DataflowRunner.
+-      if (words.length == 0) {
+-        emptyLines.addValue(1L);
+-      }
+-
+-      // Output each word encountered into the output PCollection.
+-      for (String word : words) {
+-        if (!word.isEmpty()) {
+-          c.output(word);
+-        }
+-      }
+-    }
+-  }
+-
+-  /**
+-   * A DoFn that converts a Word and Count into a printable string.
+-   */
+-  private static class FormatCountsFn extends DoFn<KV<String, Long>, String> {
+-    @Override
+-    public void processElement(ProcessContext c) {
+-      c.output(c.element().getKey() + ": " + c.element().getValue());
+-    }
+-  }
+-
+-  /**
+-   * A {@link PTransform} counting words.
+-   */
+-  public static class CountWords extends PTransform<PCollection<String>, PCollection<String>> {
+-    @Override
+-    public PCollection<String> apply(PCollection<String> lines) {
+-
+-      // Convert lines of text into individual words.
+-      PCollection<String> words = lines.apply(
+-          ParDo.of(new ExtractWordsFn()));
+-
+-      // Count the number of times each word occurs.
+-      PCollection<KV<String, Long>> wordCounts =
+-          words.apply(Count.<String>perElement());
+-
+-      // Format each word and count into a printable string.
+-
+-      return wordCounts.apply(ParDo.of(new FormatCountsFn()));
+-    }
+-
+-  }
+ }
+diff --git a/runners/spark/src/test/java/org/apache/beam/runners/spark/TfIdfTest.java b/runners/spark/src/test/java/org/apache/beam/runners/spark/TfIdfTest.java
+index df78338d4269..d1f8d125bdad 100644
+--- a/runners/spark/src/test/java/org/apache/beam/runners/spark/TfIdfTest.java
++++ b/runners/spark/src/test/java/org/apache/beam/runners/spark/TfIdfTest.java
+@@ -18,18 +18,30 @@
+ 
+ package org.apache.beam.runners.spark;
+ 
+-import org.apache.beam.examples.complete.TfIdf;
+ import org.apache.beam.sdk.Pipeline;
+ import org.apache.beam.sdk.coders.StringDelegateCoder;
+ import org.apache.beam.sdk.options.PipelineOptionsFactory;
+ import org.apache.beam.sdk.testing.PAssert;
++import org.apache.beam.sdk.transforms.Count;
+ import org.apache.beam.sdk.transforms.Create;
++import org.apache.beam.sdk.transforms.DoFn;
+ import org.apache.beam.sdk.transforms.Keys;
++import org.apache.beam.sdk.transforms.PTransform;
++import org.apache.beam.sdk.transforms.ParDo;
+ import org.apache.beam.sdk.transforms.RemoveDuplicates;
++import org.apache.beam.sdk.transforms.Values;
++import org.apache.beam.sdk.transforms.View;
++import org.apache.beam.sdk.transforms.join.CoGbkResult;
++import org.apache.beam.sdk.transforms.join.CoGroupByKey;
++import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
+ import org.apache.beam.sdk.values.KV;
+ import org.apache.beam.sdk.values.PCollection;
+ 
++import org.apache.beam.sdk.values.PCollectionView;
++import org.apache.beam.sdk.values.TupleTag;
+ import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import java.net.URI;
+ import java.util.Arrays;
+@@ -52,7 +64,7 @@ public void testTfIdf() throws Exception {
+             KV.of(new URI("x"), "a b c d"),
+             KV.of(new URI("y"), "a b c"),
+             KV.of(new URI("z"), "a m n")))
+-        .apply(new TfIdf.ComputeTfIdf());
++        .apply(new ComputeTfIdf());
+ 
+     PCollection<String> words = wordToUriAndTfIdf
+         .apply(Keys.<String>create())
+@@ -64,4 +76,187 @@ public void testTfIdf() throws Exception {
+     res.close();
+   }
+ 
++  /**
++   * Duplicated to avoid dependency on beam-examlpes.
++   */
++  public static class ComputeTfIdf
++      extends PTransform<PCollection<KV<URI, String>>, PCollection<KV<String, KV<URI, Double>>>> {
++    public ComputeTfIdf() { }
++
++    @Override
++    public PCollection<KV<String, KV<URI, Double>>> apply(
++      PCollection<KV<URI, String>> uriToContent) {
++
++      // Compute the total number of documents, and
++      // prepare this singleton PCollectionView for
++      // use as a side input.
++      final PCollectionView<Long> totalDocuments =
++          uriToContent
++          .apply("GetURIs", Keys.<URI>create())
++          .apply("RemoveDuplicateDocs", RemoveDuplicates.<URI>create())
++          .apply(Count.<URI>globally())
++          .apply(View.<Long>asSingleton());
++
++      // Create a collection of pairs mapping a URI to each
++      // of the words in the document associated with that that URI.
++      PCollection<KV<URI, String>> uriToWords = uriToContent
++          .apply("SplitWords", ParDo.of(
++              new DoFn<KV<URI, String>, KV<URI, String>>() {
++                @Override
++                public void processElement(ProcessContext c) {
++                  URI uri = c.element().getKey();
++                  String line = c.element().getValue();
++                  for (String word : line.split("\\W+")) {
++                    // Log INFO messages when the word “love” is found.
++                    if (word.toLowerCase().equals("love")) {
++                      LOG.info("Found {}", word.toLowerCase());
++                    }
++
++                    if (!word.isEmpty()) {
++                      c.output(KV.of(uri, word.toLowerCase()));
++                    }
++                  }
++                }
++              }));
++
++      // Compute a mapping from each word to the total
++      // number of documents in which it appears.
++      PCollection<KV<String, Long>> wordToDocCount = uriToWords
++          .apply("RemoveDuplicateWords", RemoveDuplicates.<KV<URI, String>>create())
++          .apply(Values.<String>create())
++          .apply("CountDocs", Count.<String>perElement());
++
++      // Compute a mapping from each URI to the total
++      // number of words in the document associated with that URI.
++      PCollection<KV<URI, Long>> uriToWordTotal = uriToWords
++          .apply("GetURIs2", Keys.<URI>create())
++          .apply("CountWords", Count.<URI>perElement());
++
++      // Count, for each (URI, word) pair, the number of
++      // occurrences of that word in the document associated
++      // with the URI.
++      PCollection<KV<KV<URI, String>, Long>> uriAndWordToCount = uriToWords
++          .apply("CountWordDocPairs", Count.<KV<URI, String>>perElement());
++
++      // Adjust the above collection to a mapping from
++      // (URI, word) pairs to counts into an isomorphic mapping
++      // from URI to (word, count) pairs, to prepare for a join
++      // by the URI key.
++      PCollection<KV<URI, KV<String, Long>>> uriToWordAndCount = uriAndWordToCount
++          .apply("ShiftKeys", ParDo.of(
++              new DoFn<KV<KV<URI, String>, Long>, KV<URI, KV<String, Long>>>() {
++                @Override
++                public void processElement(ProcessContext c) {
++                  URI uri = c.element().getKey().getKey();
++                  String word = c.element().getKey().getValue();
++                  Long occurrences = c.element().getValue();
++                  c.output(KV.of(uri, KV.of(word, occurrences)));
++                }
++              }));
++
++      // Prepare to join the mapping of URI to (word, count) pairs with
++      // the mapping of URI to total word counts, by associating
++      // each of the input PCollection<KV<URI, ...>> with
++      // a tuple tag. Each input must have the same key type, URI
++      // in this case. The type parameter of the tuple tag matches
++      // the types of the values for each collection.
++      final TupleTag<Long> wordTotalsTag = new TupleTag<Long>();
++      final TupleTag<KV<String, Long>> wordCountsTag = new TupleTag<KV<String, Long>>();
++      KeyedPCollectionTuple<URI> coGbkInput = KeyedPCollectionTuple
++          .of(wordTotalsTag, uriToWordTotal)
++          .and(wordCountsTag, uriToWordAndCount);
++
++      // Perform a CoGroupByKey (a sort of pre-join) on the prepared
++      // inputs. This yields a mapping from URI to a CoGbkResult
++      // (CoGroupByKey Result). The CoGbkResult is a mapping
++      // from the above tuple tags to the values in each input
++      // associated with a particular URI. In this case, each
++      // KV<URI, CoGbkResult> group a URI with the total number of
++      // words in that document as well as all the (word, count)
++      // pairs for particular words.
++      PCollection<KV<URI, CoGbkResult>> uriToWordAndCountAndTotal = coGbkInput
++          .apply("CoGroupByUri", CoGroupByKey.<URI>create());
++
++      // Compute a mapping from each word to a (URI, term frequency)
++      // pair for each URI. A word's term frequency for a document
++      // is simply the number of times that word occurs in the document
++      // divided by the total number of words in the document.
++      PCollection<KV<String, KV<URI, Double>>> wordToUriAndTf = uriToWordAndCountAndTotal
++          .apply("ComputeTermFrequencies", ParDo.of(
++              new DoFn<KV<URI, CoGbkResult>, KV<String, KV<URI, Double>>>() {
++                @Override
++                public void processElement(ProcessContext c) {
++                  URI uri = c.element().getKey();
++                  Long wordTotal = c.element().getValue().getOnly(wordTotalsTag);
++
++                  for (KV<String, Long> wordAndCount
++                           : c.element().getValue().getAll(wordCountsTag)) {
++                    String word = wordAndCount.getKey();
++                    Long wordCount = wordAndCount.getValue();
++                    Double termFrequency = wordCount.doubleValue() / wordTotal.doubleValue();
++                    c.output(KV.of(word, KV.of(uri, termFrequency)));
++                  }
++                }
++              }));
++
++      // Compute a mapping from each word to its document frequency.
++      // A word's document frequency in a corpus is the number of
++      // documents in which the word appears divided by the total
++      // number of documents in the corpus. Note how the total number of
++      // documents is passed as a side input; the same value is
++      // presented to each invocation of the DoFn.
++      PCollection<KV<String, Double>> wordToDf = wordToDocCount
++          .apply("ComputeDocFrequencies", ParDo
++              .withSideInputs(totalDocuments)
++              .of(new DoFn<KV<String, Long>, KV<String, Double>>() {
++                @Override
++                public void processElement(ProcessContext c) {
++                  String word = c.element().getKey();
++                  Long documentCount = c.element().getValue();
++                  Long documentTotal = c.sideInput(totalDocuments);
++                  Double documentFrequency = documentCount.doubleValue()
++                      / documentTotal.doubleValue();
++
++                  c.output(KV.of(word, documentFrequency));
++                }
++              }));
++
++      // Join the term frequency and document frequency
++      // collections, each keyed on the word.
++      final TupleTag<KV<URI, Double>> tfTag = new TupleTag<KV<URI, Double>>();
++      final TupleTag<Double> dfTag = new TupleTag<Double>();
++      PCollection<KV<String, CoGbkResult>> wordToUriAndTfAndDf = KeyedPCollectionTuple
++          .of(tfTag, wordToUriAndTf)
++          .and(dfTag, wordToDf)
++          .apply(CoGroupByKey.<String>create());
++
++      // Compute a mapping from each word to a (URI, TF-IDF) score
++      // for each URI. There are a variety of definitions of TF-IDF
++      // ("term frequency - inverse document frequency") score;
++      // here we use a basic version that is the term frequency
++      // divided by the log of the document frequency.
++      return wordToUriAndTfAndDf
++          .apply("ComputeTfIdf", ParDo.of(
++              new DoFn<KV<String, CoGbkResult>, KV<String, KV<URI, Double>>>() {
++                @Override
++                public void processElement(ProcessContext c) {
++                  String word = c.element().getKey();
++                  Double df = c.element().getValue().getOnly(dfTag);
++
++                  for (KV<URI, Double> uriAndTf : c.element().getValue().getAll(tfTag)) {
++                    URI uri = uriAndTf.getKey();
++                    Double tf = uriAndTf.getValue();
++                    Double tfIdf = tf * Math.log(1 / df);
++                    c.output(KV.of(word, KV.of(uri, tfIdf)));
++                  }
++                }
++              }));
++    }
++
++    // Instantiate Logger.
++    // It is suggested that the user specify the class name of the containing class
++    // (in this case ComputeTfIdf).
++    private static final Logger LOG = LoggerFactory.getLogger(ComputeTfIdf.class);
++  }
++
+ }
+diff --git a/runners/spark/src/test/java/org/apache/beam/runners/spark/io/NumShardsTest.java b/runners/spark/src/test/java/org/apache/beam/runners/spark/io/NumShardsTest.java
+index b4268d6127c1..36d8b67fb725 100644
+--- a/runners/spark/src/test/java/org/apache/beam/runners/spark/io/NumShardsTest.java
++++ b/runners/spark/src/test/java/org/apache/beam/runners/spark/io/NumShardsTest.java
+@@ -21,10 +21,10 @@
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ 
+-import org.apache.beam.examples.WordCount;
+ import org.apache.beam.runners.spark.EvaluationResult;
+ import org.apache.beam.runners.spark.SparkPipelineOptions;
+ import org.apache.beam.runners.spark.SparkRunner;
++import org.apache.beam.runners.spark.examples.WordCount;
+ import org.apache.beam.sdk.Pipeline;
+ import org.apache.beam.sdk.coders.StringUtf8Coder;
+ import org.apache.beam.sdk.io.TextIO;
+diff --git a/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/WindowedWordCountTest.java b/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/WindowedWordCountTest.java
+index 043d506d9247..b70e090ddae7 100644
+--- a/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/WindowedWordCountTest.java
++++ b/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/WindowedWordCountTest.java
+@@ -19,14 +19,15 @@
+ package org.apache.beam.runners.spark.translation;
+ 
+ import org.apache.beam.runners.spark.EvaluationResult;
+-import org.apache.beam.runners.spark.SimpleWordCountTest;
+ import org.apache.beam.runners.spark.SparkRunner;
++import org.apache.beam.runners.spark.examples.WordCount;
+ import org.apache.beam.sdk.Pipeline;
+ import org.apache.beam.sdk.coders.StringUtf8Coder;
+ import org.apache.beam.sdk.options.PipelineOptions;
+ import org.apache.beam.sdk.options.PipelineOptionsFactory;
+ import org.apache.beam.sdk.testing.PAssert;
+ import org.apache.beam.sdk.transforms.Create;
++import org.apache.beam.sdk.transforms.MapElements;
+ import org.apache.beam.sdk.transforms.windowing.FixedWindows;
+ import org.apache.beam.sdk.transforms.windowing.SlidingWindows;
+ import org.apache.beam.sdk.transforms.windowing.Window;
+@@ -64,7 +65,8 @@ public void testFixed() throws Exception {
+     PCollection<String> windowedWords =
+         inputWords.apply(Window.<String>into(FixedWindows.of(Duration.standardMinutes(1))));
+ 
+-    PCollection<String> output = windowedWords.apply(new SimpleWordCountTest.CountWords());
++    PCollection<String> output = windowedWords.apply(new WordCount.CountWords())
++        .apply(MapElements.via(new WordCount.FormatAsTextFn()));
+ 
+     PAssert.that(output).containsInAnyOrder(EXPECTED_FIXED_SEPARATE_COUNT_SET);
+ 
+@@ -85,7 +87,8 @@ public void testFixed2() throws Exception {
+     PCollection<String> windowedWords = inputWords
+         .apply(Window.<String>into(FixedWindows.of(Duration.standardMinutes(5))));
+ 
+-    PCollection<String> output = windowedWords.apply(new SimpleWordCountTest.CountWords());
++    PCollection<String> output = windowedWords.apply(new WordCount.CountWords())
++        .apply(MapElements.via(new WordCount.FormatAsTextFn()));
+ 
+     PAssert.that(output).containsInAnyOrder(EXPECTED_FIXED_SAME_COUNT_SET);
+ 
+@@ -108,7 +111,8 @@ public void testSliding() throws Exception {
+         .apply(Window.<String>into(SlidingWindows.of(Duration.standardMinutes(2))
+         .every(Duration.standardMinutes(1))));
+ 
+-    PCollection<String> output = windowedWords.apply(new SimpleWordCountTest.CountWords());
++    PCollection<String> output = windowedWords.apply(new WordCount.CountWords())
++        .apply(MapElements.via(new WordCount.FormatAsTextFn()));
+ 
+     PAssert.that(output).containsInAnyOrder(EXPECTED_SLIDING_COUNT_SET);
+ 
+diff --git a/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/streaming/SimpleStreamingWordCountTest.java b/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/streaming/SimpleStreamingWordCountTest.java
+index 75a702b87791..75ab2745807d 100644
+--- a/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/streaming/SimpleStreamingWordCountTest.java
++++ b/runners/spark/src/test/java/org/apache/beam/runners/spark/translation/streaming/SimpleStreamingWordCountTest.java
+@@ -19,14 +19,15 @@
+ 
+ 
+ import org.apache.beam.runners.spark.EvaluationResult;
+-import org.apache.beam.runners.spark.SimpleWordCountTest;
+ import org.apache.beam.runners.spark.SparkRunner;
+ import org.apache.beam.runners.spark.SparkStreamingPipelineOptions;
++import org.apache.beam.runners.spark.examples.WordCount;
+ import org.apache.beam.runners.spark.io.CreateStream;
+ import org.apache.beam.runners.spark.translation.streaming.utils.PAssertStreaming;
+ import org.apache.beam.sdk.Pipeline;
+ import org.apache.beam.sdk.coders.StringUtf8Coder;
+ import org.apache.beam.sdk.options.PipelineOptionsFactory;
++import org.apache.beam.sdk.transforms.MapElements;
+ import org.apache.beam.sdk.transforms.windowing.FixedWindows;
+ import org.apache.beam.sdk.transforms.windowing.Window;
+ import org.apache.beam.sdk.values.PCollection;
+@@ -65,7 +66,8 @@ public void testRun() throws Exception {
+     PCollection<String> windowedWords = inputWords
+         .apply(Window.<String>into(FixedWindows.of(Duration.standardSeconds(1))));
+ 
+-    PCollection<String> output = windowedWords.apply(new SimpleWordCountTest.CountWords());
++    PCollection<String> output = windowedWords.apply(new WordCount.CountWords())
++        .apply(MapElements.via(new WordCount.FormatAsTextFn()));
+ 
+     PAssertStreaming.assertContents(output, EXPECTED_COUNTS);
+     EvaluationResult res = SparkRunner.create(options).run(p);

@@ -1,0 +1,503 @@
+diff --git a/core/src/main/java/org/apache/calcite/plan/volcano/ChainedPhaseRuleMappingInitializer.java b/core/src/main/java/org/apache/calcite/plan/volcano/ChainedPhaseRuleMappingInitializer.java
+deleted file mode 100644
+index ce276c12d8c..00000000000
+--- a/core/src/main/java/org/apache/calcite/plan/volcano/ChainedPhaseRuleMappingInitializer.java
++++ /dev/null
+@@ -1,68 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to you under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.calcite.plan.volcano;
+-
+-import java.util.Map;
+-import java.util.Set;
+-
+-/**
+- * ChainedPhaseRuleMappingInitializer is an abstract implementation of
+- * {@link VolcanoPlannerPhaseRuleMappingInitializer} that allows additional
+- * rules to be layered on top of those configured by a subordinate
+- * {@link VolcanoPlannerPhaseRuleMappingInitializer}.
+- *
+- * @see VolcanoPlannerPhaseRuleMappingInitializer
+- */
+-public abstract class ChainedPhaseRuleMappingInitializer
+-    implements VolcanoPlannerPhaseRuleMappingInitializer {
+-  //~ Instance fields --------------------------------------------------------
+-
+-  private final VolcanoPlannerPhaseRuleMappingInitializer subordinate;
+-
+-  //~ Constructors -----------------------------------------------------------
+-
+-  public ChainedPhaseRuleMappingInitializer(
+-      VolcanoPlannerPhaseRuleMappingInitializer subordinate) {
+-    this.subordinate = subordinate;
+-  }
+-
+-  //~ Methods ----------------------------------------------------------------
+-
+-  public final void initialize(
+-      Map<VolcanoPlannerPhase, Set<String>> phaseRuleMap) {
+-    // Initialize subordinate's mappings.
+-    subordinate.initialize(phaseRuleMap);
+-
+-    // Initialize our mappings.
+-    chainedInitialize(phaseRuleMap);
+-  }
+-
+-  /**
+-   * Extend this method to provide phase-to-rule mappings beyond what is
+-   * provided by this initializer's subordinate.
+-   *
+-   * <p>When this method is called, the map will already be pre-initialized
+-   * with empty sets for each VolcanoPlannerPhase. Implementations must not
+-   * return having added or removed keys from the map, although it is safe to
+-   * temporarily add or remove keys.
+-   *
+-   * @param phaseRuleMap the {@link VolcanoPlannerPhase}-rule description map
+-   * @see VolcanoPlannerPhaseRuleMappingInitializer
+-   */
+-  public abstract void chainedInitialize(
+-      Map<VolcanoPlannerPhase, Set<String>> phaseRuleMap);
+-}
+diff --git a/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleDriver.java b/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleDriver.java
+index 3ff8300df23..47add561a01 100644
+--- a/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleDriver.java
++++ b/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleDriver.java
+@@ -22,11 +22,10 @@
+ import org.slf4j.Logger;
+ 
+ /***
+- * <p>The algorithm executes repeatedly in a series of phases. In each phase
+- * the exact rules that may be fired varies. The mapping of phases to rule
+- * sets is maintained in the {@link #ruleQueue}.
++ * <p>The algorithm executes repeatedly.
++ * The exact rules that may be fired varies.
+  *
+- * <p>In each phase, the planner then iterates over the rule matches presented
++ * <p>The planner iterates over the rule matches presented
+  * by the rule queue until the rule queue becomes empty.
+  */
+ class IterativeRuleDriver implements RuleDriver {
+@@ -46,34 +45,28 @@ class IterativeRuleDriver implements RuleDriver {
+   }
+ 
+   @Override public void drive() {
+-    PLANNING:
+-    for (VolcanoPlannerPhase phase : VolcanoPlannerPhase.values()) {
+-      while (true) {
+-        LOGGER.debug("PLANNER = {}; PHASE = {}; COST = {}",
+-            this, phase.toString(), planner.root.bestCost);
++    while (true) {
++      LOGGER.debug("PLANNER = {}; COST = {}", this, planner.root.bestCost);
+ 
+-        VolcanoRuleMatch match = ruleQueue.popMatch(phase);
+-        if (match == null) {
+-          break;
+-        }
+-
+-        assert match.getRule().matches(match);
+-        try {
+-          match.onMatch();
+-        } catch (VolcanoTimeoutException e) {
+-          LOGGER.warn("Volcano planning times out, cancels the subsequent optimization.");
+-          planner.canonize();
+-          ruleQueue.phaseCompleted(phase);
+-          break PLANNING;
+-        }
++      VolcanoRuleMatch match = ruleQueue.popMatch();
++      if (match == null) {
++        break;
++      }
+ 
+-        // The root may have been merged with another
+-        // subset. Find the new root subset.
++      assert match.getRule().matches(match);
++      try {
++        match.onMatch();
++      } catch (VolcanoTimeoutException e) {
++        LOGGER.warn("Volcano planning times out, cancels the subsequent optimization.");
+         planner.canonize();
++        break;
+       }
+ 
+-      ruleQueue.phaseCompleted(phase);
++      // The root may have been merged with another
++      // subset. Find the new root subset.
++      planner.canonize();
+     }
++
+   }
+ 
+   @Override public void onProduce(RelNode rel, RelSubset subset) {
+diff --git a/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleQueue.java b/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleQueue.java
+index 531df456a8e..b6aec2bf6a3 100644
+--- a/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleQueue.java
++++ b/core/src/main/java/org/apache/calcite/plan/volcano/IterativeRuleQueue.java
+@@ -20,17 +20,14 @@
+ import org.apache.calcite.util.trace.CalciteTrace;
+ 
+ import com.google.common.collect.HashMultimap;
+-import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Multimap;
+ 
+ import org.slf4j.Logger;
+ 
+ import java.io.PrintWriter;
+ import java.io.StringWriter;
+-import java.util.EnumMap;
+ import java.util.HashSet;
+ import java.util.LinkedList;
+-import java.util.Map;
+ import java.util.Queue;
+ import java.util.Set;
+ 
+@@ -43,56 +40,21 @@ class IterativeRuleQueue extends RuleQueue {
+ 
+   private static final Logger LOGGER = CalciteTrace.getPlannerTracer();
+ 
+-  private static final Set<String> ALL_RULES = ImmutableSet.of("<ALL RULES>");
+-
+   //~ Instance fields --------------------------------------------------------
+ 
+   /**
+-   * Map of {@link VolcanoPlannerPhase} to a list of rule-matches. Initially,
+-   * there is an empty {@link PhaseMatchList} for each planner phase. As the
++   * A list of rule-matches.
++   * Initially, there is an empty {@link MatchList}. As the
+    * planner invokes {@link #addMatch(VolcanoRuleMatch)} the rule-match is
+-   * added to the appropriate PhaseMatchList(s). As the planner completes
+-   * phases, the matching entry is removed from this list to avoid unused
+-   * work.
+-   */
+-  final Map<VolcanoPlannerPhase, PhaseMatchList> matchListMap =
+-      new EnumMap<>(VolcanoPlannerPhase.class);
+-
+-  /**
+-   * Maps a {@link VolcanoPlannerPhase} to a set of rule descriptions. Named rules
+-   * may be invoked in their corresponding phase.
+-   *
+-   * <p>See {@link VolcanoPlannerPhaseRuleMappingInitializer} for more
+-   * information regarding the contents of this Map and how it is initialized.
++   * added to the appropriate MatchList(s). As the planner completes the match,
++   * the matching entry is removed from this list to avoid unused work.
+    */
+-  private final Map<VolcanoPlannerPhase, Set<String>> phaseRuleMapping;
++  final MatchList matchList = new MatchList();
+ 
+   //~ Constructors -----------------------------------------------------------
+ 
+   IterativeRuleQueue(VolcanoPlanner planner) {
+     super(planner);
+-
+-    phaseRuleMapping = new EnumMap<>(VolcanoPlannerPhase.class);
+-
+-    // init empty sets for all phases
+-    for (VolcanoPlannerPhase phase : VolcanoPlannerPhase.values()) {
+-      phaseRuleMapping.put(phase, new HashSet<>());
+-    }
+-
+-    // configure phases
+-    planner.getPhaseRuleMappingInitializer().initialize(phaseRuleMapping);
+-
+-    for (VolcanoPlannerPhase phase : VolcanoPlannerPhase.values()) {
+-      // empty phases get converted to "all rules"
+-      if (phaseRuleMapping.get(phase).isEmpty()) {
+-        phaseRuleMapping.put(phase, ALL_RULES);
+-      }
+-
+-      // create a match list data structure for each phase
+-      PhaseMatchList matchList = new PhaseMatchList(phase);
+-
+-      matchListMap.put(phase, matchList);
+-    }
+   }
+ 
+   //~ Methods ----------------------------------------------------------------
+@@ -101,51 +63,30 @@ class IterativeRuleQueue extends RuleQueue {
+    */
+   @Override public boolean clear() {
+     boolean empty = true;
+-    for (PhaseMatchList matchList : matchListMap.values()) {
+-      if (!matchList.queue.isEmpty() || !matchList.preQueue.isEmpty()) {
+-        empty = false;
+-      }
+-      matchList.clear();
++    if (!matchList.queue.isEmpty() || !matchList.preQueue.isEmpty()) {
++      empty = false;
+     }
++    matchList.clear();
+     return !empty;
+   }
+ 
+   /**
+-   * Removes the {@link PhaseMatchList rule-match list} for the given planner
+-   * phase.
+-   */
+-  public void phaseCompleted(VolcanoPlannerPhase phase) {
+-    matchListMap.get(phase).clear();
+-  }
+-
+-  /**
+-   * Adds a rule match. The rule-matches are automatically added to all
+-   * existing {@link PhaseMatchList per-phase rule-match lists} which allow
++   * Add a rule match, allow
+    * the rule referenced by the match.
+    */
+   public void addMatch(VolcanoRuleMatch match) {
+     final String matchName = match.toString();
+-    for (PhaseMatchList matchList : matchListMap.values()) {
+-      Set<String> phaseRuleSet = phaseRuleMapping.get(matchList.phase);
+-      if (phaseRuleSet != ALL_RULES) {
+-        String ruleDescription = match.getRule().toString();
+-        if (!phaseRuleSet.contains(ruleDescription)) {
+-          continue;
+-        }
+-      }
+ 
+-      if (!matchList.names.add(matchName)) {
+-        // Identical match has already been added.
+-        continue;
+-      }
++    if (!matchList.names.add(matchName)) {
++      // Identical match has already been added.
++      return;
++    }
+ 
+-      LOGGER.trace("{} Rule-match queued: {}", matchList.phase.toString(), matchName);
++    LOGGER.trace("Rule-match queued: {}", matchName);
+ 
+-      matchList.offer(match);
++    matchList.offer(match);
+ 
+-      matchList.matchMap.put(
+-          planner.getSubset(match.rels[0]), match);
+-    }
++    matchList.matchMap.put(planner.getSubset(match.rels[0]), match);
+   }
+ 
+   /**
+@@ -157,28 +98,19 @@ public void addMatch(VolcanoRuleMatch match) {
+    * which have become invalid, say if one of their operands belongs to an
+    * obsolete set or has importance=0.
+    *
+-   * @throws java.lang.AssertionError if this method is called with a phase
+-   *                              previously marked as completed via
+-   *                              {@link #phaseCompleted(VolcanoPlannerPhase)}.
+    */
+-  public VolcanoRuleMatch popMatch(VolcanoPlannerPhase phase) {
++  public VolcanoRuleMatch popMatch() {
+     dumpPlannerState();
+ 
+-    PhaseMatchList phaseMatchList = matchListMap.get(phase);
+-    if (phaseMatchList == null) {
+-      throw new AssertionError("Used match list for phase " + phase
+-          + " after phase complete");
+-    }
+-
+     VolcanoRuleMatch match;
+     for (;;) {
+-      if (phaseMatchList.size() == 0) {
++      if (matchList.size() == 0) {
+         return null;
+       }
+ 
+-      dumpRuleQueue(phaseMatchList);
++      dumpRuleQueue(matchList);
+ 
+-      match = phaseMatchList.poll();
++      match = matchList.poll();
+ 
+       if (skipMatch(match)) {
+         LOGGER.debug("Skip match: {}", match);
+@@ -191,8 +123,7 @@ public VolcanoRuleMatch popMatch(VolcanoPlannerPhase phase) {
+     // may not be removed from the matchMap because the subset may have
+     // changed, it is OK to leave it since the matchMap will be cleared
+     // at the end.
+-    phaseMatchList.matchMap.remove(
+-        planner.getSubset(match.rels[0]), match);
++    matchList.matchMap.remove(planner.getSubset(match.rels[0]), match);
+ 
+     LOGGER.debug("Pop match: {}", match);
+     return match;
+@@ -201,15 +132,15 @@ public VolcanoRuleMatch popMatch(VolcanoPlannerPhase phase) {
+   /**
+    * Dumps rules queue to the logger when debug level is set to {@code TRACE}.
+    */
+-  private void dumpRuleQueue(PhaseMatchList phaseMatchList) {
++  private void dumpRuleQueue(MatchList matchList) {
+     if (LOGGER.isTraceEnabled()) {
+       StringBuilder b = new StringBuilder();
+       b.append("Rule queue:");
+-      for (VolcanoRuleMatch rule : phaseMatchList.preQueue) {
++      for (VolcanoRuleMatch rule : matchList.preQueue) {
+         b.append("\n");
+         b.append(rule);
+       }
+-      for (VolcanoRuleMatch rule : phaseMatchList.queue) {
++      for (VolcanoRuleMatch rule : matchList.queue) {
+         b.append("\n");
+         b.append(rule);
+       }
+@@ -234,15 +165,9 @@ private void dumpPlannerState() {
+   //~ Inner Classes ----------------------------------------------------------
+ 
+   /**
+-   * PhaseMatchList represents a set of {@link VolcanoRuleMatch rule-matches}
+-   * for a particular
+-   * {@link VolcanoPlannerPhase phase of the planner's execution}.
++   * MatchList represents a set of {@link VolcanoRuleMatch rule-matches}.
+    */
+-  private static class PhaseMatchList {
+-    /**
+-     * The VolcanoPlannerPhase that this PhaseMatchList is used in.
+-     */
+-    final VolcanoPlannerPhase phase;
++  private static class MatchList {
+ 
+     /**
+      * Rule match queue for SubstitutionRule
+@@ -268,10 +193,6 @@ private static class PhaseMatchList {
+     final Multimap<RelSubset, VolcanoRuleMatch> matchMap =
+         HashMultimap.create();
+ 
+-    PhaseMatchList(VolcanoPlannerPhase phase) {
+-      this.phase = phase;
+-    }
+-
+     int size() {
+       return preQueue.size() + queue.size();
+     }
+diff --git a/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java b/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java
+index e38986391c6..6014c795c70 100644
+--- a/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java
++++ b/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java
+@@ -237,16 +237,6 @@ private void initRuleQueue() {
+ 
+   //~ Methods ----------------------------------------------------------------
+ 
+-  protected VolcanoPlannerPhaseRuleMappingInitializer
+-      getPhaseRuleMappingInitializer() {
+-    return phaseRuleMap -> {
+-      // Disable all phases except OPTIMIZE by adding one useless rule name.
+-      phaseRuleMap.get(VolcanoPlannerPhase.PRE_PROCESS_MDR).add("xxx");
+-      phaseRuleMap.get(VolcanoPlannerPhase.PRE_PROCESS).add("xxx");
+-      phaseRuleMap.get(VolcanoPlannerPhase.CLEANUP).add("xxx");
+-    };
+-  }
+-
+   /**
+    * Enable or disable top-down optimization.
+    *
+diff --git a/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlannerPhase.java b/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlannerPhase.java
+deleted file mode 100644
+index 24ed5e9ec8f..00000000000
+--- a/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlannerPhase.java
++++ /dev/null
+@@ -1,26 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to you under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.calcite.plan.volcano;
+-
+-/**
+- * VolcanoPlannerPhase represents the phases of operation that the
+- * {@link VolcanoPlanner} passes through during optimization of a tree of
+- * {@link org.apache.calcite.rel.RelNode} objects.
+- */
+-public enum VolcanoPlannerPhase {
+-  PRE_PROCESS_MDR, PRE_PROCESS, OPTIMIZE, CLEANUP,
+-}
+diff --git a/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlannerPhaseRuleMappingInitializer.java b/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlannerPhaseRuleMappingInitializer.java
+deleted file mode 100644
+index 02fa7ce4d5d..00000000000
+--- a/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlannerPhaseRuleMappingInitializer.java
++++ /dev/null
+@@ -1,49 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to you under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.calcite.plan.volcano;
+-
+-import java.util.Map;
+-import java.util.Set;
+-
+-/**
+- * VolcanoPlannerPhaseRuleMappingInitializer describes an interface for
+- * initializing the mapping of {@link VolcanoPlannerPhase}s to sets of rule
+- * descriptions.
+- *
+- * <p><b>Note:</b> Rule descriptions are obtained via
+- * {@link org.apache.calcite.plan.RelOptRule#toString()}. By default they are
+- * the class's simple name (e.g. class name sans package), unless the class is
+- * an inner class, in which case the default is the inner class's simple
+- * name. Some rules explicitly provide alternate descriptions by calling the
+- * {@link org.apache.calcite.plan.RelOptRule#RelOptRule(org.apache.calcite.plan.RelOptRuleOperand, String)}
+- * constructor.
+- */
+-public interface VolcanoPlannerPhaseRuleMappingInitializer {
+-  //~ Methods ----------------------------------------------------------------
+-
+-  /**
+-   * Initializes a {@link VolcanoPlannerPhase}-to-rule map. Rules are
+-   * specified by description (see above). When this method is called, the map
+-   * will already be pre-initialized with empty sets for each
+-   * VolcanoPlannerPhase. Implementations must not return having added or
+-   * removed keys from the map, although it is safe to temporarily add or
+-   * remove keys.
+-   *
+-   * @param phaseRuleMap a {@link VolcanoPlannerPhase}-to-rule map
+-   */
+-  void initialize(Map<VolcanoPlannerPhase, Set<String>> phaseRuleMap);
+-}
+diff --git a/core/src/test/java/org/apache/calcite/plan/volcano/VolcanoPlannerTest.java b/core/src/test/java/org/apache/calcite/plan/volcano/VolcanoPlannerTest.java
+index 9d1371f1fc1..4b79ad70c29 100644
+--- a/core/src/test/java/org/apache/calcite/plan/volcano/VolcanoPlannerTest.java
++++ b/core/src/test/java/org/apache/calcite/plan/volcano/VolcanoPlannerTest.java
+@@ -506,7 +506,7 @@ public RelNode convert(RelNode rel) {
+     while (true) {
+       VolcanoRuleMatch ruleMatch;
+       if (ruleQueue instanceof IterativeRuleQueue) {
+-        ruleMatch = ((IterativeRuleQueue) ruleQueue).popMatch(VolcanoPlannerPhase.OPTIMIZE);
++        ruleMatch = ((IterativeRuleQueue) ruleQueue).popMatch();
+       } else {
+         ruleMatch = ((TopDownRuleQueue) ruleQueue).popMatch(Pair.of(leafRel, null));
+       }

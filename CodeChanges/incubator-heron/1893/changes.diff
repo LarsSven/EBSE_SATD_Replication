@@ -1,0 +1,1055 @@
+diff --git a/heron/instance/tests/java/com/twitter/heron/grouping/AbstractTupleRoutingTest.java b/heron/instance/tests/java/com/twitter/heron/grouping/AbstractTupleRoutingTest.java
+index e2da6c4ecd9..d05935f961b 100644
+--- a/heron/instance/tests/java/com/twitter/heron/grouping/AbstractTupleRoutingTest.java
++++ b/heron/instance/tests/java/com/twitter/heron/grouping/AbstractTupleRoutingTest.java
+@@ -15,8 +15,6 @@
+ package com.twitter.heron.grouping;
+ 
+ import java.util.List;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ 
+ import org.junit.After;
+ import org.junit.Before;
+@@ -25,21 +23,16 @@
+ import com.twitter.heron.api.Config;
+ import com.twitter.heron.api.generated.TopologyAPI;
+ import com.twitter.heron.api.topology.TopologyBuilder;
+-import com.twitter.heron.common.basics.Communicator;
+ import com.twitter.heron.common.basics.SingletonRegistry;
+-import com.twitter.heron.common.basics.SlaveLooper;
+ import com.twitter.heron.common.basics.SysUtils;
+-import com.twitter.heron.common.basics.WakeableLooper;
+ import com.twitter.heron.common.utils.misc.PhysicalPlanHelper;
+ import com.twitter.heron.instance.InstanceControlMsg;
+-import com.twitter.heron.instance.Slave;
++import com.twitter.heron.instance.SlaveTester;
+ import com.twitter.heron.proto.system.HeronTuples;
+-import com.twitter.heron.proto.system.Metrics;
+ import com.twitter.heron.proto.system.PhysicalPlans;
+ import com.twitter.heron.resource.Constants;
+ import com.twitter.heron.resource.TestBolt;
+ import com.twitter.heron.resource.TestSpout;
+-import com.twitter.heron.resource.UnitTestHelper;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+@@ -51,16 +44,9 @@
+  * necessary to achieve the desired routing logic.
+  */
+ public abstract class AbstractTupleRoutingTest {
+-  private WakeableLooper testLooper;
+-  private SlaveLooper slaveLooper;
+-  private PhysicalPlans.PhysicalPlan physicalPlan;
+-  private Communicator<HeronTuples.HeronTupleSet> outStreamQueue;
+-  private Communicator<HeronTuples.HeronTupleSet> inStreamQueue;
+-  private Communicator<InstanceControlMsg> inControlQueue;
+-  private ExecutorService threadsPool;
+   private volatile int tupleReceived;
+   private volatile StringBuilder groupingInitInfo;
+-  private Slave slave;
++  private SlaveTester slaveTester;
+ 
+   // Test component info. Topology is SPOUT -> BOLT_A -> BOLT_B
+   protected enum Component {
+@@ -68,8 +54,8 @@ protected enum Component {
+     BOLT_A("test-bolt-a", "bolt-a-id"),
+     BOLT_B("test-bolt-b", "bolt-b-id");
+ 
+-    private String name;
+-    private String id;
++    private final String name;
++    private final String id;
+ 
+     Component(String name, String instanceId) {
+       this.name = name;
+@@ -86,57 +72,20 @@ public String getInstanceId() {
+   }
+ 
+   @Before
+-  public void before() throws Exception {
+-    UnitTestHelper.addSystemConfigToSingleton();
+-
++  public void before() {
+     tupleReceived = 0;
+     groupingInitInfo = new StringBuilder();
+ 
+-    testLooper = new SlaveLooper();
+-    slaveLooper = new SlaveLooper();
+-    outStreamQueue = new Communicator<>(slaveLooper, testLooper);
+-    outStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inStreamQueue = new Communicator<>(testLooper, slaveLooper);
+-    inStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inControlQueue = new Communicator<>(testLooper, slaveLooper);
+-
+-    Communicator<Metrics.MetricPublisherPublishMessage> slaveMetricsOut =
+-        new Communicator<>(slaveLooper, testLooper);
+-    slaveMetricsOut.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-
+-    slave = new Slave(slaveLooper, inStreamQueue, outStreamQueue, inControlQueue, slaveMetricsOut);
+-    threadsPool = Executors.newSingleThreadExecutor();
+-
+-    threadsPool.execute(slave);
++    slaveTester = new SlaveTester();
++    slaveTester.start();
+   }
+ 
+   @After
+-  public void after() throws Exception {
+-    UnitTestHelper.clearSingletonRegistry();
+-
+-    tupleReceived = 0;
+-    groupingInitInfo = null;
+-
+-    if (testLooper != null) {
+-      testLooper.exitLoop();
+-    }
+-    if (slaveLooper != null) {
+-      slaveLooper.exitLoop();
+-    }
+-    if (threadsPool != null) {
+-      threadsPool.shutdownNow();
+-    }
+-    physicalPlan = null;
+-    testLooper = null;
+-    slaveLooper = null;
+-    outStreamQueue = null;
+-    inStreamQueue = null;
+-
+-    slave = null;
+-    threadsPool = null;
++  public void after() throws NoSuchFieldException, IllegalAccessException {
++    slaveTester.stop();
+   }
+ 
+-  protected String getInitInfoKey(String componentName) {
++  String getInitInfoKey(String componentName) {
+     return "routing-init-info+" + componentName;
+   }
+ 
+@@ -145,15 +94,13 @@ protected String getInitInfoKey(String componentName) {
+    */
+   @Test
+   public void testRoundRobinRouting() throws Exception {
+-    physicalPlan = constructPhysicalPlan();
+-
+     PhysicalPlanHelper physicalPlanHelper =
+-        new PhysicalPlanHelper(physicalPlan, getComponentToVerify().getInstanceId());
++        new PhysicalPlanHelper(constructPhysicalPlan(), getComponentToVerify().getInstanceId());
+     InstanceControlMsg instanceControlMsg = InstanceControlMsg.newBuilder()
+         .setNewPhysicalPlanHelper(physicalPlanHelper)
+         .build();
+ 
+-    inControlQueue.offer(instanceControlMsg);
++    slaveTester.getInControlQueue().offer(instanceControlMsg);
+ 
+     SingletonRegistry.INSTANCE.registerSingleton(
+         getInitInfoKey(getComponentToVerify().getName()), groupingInitInfo);
+@@ -163,8 +110,8 @@ public void testRoundRobinRouting() throws Exception {
+       @Override
+       public void run() {
+         for (int i = 0; i < Constants.RETRY_TIMES; i++) {
+-          if (outStreamQueue.size() != 0) {
+-            HeronTuples.HeronTupleSet set = outStreamQueue.poll();
++          if (slaveTester.getOutStreamQueue().size() != 0) {
++            HeronTuples.HeronTupleSet set = slaveTester.getOutStreamQueue().poll();
+ 
+             assertTrue(set.isInitialized());
+             assertFalse(set.hasControl());
+@@ -184,7 +131,7 @@ public void run() {
+           }
+           if (tupleReceived == expectedTuplesValidated) {
+             assertEquals(getExpectedComponentInitInfo(), groupingInitInfo.toString());
+-            testLooper.exitLoop();
++            slaveTester.getTestLooper().exitLoop();
+             break;
+           }
+           SysUtils.sleep(Constants.RETRY_INTERVAL);
+@@ -192,8 +139,8 @@ public void run() {
+       }
+     };
+ 
+-    testLooper.addTasksOnWakeup(task);
+-    testLooper.loop();
++    slaveTester.getTestLooper().addTasksOnWakeup(task);
++    slaveTester.getTestLooper().loop();
+     assertEquals(expectedTuplesValidated, tupleReceived);
+   }
+ 
+diff --git a/heron/instance/tests/java/com/twitter/heron/instance/CommunicatorTester.java b/heron/instance/tests/java/com/twitter/heron/instance/CommunicatorTester.java
+new file mode 100644
+index 00000000000..eb04f911849
+--- /dev/null
++++ b/heron/instance/tests/java/com/twitter/heron/instance/CommunicatorTester.java
+@@ -0,0 +1,95 @@
++//  Copyright 2017 Twitter. All rights reserved.
++//
++//  Licensed under the Apache License, Version 2.0 (the "License");
++//  you may not use this file except in compliance with the License.
++//  You may obtain a copy of the License at
++//
++//  http://www.apache.org/licenses/LICENSE-2.0
++//
++//  Unless required by applicable law or agreed to in writing, software
++//  distributed under the License is distributed on an "AS IS" BASIS,
++//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//  See the License for the specific language governing permissions and
++//  limitations under the License.
++package com.twitter.heron.instance;
++
++import java.io.IOException;
++
++import com.twitter.heron.common.basics.Communicator;
++import com.twitter.heron.common.basics.NIOLooper;
++import com.twitter.heron.common.basics.SlaveLooper;
++import com.twitter.heron.common.basics.WakeableLooper;
++import com.twitter.heron.proto.system.HeronTuples;
++import com.twitter.heron.proto.system.Metrics;
++import com.twitter.heron.resource.Constants;
++import com.twitter.heron.resource.UnitTestHelper;
++
++/**
++ * Class to help write tests that require loopers and communicators
++ */
++public class CommunicatorTester {
++  private final WakeableLooper testLooper;
++  private final SlaveLooper slaveLooper;
++
++  // Only one outStreamQueue, which is responsible for both control tuples and data tuples
++  private final Communicator<HeronTuples.HeronTupleSet> outStreamQueue;
++
++  // This blocking queue is used to buffer tuples read from socket and ready to be used by instance
++  // For spout, it will buffer Control tuple, while for bolt, it will buffer data tuple.
++  private final Communicator<HeronTuples.HeronTupleSet> inStreamQueue;
++  private final Communicator<InstanceControlMsg> inControlQueue;
++  private final Communicator<Metrics.MetricPublisherPublishMessage> slaveMetricsOut;
++
++  public CommunicatorTester() throws IOException {
++    this(new NIOLooper());
++  }
++
++  protected CommunicatorTester(WakeableLooper testLooper) {
++    UnitTestHelper.addSystemConfigToSingleton();
++    this.testLooper = testLooper;
++    slaveLooper = new SlaveLooper();
++    outStreamQueue = new Communicator<>(slaveLooper, testLooper);
++    outStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
++    inStreamQueue = new Communicator<>(testLooper, slaveLooper);
++    inStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
++    inControlQueue = new Communicator<>(testLooper, slaveLooper);
++
++    slaveMetricsOut = new Communicator<>(slaveLooper, testLooper);
++    slaveMetricsOut.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
++  }
++
++  public void stop() throws NoSuchFieldException, IllegalAccessException {
++    UnitTestHelper.clearSingletonRegistry();
++
++    if (testLooper != null) {
++      testLooper.exitLoop();
++    }
++    if (slaveLooper != null) {
++      slaveLooper.exitLoop();
++    }
++  }
++
++  public Communicator<Metrics.MetricPublisherPublishMessage> getSlaveMetricsOut() {
++    return slaveMetricsOut;
++  }
++
++  public WakeableLooper getTestLooper() {
++    return testLooper;
++  }
++
++  public SlaveLooper getSlaveLooper() {
++    return slaveLooper;
++  }
++
++  public Communicator<InstanceControlMsg> getInControlQueue() {
++    return inControlQueue;
++  }
++
++  public Communicator<HeronTuples.HeronTupleSet> getInStreamQueue() {
++    return inStreamQueue;
++  }
++
++  public Communicator<HeronTuples.HeronTupleSet> getOutStreamQueue() {
++    return outStreamQueue;
++  }
++}
+diff --git a/heron/instance/tests/java/com/twitter/heron/instance/SlaveTester.java b/heron/instance/tests/java/com/twitter/heron/instance/SlaveTester.java
+new file mode 100644
+index 00000000000..8fb6d2db683
+--- /dev/null
++++ b/heron/instance/tests/java/com/twitter/heron/instance/SlaveTester.java
+@@ -0,0 +1,47 @@
++//  Copyright 2017 Twitter. All rights reserved.
++//
++//  Licensed under the Apache License, Version 2.0 (the "License");
++//  you may not use this file except in compliance with the License.
++//  You may obtain a copy of the License at
++//
++//  http://www.apache.org/licenses/LICENSE-2.0
++//
++//  Unless required by applicable law or agreed to in writing, software
++//  distributed under the License is distributed on an "AS IS" BASIS,
++//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//  See the License for the specific language governing permissions and
++//  limitations under the License.
++package com.twitter.heron.instance;
++
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++
++import com.twitter.heron.common.basics.SlaveLooper;
++
++/**
++ * Class to help write tests that require Slave instances, loopers and communicators
++ */
++public class SlaveTester extends CommunicatorTester {
++  private final ExecutorService threadsPool;
++  private final Slave slave;
++
++  public SlaveTester() {
++    super(new SlaveLooper());
++
++    slave = new Slave(getSlaveLooper(), getInStreamQueue(), getOutStreamQueue(),
++        getInControlQueue(), getSlaveMetricsOut());
++    threadsPool = Executors.newSingleThreadExecutor();
++  }
++
++  public void start() {
++    threadsPool.execute(slave);
++  }
++
++  public void stop() throws NoSuchFieldException, IllegalAccessException {
++    super.stop();
++
++    if (threadsPool != null) {
++      threadsPool.shutdownNow();
++    }
++  }
++}
+diff --git a/heron/instance/tests/java/com/twitter/heron/instance/bolt/BoltInstanceTest.java b/heron/instance/tests/java/com/twitter/heron/instance/bolt/BoltInstanceTest.java
+index 6e1d44069ec..827dc0b8734 100644
+--- a/heron/instance/tests/java/com/twitter/heron/instance/bolt/BoltInstanceTest.java
++++ b/heron/instance/tests/java/com/twitter/heron/instance/bolt/BoltInstanceTest.java
+@@ -15,32 +15,24 @@
+ package com.twitter.heron.instance.bolt;
+ 
+ 
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import com.google.protobuf.ByteString;
+ 
+ import org.junit.After;
+-import org.junit.AfterClass;
+ import org.junit.Assert;
+ import org.junit.Before;
+-import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+ import com.twitter.heron.api.generated.TopologyAPI;
+ import com.twitter.heron.api.serializer.IPluggableSerializer;
+ import com.twitter.heron.api.serializer.JavaSerializer;
+-import com.twitter.heron.common.basics.Communicator;
+ import com.twitter.heron.common.basics.SingletonRegistry;
+-import com.twitter.heron.common.basics.SlaveLooper;
+ import com.twitter.heron.common.basics.SysUtils;
+-import com.twitter.heron.common.basics.WakeableLooper;
+ import com.twitter.heron.common.utils.misc.PhysicalPlanHelper;
+ import com.twitter.heron.instance.InstanceControlMsg;
+-import com.twitter.heron.instance.Slave;
++import com.twitter.heron.instance.SlaveTester;
+ import com.twitter.heron.proto.system.HeronTuples;
+-import com.twitter.heron.proto.system.Metrics;
+ import com.twitter.heron.proto.system.PhysicalPlans;
+ import com.twitter.heron.resource.Constants;
+ import com.twitter.heron.resource.UnitTestHelper;
+@@ -56,108 +48,49 @@
+  */
+ public class BoltInstanceTest {
+   private static final String BOLT_INSTANCE_ID = "bolt-id";
+-  private static IPluggableSerializer serializer;
+-
+-  private WakeableLooper testLooper;
+-  private SlaveLooper slaveLooper;
++  private static IPluggableSerializer serializer = new JavaSerializer();
+ 
+   // Singleton to be changed globally for testing
+   private AtomicInteger ackCount;
+   private AtomicInteger failCount;
+   private AtomicInteger tupleExecutedCount;
+   private volatile StringBuilder receivedStrings;
+-  private PhysicalPlans.PhysicalPlan physicalPlan;
+-
+-  // Only one outStreamQueue, which is responsible for both control tuples and data tuples
+-  private Communicator<HeronTuples.HeronTupleSet> outStreamQueue;
+-
+-  // This blocking queue is used to buffer tuples read from socket and ready to be used by instance
+-  // For spout, it will buffer Control tuple, while for bolt, it will buffer data tuple.
+-  private Communicator<HeronTuples.HeronTupleSet> inStreamQueue;
+-  private Communicator<InstanceControlMsg> inControlQueue;
+-  private ExecutorService threadsPool;
+-  private Communicator<Metrics.MetricPublisherPublishMessage> slaveMetricsOut;
+-  private Slave slave;
+-
+-  @BeforeClass
+-  public static void beforeClass() throws Exception {
+-    serializer = new JavaSerializer();
+-    serializer.initialize(null);
+-  }
+ 
+-  @AfterClass
+-  public static void afterClass() throws Exception {
+-    serializer = null;
++  private SlaveTester slaveTester;
++
++  static {
++    serializer.initialize(null);
+   }
+ 
+   @Before
+-  public void before() throws Exception {
+-    UnitTestHelper.addSystemConfigToSingleton();
+-
++  public void before() {
+     ackCount = new AtomicInteger(0);
+     failCount = new AtomicInteger(0);
+     tupleExecutedCount = new AtomicInteger(0);
+     receivedStrings = new StringBuilder();
+ 
+-    testLooper = new SlaveLooper();
+-    slaveLooper = new SlaveLooper();
+-    outStreamQueue = new Communicator<HeronTuples.HeronTupleSet>(slaveLooper, testLooper);
+-    outStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inStreamQueue = new Communicator<HeronTuples.HeronTupleSet>(testLooper, slaveLooper);
+-    inStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inControlQueue = new Communicator<InstanceControlMsg>(testLooper, slaveLooper);
+-
+-    slaveMetricsOut =
+-        new Communicator<Metrics.MetricPublisherPublishMessage>(slaveLooper, testLooper);
+-    slaveMetricsOut.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-
+-    slave = new Slave(slaveLooper, inStreamQueue, outStreamQueue, inControlQueue, slaveMetricsOut);
+-    threadsPool = Executors.newSingleThreadExecutor();
+-
+-    threadsPool.execute(slave);
++    slaveTester = new SlaveTester();
++    slaveTester.start();
+   }
+ 
+   @After
+-  public void after() throws Exception {
+-    UnitTestHelper.clearSingletonRegistry();
+-
+-    ackCount = new AtomicInteger(0);
+-    failCount = new AtomicInteger(0);
+-    tupleExecutedCount = new AtomicInteger(0);
+-    receivedStrings = null;
+-
+-    if (testLooper != null) {
+-      testLooper.exitLoop();
+-    }
+-    if (slaveLooper != null) {
+-      slaveLooper.exitLoop();
+-    }
+-    if (threadsPool != null) {
+-      threadsPool.shutdownNow();
+-    }
+-    physicalPlan = null;
+-    testLooper = null;
+-    slaveLooper = null;
+-    outStreamQueue = null;
+-    inStreamQueue = null;
+-
+-    slave = null;
+-    threadsPool = null;
++  public void after() throws NoSuchFieldException, IllegalAccessException {
++    slaveTester.stop();
+   }
+ 
+   /**
+    * Test the reading of a tuple and apply execute on that tuple
+    */
+   @Test
+-  public void testReadTupleAndExecute() throws Exception {
+-    physicalPlan = UnitTestHelper.getPhysicalPlan(false, -1);
++  public void testReadTupleAndExecute() {
++    PhysicalPlans.PhysicalPlan physicalPlan = UnitTestHelper.getPhysicalPlan(false, -1);
+ 
+     PhysicalPlanHelper physicalPlanHelper = new PhysicalPlanHelper(physicalPlan, BOLT_INSTANCE_ID);
+     InstanceControlMsg instanceControlMsg = InstanceControlMsg.newBuilder().
+         setNewPhysicalPlanHelper(physicalPlanHelper).
+         build();
+ 
+-    inControlQueue.offer(instanceControlMsg);
++    slaveTester.getInControlQueue().offer(instanceControlMsg);
+ 
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.ACK_COUNT, ackCount);
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.FAIL_COUNT, failCount);
+@@ -182,7 +115,7 @@ public void testReadTupleAndExecute() throws Exception {
+       rootId.setTaskid(0);
+       dataTuple.addRoots(rootId);
+ 
+-      String s = "";
++      String s;
+       if ((i & 1) == 0) {
+         s = "A";
+       } else {
+@@ -195,7 +128,7 @@ public void testReadTupleAndExecute() throws Exception {
+     }
+ 
+     heronTupleSet.setData(dataTupleSet);
+-    inStreamQueue.offer(heronTupleSet.build());
++    slaveTester.getInStreamQueue().offer(heronTupleSet.build());
+ 
+     for (int i = 0; i < Constants.RETRY_TIMES; i++) {
+       if (tupleExecutedCount.intValue() == 10) {
+diff --git a/heron/instance/tests/java/com/twitter/heron/instance/spout/ActivateDeactivateTest.java b/heron/instance/tests/java/com/twitter/heron/instance/spout/ActivateDeactivateTest.java
+index 7b406425727..b9d88b4f090 100644
+--- a/heron/instance/tests/java/com/twitter/heron/instance/spout/ActivateDeactivateTest.java
++++ b/heron/instance/tests/java/com/twitter/heron/instance/spout/ActivateDeactivateTest.java
+@@ -15,8 +15,6 @@
+ package com.twitter.heron.instance.spout;
+ 
+ import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+ 
+ import org.junit.After;
+@@ -24,14 +22,10 @@
+ import org.junit.Test;
+ 
+ import com.twitter.heron.api.generated.TopologyAPI;
+-import com.twitter.heron.common.basics.Communicator;
+ import com.twitter.heron.common.basics.SingletonRegistry;
+-import com.twitter.heron.common.basics.SlaveLooper;
+ import com.twitter.heron.common.utils.misc.PhysicalPlanHelper;
+ import com.twitter.heron.instance.InstanceControlMsg;
+-import com.twitter.heron.instance.Slave;
+-import com.twitter.heron.proto.system.HeronTuples;
+-import com.twitter.heron.proto.system.Metrics;
++import com.twitter.heron.instance.SlaveTester;
+ import com.twitter.heron.proto.system.PhysicalPlans;
+ import com.twitter.heron.resource.Constants;
+ import com.twitter.heron.resource.UnitTestHelper;
+@@ -41,62 +35,23 @@
+ 
+ public class ActivateDeactivateTest {
+   private static final String SPOUT_INSTANCE_ID = "spout-id";
+-  private SlaveLooper slaveLooper;
+-
+-  // Only one outStreamQueue, which is responsible for both control tuples and data tuples
+-  private Communicator<HeronTuples.HeronTupleSet> outStreamQueue;
+-
+-  // This blocking queue is used to buffer tuples read from socket and ready to be used by instance
+-  // For spout, it will buffer Control tuple, while for bolt, it will buffer data tuple.
+-  private Communicator<HeronTuples.HeronTupleSet> inStreamQueue;
+-  private Communicator<InstanceControlMsg> inControlQueue;
+-  private ExecutorService threadsPool;
+-  private Communicator<Metrics.MetricPublisherPublishMessage> slaveMetricsOut;
+-  private Slave slave;
++  private SlaveTester slaveTester;
+ 
+   @Before
+-  public void before() throws Exception {
+-    UnitTestHelper.addSystemConfigToSingleton();
+-
+-    slaveLooper = new SlaveLooper();
+-    outStreamQueue = new Communicator<HeronTuples.HeronTupleSet>(slaveLooper, null);
+-    outStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inStreamQueue = new Communicator<HeronTuples.HeronTupleSet>(null, slaveLooper);
+-    inStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    slaveMetricsOut = new Communicator<Metrics.MetricPublisherPublishMessage>(slaveLooper, null);
+-    slaveMetricsOut.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inControlQueue = new Communicator<InstanceControlMsg>(null, slaveLooper);
+-
+-    slave = new Slave(slaveLooper, inStreamQueue, outStreamQueue, inControlQueue, slaveMetricsOut);
+-    threadsPool = Executors.newSingleThreadExecutor();
+-
+-    threadsPool.execute(slave);
++  public void before() {
++    slaveTester = new SlaveTester();
++    slaveTester.start();
+   }
+ 
+   @After
+-  public void after() throws Exception {
+-    UnitTestHelper.clearSingletonRegistry();
+-    if (slaveLooper != null) {
+-      slaveLooper.exitLoop();
+-    }
+-    if (threadsPool != null) {
+-      threadsPool.shutdownNow();
+-    }
+-
+-    slaveLooper = null;
+-    outStreamQueue = null;
+-    inStreamQueue = null;
+-
+-    slave = null;
+-    threadsPool = null;
++  public void after() throws NoSuchFieldException, IllegalAccessException {
++    slaveTester.stop();
+   }
+ 
+-
+   /**
+    * We will test whether spout would pull activate/deactivate state change and
+    * invoke activate()/deactivate()
+    */
+-
+   @Test
+   public void testActivateAndDeactivate() throws Exception {
+     CountDownLatch activateLatch = new CountDownLatch(1);
+@@ -104,20 +59,20 @@ public void testActivateAndDeactivate() throws Exception {
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.ACTIVATE_COUNT_LATCH, activateLatch);
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.DEACTIVATE_COUNT_LATCH, deactivateLatch);
+ 
+-    inControlQueue.offer(buildMessage(TopologyAPI.TopologyState.RUNNING));
++    slaveTester.getInControlQueue().offer(buildMessage(TopologyAPI.TopologyState.RUNNING));
+ 
+     // Now the activateLatch and deactivateLatch should be 1
+     assertEquals(1, activateLatch.getCount());
+     assertEquals(1, deactivateLatch.getCount());
+ 
+     // And we start the test
+-    inControlQueue.offer(buildMessage(TopologyAPI.TopologyState.PAUSED));
++    slaveTester.getInControlQueue().offer(buildMessage(TopologyAPI.TopologyState.PAUSED));
+     assertTrue(deactivateLatch.await(Constants.TEST_WAIT_TIME.toMillis(), TimeUnit.MILLISECONDS));
+ 
+     assertEquals(1, activateLatch.getCount());
+     assertEquals(0, deactivateLatch.getCount());
+ 
+-    inControlQueue.offer(buildMessage(TopologyAPI.TopologyState.RUNNING));
++    slaveTester.getInControlQueue().offer(buildMessage(TopologyAPI.TopologyState.RUNNING));
+     assertTrue(activateLatch.await(Constants.TEST_WAIT_TIME.toMillis(), TimeUnit.MILLISECONDS));
+ 
+     assertEquals(0, activateLatch.getCount());
+diff --git a/heron/instance/tests/java/com/twitter/heron/instance/spout/SpoutInstanceTest.java b/heron/instance/tests/java/com/twitter/heron/instance/spout/SpoutInstanceTest.java
+index e2259af6ce3..a2a3c19e627 100644
+--- a/heron/instance/tests/java/com/twitter/heron/instance/spout/SpoutInstanceTest.java
++++ b/heron/instance/tests/java/com/twitter/heron/instance/spout/SpoutInstanceTest.java
+@@ -18,29 +18,22 @@
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Set;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import com.google.protobuf.ByteString;
+ 
+ import org.junit.After;
+-import org.junit.AfterClass;
+ import org.junit.Assert;
+ import org.junit.Before;
+-import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+ import com.twitter.heron.api.serializer.IPluggableSerializer;
+ import com.twitter.heron.api.serializer.JavaSerializer;
+-import com.twitter.heron.common.basics.Communicator;
+ import com.twitter.heron.common.basics.SingletonRegistry;
+-import com.twitter.heron.common.basics.SlaveLooper;
+ import com.twitter.heron.common.basics.SysUtils;
+-import com.twitter.heron.common.basics.WakeableLooper;
+ import com.twitter.heron.common.utils.misc.PhysicalPlanHelper;
+ import com.twitter.heron.instance.InstanceControlMsg;
+-import com.twitter.heron.instance.Slave;
++import com.twitter.heron.instance.SlaveTester;
+ import com.twitter.heron.proto.system.HeronTuples;
+ import com.twitter.heron.proto.system.Metrics;
+ import com.twitter.heron.proto.system.PhysicalPlans;
+@@ -52,7 +45,7 @@
+  * To test the SpoutInstance.
+  * We will test by instantiate a slave with TestSpout's instance:
+  * 1. nextTuple().
+- * Check whether Message inside outStreamQueue matches tuples emitted by TestSpout.
++ * Check whether Message inside slaveTester.getOutStreamQueue() matches tuples emitted by TestSpout.
+  * We will not enable acking system and not enable timeout.
+  * 2. gatherMetrics()
+  * We wait for the interval for gathering metrics, and check whether the Metrics Message contains
+@@ -70,106 +63,43 @@
+  */
+ public class SpoutInstanceTest {
+   private static final String SPOUT_INSTANCE_ID = "spout-id";
+-  private static IPluggableSerializer serializer;
+-  private WakeableLooper testLooper;
+-  private SlaveLooper slaveLooper;
++  private static IPluggableSerializer serializer = new JavaSerializer();
+ 
+   // Singleton to be changed globally for testing
+   private AtomicInteger ackCount;
+   private AtomicInteger failCount;
+-  private PhysicalPlans.PhysicalPlan physicalPlan;
+ 
+-  // Only one outStreamQueue, which is responsible for both control tuples and data tuples
+-  private Communicator<HeronTuples.HeronTupleSet> outStreamQueue;
+-
+-  // This blocking queue is used to buffer tuples read from socket and ready to be used by instance
+-  // For spout, it will buffer Control tuple, while for bolt, it will buffer data tuple.
+-  private Communicator<HeronTuples.HeronTupleSet> inStreamQueue;
+-  private Communicator<InstanceControlMsg> inControlQueue;
+-  private ExecutorService threadsPool;
+-  private Communicator<Metrics.MetricPublisherPublishMessage> slaveMetricsOut;
+-  private Slave slave;
++  private SlaveTester slaveTester;
+ 
+   private int tupleReceived;
+   private List<HeronTuples.HeronDataTuple> heronDataTupleList;
+ 
+-  @BeforeClass
+-  public static void beforeClass() throws Exception {
+-    serializer = new JavaSerializer();
++  static {
+     serializer.initialize(null);
+   }
+ 
+-  @AfterClass
+-  public static void afterClass() throws Exception {
+-    serializer = null;
+-  }
+-
+   @Before
+-  public void before() throws Exception {
+-    UnitTestHelper.addSystemConfigToSingleton();
+-
++  public void before() {
+     tupleReceived = 0;
+-    heronDataTupleList = new ArrayList<HeronTuples.HeronDataTuple>();
++    heronDataTupleList = new ArrayList<>();
+     ackCount = new AtomicInteger(0);
+     failCount = new AtomicInteger(0);
+ 
+-    testLooper = new SlaveLooper();
+-    slaveLooper = new SlaveLooper();
+-    outStreamQueue = new Communicator<HeronTuples.HeronTupleSet>(slaveLooper, testLooper);
+-    outStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inStreamQueue = new Communicator<HeronTuples.HeronTupleSet>(testLooper, slaveLooper);
+-    inStreamQueue.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    slaveMetricsOut =
+-        new Communicator<Metrics.MetricPublisherPublishMessage>(slaveLooper, testLooper);
+-    slaveMetricsOut.init(Constants.QUEUE_BUFFER_SIZE, Constants.QUEUE_BUFFER_SIZE, 0.5);
+-    inControlQueue = new Communicator<InstanceControlMsg>(testLooper, slaveLooper);
+-
+-    slave = new Slave(slaveLooper, inStreamQueue, outStreamQueue, inControlQueue, slaveMetricsOut);
+-    threadsPool = Executors.newSingleThreadExecutor();
+-
+-    threadsPool.execute(slave);
++    slaveTester = new SlaveTester();
++    slaveTester.start();
+   }
+ 
+   @After
+-  public void after() throws Exception {
+-    UnitTestHelper.clearSingletonRegistry();
+-    if (slaveLooper != null) {
+-      slaveLooper.exitLoop();
+-    }
+-    if (testLooper != null) {
+-      testLooper.exitLoop();
+-    }
+-    tupleReceived = 0;
+-    heronDataTupleList = new ArrayList<HeronTuples.HeronDataTuple>();
+-    ackCount = new AtomicInteger(0);
+-    failCount = new AtomicInteger(0);
+-
+-    if (threadsPool != null) {
+-      threadsPool.shutdownNow();
+-    }
+-    physicalPlan = null;
+-    testLooper = null;
+-    slaveLooper = null;
+-    outStreamQueue = null;
+-    inStreamQueue = null;
+-
+-    slave = null;
+-    threadsPool = null;
++  public void after() throws NoSuchFieldException, IllegalAccessException {
++    slaveTester.stop();
+   }
+ 
+   /**
+    * Test the fetching of next tuple
+    */
+   @Test
+-  public void testNextTuple() throws Exception {
+-    physicalPlan = UnitTestHelper.getPhysicalPlan(false, -1);
+-
+-    PhysicalPlanHelper physicalPlanHelper = new PhysicalPlanHelper(physicalPlan, SPOUT_INSTANCE_ID);
+-    InstanceControlMsg instanceControlMsg = InstanceControlMsg.newBuilder().
+-        setNewPhysicalPlanHelper(physicalPlanHelper).
+-        build();
+-
+-    inControlQueue.offer(instanceControlMsg);
++  public void testNextTuple() {
++    initSpout(slaveTester, false, -1);
+ 
+     Runnable task = new Runnable() {
+       private String streamId = "";
+@@ -179,8 +109,8 @@ public void testNextTuple() throws Exception {
+       @Override
+       public void run() {
+         for (int i = 0; i < Constants.RETRY_TIMES; i++) {
+-          if (outStreamQueue.size() != 0) {
+-            HeronTuples.HeronTupleSet set = outStreamQueue.poll();
++          if (slaveTester.getOutStreamQueue().size() != 0) {
++            HeronTuples.HeronTupleSet set = slaveTester.getOutStreamQueue().poll();
+ 
+             Assert.assertTrue(set.isInitialized());
+             Assert.assertFalse(set.hasControl());
+@@ -204,7 +134,7 @@ public void run() {
+           }
+           if (tupleReceived == 10) {
+             Assert.assertEquals("ABABABABAB", receivedTupleStrings);
+-            testLooper.exitLoop();
++            slaveTester.getTestLooper().exitLoop();
+             break;
+           }
+           SysUtils.sleep(Constants.RETRY_INTERVAL);
+@@ -212,8 +142,8 @@ public void run() {
+       }
+     };
+ 
+-    testLooper.addTasksOnWakeup(task);
+-    testLooper.loop();
++    slaveTester.getTestLooper().addTasksOnWakeup(task);
++    slaveTester.getTestLooper().loop();
+ 
+     Assert.assertEquals(tupleReceived, 10);
+   }
+@@ -222,23 +152,16 @@ public void run() {
+    * Test the gathering of metrics
+    */
+   @Test
+-  public void testGatherMetrics() throws Exception {
+-    physicalPlan = UnitTestHelper.getPhysicalPlan(false, -1);
+-
+-    PhysicalPlanHelper physicalPlanHelper = new PhysicalPlanHelper(physicalPlan, SPOUT_INSTANCE_ID);
+-    InstanceControlMsg instanceControlMsg = InstanceControlMsg.newBuilder().
+-        setNewPhysicalPlanHelper(physicalPlanHelper).
+-        build();
+-
+-    inControlQueue.offer(instanceControlMsg);
++  public void testGatherMetrics() {
++    initSpout(slaveTester, false, -1);
+ 
+     Runnable task = new Runnable() {
+       @Override
+       public void run() {
+         for (int i = 0; i < Constants.RETRY_TIMES; i++) {
+-          if (!slaveMetricsOut.isEmpty()) {
+-            Metrics.MetricPublisherPublishMessage msg = slaveMetricsOut.poll();
+-            Set<String> metricsName = new HashSet<String>();
++          if (!slaveTester.getSlaveMetricsOut().isEmpty()) {
++            Metrics.MetricPublisherPublishMessage msg = slaveTester.getSlaveMetricsOut().poll();
++            Set<String> metricsName = new HashSet<>();
+             for (Metrics.MetricDatum metricDatum : msg.getMetricsList()) {
+               metricsName.add(metricDatum.getName());
+             }
+@@ -249,7 +172,7 @@ public void run() {
+             Assert.assertTrue(metricsName.contains("__next-tuple-latency"));
+             Assert.assertTrue(metricsName.contains("__next-tuple-count"));
+ 
+-            testLooper.exitLoop();
++            slaveTester.getTestLooper().exitLoop();
+             break;
+           }
+           SysUtils.sleep(Constants.RETRY_INTERVAL);
+@@ -257,40 +180,23 @@ public void run() {
+       }
+     };
+ 
+-    testLooper.addTasksOnWakeup(task);
+-    testLooper.loop();
++    slaveTester.getTestLooper().addTasksOnWakeup(task);
++    slaveTester.getTestLooper().loop();
+   }
+ 
+   /**
+    * Test with the acking immediately
+    */
+   @Test
+-  public void testDoImmediateAcks() throws Exception {
+-    physicalPlan = UnitTestHelper.getPhysicalPlan(false, -1);
+-
+-    PhysicalPlanHelper physicalPlanHelper = new PhysicalPlanHelper(physicalPlan, SPOUT_INSTANCE_ID);
+-    InstanceControlMsg instanceControlMsg = InstanceControlMsg.newBuilder().
+-        setNewPhysicalPlanHelper(physicalPlanHelper).
+-        build();
+-
++  public void testDoImmediateAcks() {
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.ACK_COUNT, ackCount);
+ 
+-    inControlQueue.offer(instanceControlMsg);
++    initSpout(slaveTester, false, -1);
+ 
+     Runnable task = new Runnable() {
+       @Override
+       public void run() {
+-        while (outStreamQueue.size() != 0) {
+-          HeronTuples.HeronTupleSet set = outStreamQueue.poll();
+-
+-          Assert.assertTrue(set.isInitialized());
+-          Assert.assertTrue(set.hasData());
+-
+-          HeronTuples.HeronDataTupleSet dataTupleSet = set.getData();
+-
+-          tupleReceived += dataTupleSet.getTuplesCount();
+-          heronDataTupleList.addAll(dataTupleSet.getTuplesList());
+-        }
++        drainOutStream();
+         if (tupleReceived == 10) {
+           // We fetch it from SingletonRegistry
+           for (int i = 0; i < Constants.RETRY_TIMES; i++) {
+@@ -303,27 +209,20 @@ public void run() {
+           // Wait the bolt's finishing
+           SysUtils.sleep(Constants.TEST_WAIT_TIME);
+           Assert.assertEquals(10, ackCount.intValue());
+-          testLooper.exitLoop();
++          slaveTester.getTestLooper().exitLoop();
+         }
+       }
+     };
+ 
+-    testLooper.addTasksOnWakeup(task);
+-    testLooper.loop();
++    slaveTester.getTestLooper().addTasksOnWakeup(task);
++    slaveTester.getTestLooper().loop();
+   }
+ 
+   @Test
+-  public void testLookForTimeouts() throws Exception {
+-    physicalPlan = UnitTestHelper.getPhysicalPlan(true, 1);
+-
+-    PhysicalPlanHelper physicalPlanHelper = new PhysicalPlanHelper(physicalPlan, SPOUT_INSTANCE_ID);
+-    InstanceControlMsg instanceControlMsg = InstanceControlMsg.newBuilder().
+-        setNewPhysicalPlanHelper(physicalPlanHelper).
+-        build();
+-
++  public void testLookForTimeouts() {
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.FAIL_COUNT, failCount);
+ 
+-    inControlQueue.offer(instanceControlMsg);
++    initSpout(slaveTester, true, 1);
+ 
+     Runnable task = new Runnable() {
+       @Override
+@@ -338,12 +237,12 @@ public void run() {
+         // Wait the bolt's finishing
+         SysUtils.sleep(Constants.TEST_WAIT_TIME);
+         Assert.assertEquals(10, failCount.intValue());
+-        testLooper.exitLoop();
++        slaveTester.getTestLooper().exitLoop();
+       }
+     };
+ 
+-    testLooper.addTasksOnWakeup(task);
+-    testLooper.loop();
++    slaveTester.getTestLooper().addTasksOnWakeup(task);
++    slaveTester.getTestLooper().loop();
+   }
+ 
+   /**
+@@ -351,33 +250,16 @@ public void run() {
+    */
+ 
+   @Test
+-  public void testAckAndFail() throws Exception {
+-    physicalPlan = UnitTestHelper.getPhysicalPlan(true, -1);
+-
+-    PhysicalPlanHelper physicalPlanHelper = new PhysicalPlanHelper(physicalPlan, SPOUT_INSTANCE_ID);
+-    InstanceControlMsg instanceControlMsg = InstanceControlMsg.newBuilder().
+-        setNewPhysicalPlanHelper(physicalPlanHelper).
+-        build();
+-
++  public void testAckAndFail() {
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.ACK_COUNT, ackCount);
+     SingletonRegistry.INSTANCE.registerSingleton(Constants.FAIL_COUNT, failCount);
+ 
+-    inControlQueue.offer(instanceControlMsg);
++    initSpout(slaveTester, true, -1);
+ 
+     Runnable task = new Runnable() {
+       @Override
+       public void run() {
+-        while (outStreamQueue.size() != 0) {
+-          HeronTuples.HeronTupleSet set = outStreamQueue.poll();
+-
+-          Assert.assertTrue(set.isInitialized());
+-          Assert.assertTrue(set.hasData());
+-
+-          HeronTuples.HeronDataTupleSet dataTupleSet = set.getData();
+-
+-          tupleReceived += dataTupleSet.getTuplesCount();
+-          heronDataTupleList.addAll(dataTupleSet.getTuplesList());
+-        }
++        drainOutStream();
+         if (tupleReceived == 10) {
+           constructAndSendAcks();
+           // We fetch it from SingletonRegistry
+@@ -392,13 +274,13 @@ public void run() {
+           SysUtils.sleep(Constants.TEST_WAIT_TIME);
+           Assert.assertEquals(5, ackCount.intValue());
+           Assert.assertEquals(5, failCount.intValue());
+-          testLooper.exitLoop();
++          slaveTester.getTestLooper().exitLoop();
+         }
+       }
+     };
+ 
+-    testLooper.addTasksOnWakeup(task);
+-    testLooper.loop();
++    slaveTester.getTestLooper().addTasksOnWakeup(task);
++    slaveTester.getTestLooper().loop();
+   }
+ 
+   private void constructAndSendAcks() {
+@@ -431,6 +313,28 @@ private void constructAndSendAcks() {
+     bldr.setControl(controlTupleSet);
+ 
+     // We will send back to the SpoutInstance
+-    inStreamQueue.offer(bldr.build());
++    slaveTester.getInStreamQueue().offer(bldr.build());
++  }
++
++  private void drainOutStream() {
++    while (slaveTester.getOutStreamQueue().size() != 0) {
++      HeronTuples.HeronTupleSet set = slaveTester.getOutStreamQueue().poll();
++
++      Assert.assertTrue(set.isInitialized());
++      Assert.assertTrue(set.hasData());
++
++      HeronTuples.HeronDataTupleSet dataTupleSet = set.getData();
++
++      tupleReceived += dataTupleSet.getTuplesCount();
++      heronDataTupleList.addAll(dataTupleSet.getTuplesList());
++    }
++  }
++
++  private static void initSpout(SlaveTester slaveTester, boolean ackEnabled, int timeout) {
++    PhysicalPlans.PhysicalPlan physicalPlan = UnitTestHelper.getPhysicalPlan(ackEnabled, timeout);
++    PhysicalPlanHelper physicalPlanHelper = new PhysicalPlanHelper(physicalPlan, SPOUT_INSTANCE_ID);
++
++    slaveTester.getInControlQueue().offer(
++        InstanceControlMsg.newBuilder().setNewPhysicalPlanHelper(physicalPlanHelper).build());
+   }
+ }
+diff --git a/heron/instance/tests/java/com/twitter/heron/resource/UnitTestHelper.java b/heron/instance/tests/java/com/twitter/heron/resource/UnitTestHelper.java
+index f4c70f93eab..4dc852b4d9f 100644
+--- a/heron/instance/tests/java/com/twitter/heron/resource/UnitTestHelper.java
++++ b/heron/instance/tests/java/com/twitter/heron/resource/UnitTestHelper.java
+@@ -141,7 +141,7 @@ private static void setStMgr(PhysicalPlans.PhysicalPlan.Builder pPlan) {
+   }
+ 
+   @SuppressWarnings("unchecked")
+-  public static void clearSingletonRegistry() throws Exception {
++  public static void clearSingletonRegistry() throws IllegalAccessException, NoSuchFieldException {
+     // Remove the Singleton by Reflection
+     Field field = SingletonRegistry.INSTANCE.getClass().getDeclaredField("singletonObjects");
+     field.setAccessible(true);

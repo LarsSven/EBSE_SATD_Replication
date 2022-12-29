@@ -1,0 +1,919 @@
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
+index 415ce46788119..5a994f1ad0a39 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
+@@ -21,8 +21,10 @@ import org.apache.spark.internal.Logging
+ import org.apache.spark.sql.AnalysisException
+ import org.apache.spark.sql.catalyst.expressions._
+ import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
++import org.apache.spark.sql.catalyst.optimizer.JoinSelectionHelper
+ import org.apache.spark.sql.catalyst.plans._
+ import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.internal.SQLConf
+ 
+ trait OperationHelper {
+   type ReturnType = (Seq[NamedExpression], Seq[Expression], LogicalPlan)
+@@ -388,3 +390,37 @@ object PhysicalWindow {
+     case _ => None
+   }
+ }
++
++object ExtractSingleColumnNullAwareAntiJoin extends JoinSelectionHelper with PredicateHelper {
++
++  // TODO support multi column NULL-aware anti join in future.
++  // See. http://www.vldb.org/pvldb/vol2/vldb09-423.pdf Section 6
++  // multi-column null aware anti join is much more complicated than single column ones.
++
++  // streamedSideKeys, buildSideKeys
++  private type ReturnType = (Seq[Expression], Seq[Expression])
++
++  /**
++   * See. [SPARK-32290]
++   * LeftAnti(condition: Or(EqualTo(a=b), IsNull(EqualTo(a=b)))
++   * will almost certainly be planned as a Broadcast Nested Loop join,
++   * which is very time consuming because it's an O(M*N) calculation.
++   * But if it's a single column case O(M*N) calculation could be optimized into O(M)
++   * using hash lookup instead of loop lookup.
++   */
++  def unapply(join: Join): Option[ReturnType] = join match {
++    case Join(left, right, LeftAnti,
++      Some(Or(e @ EqualTo(leftAttr: AttributeReference, rightAttr: AttributeReference),
++        IsNull(e2 @ EqualTo(_, _)))), _)
++        if SQLConf.get.optimizeNullAwareAntiJoin &&
++          e.semanticEquals(e2) =>
++      if (canEvaluate(leftAttr, left) && canEvaluate(rightAttr, right)) {
++        Some(Seq(leftAttr), Seq(rightAttr))
++      } else if (canEvaluate(leftAttr, right) && canEvaluate(rightAttr, left)) {
++        Some(Seq(rightAttr), Seq(leftAttr))
++      } else {
++        None
++      }
++    case _ => None
++  }
++}
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+index c68d7ccab4d10..f4bc328b24676 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+@@ -2672,6 +2672,17 @@ object SQLConf {
+       .checkValue(_ >= 0, "The value must be non-negative.")
+       .createWithDefault(8)
+ 
++  val OPTIMIZE_NULL_AWARE_ANTI_JOIN =
++    buildConf("spark.sql.optimizeNullAwareAntiJoin")
++      .internal()
++      .doc("When true, NULL-aware anti join execution will be planed into " +
++        "BroadcastHashJoinExec with flag isNullAwareAntiJoin enabled, " +
++        "optimized from O(M*N) calculation into O(M) calculation " +
++        "using Hash lookup instead of Looping lookup." +
++        "Only support for singleColumn NAAJ for now.")
++      .booleanConf
++      .createWithDefault(true)
++
+   /**
+    * Holds information about keys that have been deprecated.
+    *
+@@ -3277,6 +3288,9 @@ class SQLConf extends Serializable with Logging {
+   def coalesceBucketsInJoinMaxBucketRatio: Int =
+     getConf(SQLConf.COALESCE_BUCKETS_IN_JOIN_MAX_BUCKET_RATIO)
+ 
++  def optimizeNullAwareAntiJoin: Boolean =
++    getConf(SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN)
++
+   /** ********************** SQLConf functionality methods ************ */
+ 
+   /** Set Spark SQL configuration properties. */
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
+index 78aa258387daa..4f9cb22ee0057 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala
+@@ -232,6 +232,10 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+           .orElse { if (hintToShuffleReplicateNL(hint)) createCartesianProduct() else None }
+           .getOrElse(createJoinWithoutHint())
+ 
++      case j @ ExtractSingleColumnNullAwareAntiJoin(leftKeys, rightKeys) =>
++        Seq(joins.BroadcastHashJoinExec(leftKeys, rightKeys, LeftAnti, BuildRight,
++          None, planLater(j.left), planLater(j.right), isNullAwareAntiJoin = true))
++
+       // If it is not an equi-join, we first look at the join hints w.r.t. the following order:
+       //   1. broadcast hint: pick broadcast nested loop join. If both sides have the broadcast
+       //      hints, choose the smaller side (based on stats) to broadcast for inner and full joins,
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala
+index ac98342277bc0..bcf9dc1544ce3 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala
+@@ -20,9 +20,10 @@ package org.apache.spark.sql.execution.adaptive
+ import org.apache.spark.sql.Strategy
+ import org.apache.spark.sql.catalyst.expressions.PredicateHelper
+ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
+-import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
++import org.apache.spark.sql.catalyst.planning.{ExtractEquiJoinKeys, ExtractSingleColumnNullAwareAntiJoin}
++import org.apache.spark.sql.catalyst.plans.LeftAnti
+ import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan}
+-import org.apache.spark.sql.execution.SparkPlan
++import org.apache.spark.sql.execution.{joins, SparkPlan}
+ import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec}
+ 
+ /**
+@@ -48,6 +49,11 @@ object LogicalQueryStageStrategy extends Strategy with PredicateHelper {
+       Seq(BroadcastHashJoinExec(
+         leftKeys, rightKeys, joinType, buildSide, condition, planLater(left), planLater(right)))
+ 
++    case j @ ExtractSingleColumnNullAwareAntiJoin(leftKeys, rightKeys)
++        if isBroadcastStage(j.right) =>
++      Seq(joins.BroadcastHashJoinExec(leftKeys, rightKeys, LeftAnti, BuildRight,
++        None, planLater(j.left), planLater(j.right), isNullAwareAntiJoin = true))
++
+     case j @ Join(left, right, joinType, condition, _)
+         if isBroadcastStage(left) || isBroadcastStage(right) =>
+       val buildSide = if (isBroadcastStage(left)) BuildLeft else BuildRight
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/dynamicpruning/PlanDynamicPruningFilters.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/dynamicpruning/PlanDynamicPruningFilters.scala
+index cfc653a23840d..098576d72f540 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/dynamicpruning/PlanDynamicPruningFilters.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/dynamicpruning/PlanDynamicPruningFilters.scala
+@@ -59,9 +59,9 @@ case class PlanDynamicPruningFilters(sparkSession: SparkSession)
+         // the first to be applied (apart from `InsertAdaptiveSparkPlan`).
+         val canReuseExchange = SQLConf.get.exchangeReuseEnabled && buildKeys.nonEmpty &&
+           plan.find {
+-            case BroadcastHashJoinExec(_, _, _, BuildLeft, _, left, _) =>
++            case BroadcastHashJoinExec(_, _, _, BuildLeft, _, left, _, _) =>
+               left.sameResult(sparkPlan)
+-            case BroadcastHashJoinExec(_, _, _, BuildRight, _, _, right) =>
++            case BroadcastHashJoinExec(_, _, _, BuildRight, _, _, right, _) =>
+               right.sameResult(sparkPlan)
+             case _ => false
+           }.isDefined
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
+index 71faad9829a42..2a283013aceef 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
+@@ -46,14 +46,23 @@ case class BroadcastHashJoinExec(
+     buildSide: BuildSide,
+     condition: Option[Expression],
+     left: SparkPlan,
+-    right: SparkPlan)
++    right: SparkPlan,
++    isNullAwareAntiJoin: Boolean = false)
+   extends HashJoin with CodegenSupport {
+ 
++  if (isNullAwareAntiJoin) {
++    require(leftKeys.length == 1, "leftKeys length should be 1")
++    require(rightKeys.length == 1, "rightKeys length should be 1")
++    require(joinType == LeftAnti, "joinType must be LeftAnti.")
++    require(buildSide == BuildRight, "buildSide must be BuildRight.")
++    require(condition.isEmpty, "null aware anti join optimize condition should be empty.")
++  }
++
+   override lazy val metrics = Map(
+     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
+ 
+   override def requiredChildDistribution: Seq[Distribution] = {
+-    val mode = HashedRelationBroadcastMode(buildBoundKeys)
++    val mode = HashedRelationBroadcastMode(buildBoundKeys, isNullAwareAntiJoin)
+     buildSide match {
+       case BuildLeft =>
+         BroadcastDistribution(mode) :: UnspecifiedDistribution :: Nil
+@@ -133,10 +142,37 @@ case class BroadcastHashJoinExec(
+     val numOutputRows = longMetric("numOutputRows")
+ 
+     val broadcastRelation = buildPlan.executeBroadcast[HashedRelation]()
+-    streamedPlan.execute().mapPartitions { streamedIter =>
+-      val hashed = broadcastRelation.value.asReadOnlyCopy()
+-      TaskContext.get().taskMetrics().incPeakExecutionMemory(hashed.estimatedSize)
+-      join(streamedIter, hashed, numOutputRows)
++    if (isNullAwareAntiJoin) {
++      streamedPlan.execute().mapPartitionsInternal { streamedIter =>
++        val hashed = broadcastRelation.value.asReadOnlyCopy()
++        TaskContext.get().taskMetrics().incPeakExecutionMemory(hashed.estimatedSize)
++        if (hashed == EmptyHashedRelation) {
++          streamedIter
++        } else if (hashed == EmptyHashedRelationWithAllNullKeys) {
++          Iterator.empty
++        } else {
++          val keyGenerator = UnsafeProjection.create(
++            BindReferences.bindReferences[Expression](
++              leftKeys,
++              AttributeSeq(left.output))
++          )
++          streamedIter.filter(row => {
++            val lookupKey: UnsafeRow = keyGenerator(row)
++            if (lookupKey.anyNull()) {
++              false
++            } else {
++              // Anti Join: Drop the row on the streamed side if it is a match on the build
++              hashed.get(lookupKey) == null
++            }
++          })
++        }
++      }
++    } else {
++      streamedPlan.execute().mapPartitions { streamedIter =>
++        val hashed = broadcastRelation.value.asReadOnlyCopy()
++        TaskContext.get().taskMetrics().incPeakExecutionMemory(hashed.estimatedSize)
++        join(streamedIter, hashed, numOutputRows)
++      }
+     }
+   }
+ 
+@@ -454,6 +490,40 @@ case class BroadcastHashJoinExec(
+     val (matched, checkCondition, _) = getJoinCondition(ctx, input)
+     val numOutput = metricTerm(ctx, "numOutputRows")
+ 
++    if (isNullAwareAntiJoin) {
++      if (broadcastRelation.value == EmptyHashedRelation) {
++        return s"""
++                  |// If the right side is empty, NAAJ simply returns the left side.
++                  |$numOutput.add(1);
++                  |${consume(ctx, input)}
++            """.stripMargin
++      } else if (broadcastRelation.value == EmptyHashedRelationWithAllNullKeys) {
++        return s"""
++                  |// If the right side contains any all-null key, NAAJ simply returns Nothing.
++            """.stripMargin
++      } else {
++        val found = ctx.freshName("found")
++        return s"""
++                  |boolean $found = false;
++                  |// generate join key for stream side
++                  |${keyEv.code}
++                  |if ($anyNull) {
++                  |  $found = true;
++                  |} else {
++                  |  UnsafeRow $matched = (UnsafeRow)$relationTerm.getValue(${keyEv.value});
++                  |  if ($matched != null) {
++                  |    $found = true;
++                  |  }
++                  |}
++                  |
++                  |if (!$found) {
++                  |  $numOutput.add(1);
++                  |  ${consume(ctx, input)}
++                  |}
++            """.stripMargin
++      }
++    }
++
+     if (uniqueKeyCodePath) {
+       val found = ctx.freshName("found")
+       s"""
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala
+index 13180d6b20902..f2835c2fa6626 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala
+@@ -96,7 +96,8 @@ private[execution] object HashedRelation {
+       input: Iterator[InternalRow],
+       key: Seq[Expression],
+       sizeEstimate: Int = 64,
+-      taskMemoryManager: TaskMemoryManager = null): HashedRelation = {
++      taskMemoryManager: TaskMemoryManager = null,
++      isNullAware: Boolean = false): HashedRelation = {
+     val mm = Option(taskMemoryManager).getOrElse {
+       new TaskMemoryManager(
+         new UnifiedMemoryManager(
+@@ -107,10 +108,12 @@ private[execution] object HashedRelation {
+         0)
+     }
+ 
+-    if (key.length == 1 && key.head.dataType == LongType) {
+-      LongHashedRelation(input, key, sizeEstimate, mm)
++    if (isNullAware && !input.hasNext) {
++      EmptyHashedRelation
++    } else if (key.length == 1 && key.head.dataType == LongType) {
++      LongHashedRelation(input, key, sizeEstimate, mm, isNullAware)
+     } else {
+-      UnsafeHashedRelation(input, key, sizeEstimate, mm)
++      UnsafeHashedRelation(input, key, sizeEstimate, mm, isNullAware)
+     }
+   }
+ }
+@@ -310,7 +313,8 @@ private[joins] object UnsafeHashedRelation {
+       input: Iterator[InternalRow],
+       key: Seq[Expression],
+       sizeEstimate: Int,
+-      taskMemoryManager: TaskMemoryManager): HashedRelation = {
++      taskMemoryManager: TaskMemoryManager,
++      isNullAware: Boolean = false): HashedRelation = {
+ 
+     val pageSizeBytes = Option(SparkEnv.get).map(_.memoryManager.pageSizeBytes)
+       .getOrElse(new SparkConf().get(BUFFER_PAGESIZE).getOrElse(16L * 1024 * 1024))
+@@ -338,6 +342,8 @@ private[joins] object UnsafeHashedRelation {
+           throw new SparkOutOfMemoryError("There is not enough memory to build hash map")
+           // scalastyle:on throwerror
+         }
++      } else if (isNullAware) {
++        return EmptyHashedRelationWithAllNullKeys
+       }
+     }
+ 
+@@ -889,7 +895,8 @@ private[joins] object LongHashedRelation {
+       input: Iterator[InternalRow],
+       key: Seq[Expression],
+       sizeEstimate: Int,
+-      taskMemoryManager: TaskMemoryManager): LongHashedRelation = {
++      taskMemoryManager: TaskMemoryManager,
++      isNullAware: Boolean = false): HashedRelation = {
+ 
+     val map = new LongToUnsafeRowMap(taskMemoryManager, sizeEstimate)
+     val keyGenerator = UnsafeProjection.create(key)
+@@ -903,6 +910,8 @@ private[joins] object LongHashedRelation {
+       if (!rowKey.isNullAt(0)) {
+         val key = rowKey.getLong(0)
+         map.append(key, unsafeRow)
++      } else if (isNullAware) {
++        return EmptyHashedRelationWithAllNullKeys
+       }
+     }
+     map.optimize()
+@@ -910,8 +919,52 @@ private[joins] object LongHashedRelation {
+   }
+ }
+ 
++/**
++ * Common trait with dummy implementation for NAAJ special HashedRelation
++ * EmptyHashedRelation
++ * EmptyHashedRelationWithAllNullKeys
++ */
++trait NullAwareHashedRelation extends HashedRelation with Externalizable {
++  override def get(key: InternalRow): Iterator[InternalRow] = {
++    throw new UnsupportedOperationException
++  }
++
++  override def getValue(key: InternalRow): InternalRow = {
++    throw new UnsupportedOperationException
++  }
++
++  override def keyIsUnique: Boolean = true
++
++  override def keys(): Iterator[InternalRow] = {
++    throw new UnsupportedOperationException
++  }
++
++  override def close(): Unit = {}
++
++  override def writeExternal(out: ObjectOutput): Unit = {}
++
++  override def readExternal(in: ObjectInput): Unit = {}
++
++  override def estimatedSize: Long = 0
++}
++
++/**
++ * A special HashedRelation indicates it built from a empty input:Iterator[InternalRow].
++ */
++object EmptyHashedRelation extends NullAwareHashedRelation {
++  override def asReadOnlyCopy(): EmptyHashedRelation.type = this
++}
++
++/**
++ * A special HashedRelation indicates it built from a non-empty input:Iterator[InternalRow],
++ * which contains all null columns key.
++ */
++object EmptyHashedRelationWithAllNullKeys extends NullAwareHashedRelation {
++  override def asReadOnlyCopy(): EmptyHashedRelationWithAllNullKeys.type = this
++}
++
+ /** The HashedRelationBroadcastMode requires that rows are broadcasted as a HashedRelation. */
+-case class HashedRelationBroadcastMode(key: Seq[Expression])
++case class HashedRelationBroadcastMode(key: Seq[Expression], isNullAware: Boolean = false)
+   extends BroadcastMode {
+ 
+   override def transform(rows: Array[InternalRow]): HashedRelation = {
+@@ -923,9 +976,9 @@ case class HashedRelationBroadcastMode(key: Seq[Expression])
+       sizeHint: Option[Long]): HashedRelation = {
+     sizeHint match {
+       case Some(numRows) =>
+-        HashedRelation(rows, canonicalized.key, numRows.toInt)
++        HashedRelation(rows, canonicalized.key, numRows.toInt, isNullAware = isNullAware)
+       case None =>
+-        HashedRelation(rows, canonicalized.key)
++        HashedRelation(rows, canonicalized.key, isNullAware = isNullAware)
+     }
+   }
+ 
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/group-by-filter.sql b/sql/core/src/test/resources/sql-tests/inputs/group-by-filter.sql
+index beb5b9e5fe516..4c1816e93b083 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/group-by-filter.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/group-by-filter.sql
+@@ -1,5 +1,8 @@
+ -- Test filter clause for aggregate expression.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ -- Test data.
+ CREATE OR REPLACE TEMPORARY VIEW testData AS SELECT * FROM VALUES
+ (1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (null, 1), (3, null), (null, null)
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-basic.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-basic.sql
+index f4ffc20086386..5669423148f80 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-basic.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-basic.sql
+@@ -1,3 +1,6 @@
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view tab_a as select * from values (1, 1) as tab_a(a1, b1);
+ create temporary view tab_b as select * from values (1, 1) as tab_b(a2, b2);
+ create temporary view struct_tab as select struct(col1 as a, col2 as b) as record from
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-having.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-having.sql
+index 8f98ae1155062..750cc42b8641c 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-having.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-having.sql
+@@ -1,6 +1,9 @@
+ -- A test suite for IN HAVING in parent side, subquery, and both predicate subquery
+ -- It includes correlated cases.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-joins.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-joins.sql
+index 200a71ebbb622..2353560137d21 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-joins.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-joins.sql
+@@ -13,6 +13,9 @@
+ --CONFIG_DIM2 spark.sql.codegen.wholeStage=false,spark.sql.codegen.factoryMode=CODEGEN_ONLY
+ --CONFIG_DIM2 spark.sql.codegen.wholeStage=false,spark.sql.codegen.factoryMode=NO_CODEGEN
+ 
++--CONFIG_DIM3 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM3 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-limit.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-limit.sql
+index 0a16f118f0455..53fc2b8be7501 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-limit.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-limit.sql
+@@ -1,6 +1,9 @@
+ -- A test suite for IN LIMIT in parent side, subquery, and both predicate subquery
+ -- It includes correlated cases.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2BD, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2BD, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-multiple-columns.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-multiple-columns.sql
+index 4643605148a0c..1a6c06f9dad49 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-multiple-columns.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-multiple-columns.sql
+@@ -1,6 +1,9 @@
+ -- A test suite for multiple columns in predicate in parent side, subquery, and both predicate subquery
+ -- It includes correlated cases.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-order-by.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-order-by.sql
+index 001c49c460b06..568854ebe2d9b 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-order-by.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-order-by.sql
+@@ -6,6 +6,9 @@
+ --CONFIG_DIM1 spark.sql.codegen.wholeStage=false,spark.sql.codegen.factoryMode=CODEGEN_ONLY
+ --CONFIG_DIM1 spark.sql.codegen.wholeStage=false,spark.sql.codegen.factoryMode=NO_CODEGEN
+ 
++--CONFIG_DIM2 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM2 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2BD, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2BD, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-with-cte.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-with-cte.sql
+index e65cb9106c1d4..fa4ae87f041cf 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-with-cte.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/in-with-cte.sql
+@@ -1,6 +1,9 @@
+ -- A test suite for in with cte in parent side, subquery, and both predicate subquery
+ -- It includes correlated cases.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/nested-not-in.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/nested-not-in.sql
+index 2f6835b59fdd5..e2d4ad522d446 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/nested-not-in.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/nested-not-in.sql
+@@ -1,5 +1,8 @@
+ -- Tests NOT-IN subqueries nested inside OR expression(s).
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ CREATE TEMPORARY VIEW EMP AS SELECT * FROM VALUES
+   (100, "emp 1", 10),
+   (200, "emp 2", NULL),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-joins.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-joins.sql
+index fcdb667ad4523..2d11c5da20633 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-joins.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-joins.sql
+@@ -1,6 +1,9 @@
+ -- A test suite for not-in-joins in parent side, subquery, and both predicate subquery
+ -- It includes correlated cases.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column-literal.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column-literal.sql
+index 8eea84f4f5272..a061e495f51b8 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column-literal.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column-literal.sql
+@@ -4,6 +4,9 @@
+ -- This file has the same test cases as not-in-unit-tests-multi-column.sql with literals instead of
+ -- subqueries. Small changes have been made to the literals to make them typecheck.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ CREATE TEMPORARY VIEW m AS SELECT * FROM VALUES
+   (null, null),
+   (null, 1.0),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column.sql
+index 9f8dc7fca3b94..28ab75121573a 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-multi-column.sql
+@@ -15,6 +15,9 @@
+ -- This can be generalized to include more tests for more columns, but it covers the main cases
+ -- when there is more than one column.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ CREATE TEMPORARY VIEW m AS SELECT * FROM VALUES
+   (null, null),
+   (null, 1.0),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column-literal.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column-literal.sql
+index b261363d1dde7..79747022eb1e8 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column-literal.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column-literal.sql
+@@ -4,6 +4,9 @@
+ -- This file has the same test cases as not-in-unit-tests-single-column.sql with literals instead of
+ -- subqueries.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ CREATE TEMPORARY VIEW m AS SELECT * FROM VALUES
+   (null, 1.0),
+   (2, 3.0),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column.sql
+index 2cc08e10acf67..8060246bf3a3f 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/not-in-unit-tests-single-column.sql
+@@ -31,6 +31,9 @@
+ -- cause cases 2, 3, or 4 to be reduced to case 1 by limiting the number of rows returned by the
+ -- subquery, so the row from the parent table should always be included in the output.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ CREATE TEMPORARY VIEW m AS SELECT * FROM VALUES
+   (null, 1.0),
+   (2, 3.0),
+diff --git a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/simple-in.sql b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/simple-in.sql
+index 2748a959cbef8..d8a58afa344db 100644
+--- a/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/simple-in.sql
++++ b/sql/core/src/test/resources/sql-tests/inputs/subquery/in-subquery/simple-in.sql
+@@ -1,6 +1,9 @@
+ -- A test suite for simple IN predicate subquery
+ -- It includes correlated cases.
+ 
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=true
++--CONFIG_DIM1 spark.sql.optimizeNullAwareAntiJoin=false
++
+ create temporary view t1 as select * from values
+   ("t1a", 6S, 8, 10L, float(15.0), 20D, 20E2BD, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
+   ("t1b", 8S, 16, 19L, float(17.0), 25D, 26E2BD, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
+diff --git a/sql/core/src/test/resources/sql-tests/results/explain-aqe.sql.out b/sql/core/src/test/resources/sql-tests/results/explain-aqe.sql.out
+index 36757863ffcb5..79f4d48101ca4 100644
+--- a/sql/core/src/test/resources/sql-tests/results/explain-aqe.sql.out
++++ b/sql/core/src/test/resources/sql-tests/results/explain-aqe.sql.out
+@@ -308,7 +308,7 @@ Input [2]: [key#x, val#x]
+ 
+ (7) BroadcastExchange
+ Input [2]: [key#x, val#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (8) BroadcastHashJoin
+ Left keys [1]: [key#x]
+@@ -362,7 +362,7 @@ Input [2]: [key#x, val#x]
+ 
+ (5) BroadcastExchange
+ Input [2]: [key#x, val#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (6) BroadcastHashJoin
+ Left keys [1]: [key#x]
+@@ -533,7 +533,7 @@ Input [2]: [key#x, val#x]
+ 
+ (7) BroadcastExchange
+ Input [2]: [key#x, val#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (8) BroadcastHashJoin
+ Left keys [1]: [key#x]
+@@ -643,7 +643,7 @@ Results [2]: [key#x, max(val#x)#x AS max(val)#x]
+ 
+ (13) BroadcastExchange
+ Input [2]: [key#x, max(val)#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (14) BroadcastHashJoin
+ Left keys [1]: [key#x]
+diff --git a/sql/core/src/test/resources/sql-tests/results/explain.sql.out b/sql/core/src/test/resources/sql-tests/results/explain.sql.out
+index 2b07dac0e5d0a..614cb2a137d01 100644
+--- a/sql/core/src/test/resources/sql-tests/results/explain.sql.out
++++ b/sql/core/src/test/resources/sql-tests/results/explain.sql.out
+@@ -316,7 +316,7 @@ Input [2]: [key#x, val#x]
+ 
+ (9) BroadcastExchange
+ Input [2]: [key#x, val#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (10) BroadcastHashJoin [codegen id : 2]
+ Left keys [1]: [key#x]
+@@ -373,7 +373,7 @@ Input [2]: [key#x, val#x]
+ 
+ (7) BroadcastExchange
+ Input [2]: [key#x, val#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (8) BroadcastHashJoin [codegen id : 2]
+ Left keys [1]: [key#x]
+@@ -771,7 +771,7 @@ Input [2]: [key#x, val#x]
+ 
+ (9) BroadcastExchange
+ Input [2]: [key#x, val#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (10) BroadcastHashJoin [codegen id : 2]
+ Left keys [1]: [key#x]
+@@ -853,7 +853,7 @@ Results [2]: [key#x, max(val#x)#x AS max(val)#x]
+ 
+ (10) BroadcastExchange
+ Input [2]: [key#x, max(val)#x]
+-Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint))), [id=#x]
++Arguments: HashedRelationBroadcastMode(List(cast(input[0, int, true] as bigint)),false), [id=#x]
+ 
+ (11) BroadcastHashJoin [codegen id : 4]
+ Left keys [1]: [key#x]
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/DynamicPartitionPruningSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/DynamicPartitionPruningSuite.scala
+index cdf9ea4b31ee7..0b754e9e3ec0b 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/DynamicPartitionPruningSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/DynamicPartitionPruningSuite.scala
+@@ -396,7 +396,7 @@ abstract class DynamicPartitionPruningSuiteBase
+        """.stripMargin)
+ 
+       val found = df.queryExecution.executedPlan.find {
+-        case BroadcastHashJoinExec(_, _, p: ExistenceJoin, _, _, _, _) => true
++        case BroadcastHashJoinExec(_, _, p: ExistenceJoin, _, _, _, _, _) => true
+         case _ => false
+       }
+ 
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala
+index c42d4c6f74a93..bedfbffc789ac 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/JoinSuite.scala
+@@ -89,6 +89,7 @@ class JoinSuite extends QueryTest with SharedSparkSession with AdaptiveSparkPlan
+     if (operators.head.getClass != c) {
+       fail(s"$sqlString expected operator: $c, but got ${operators.head}\n physical: \n$physical")
+     }
++    operators.head
+   }
+ 
+   test("join operator selection") {
+@@ -1147,4 +1148,44 @@ class JoinSuite extends QueryTest with SharedSparkSession with AdaptiveSparkPlan
+       })
+     }
+   }
++
++  test("SPARK-32290: SingleColumn Null Aware Anti Join Optimize") {
++    withSQLConf(SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> "true",
++      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> Long.MaxValue.toString) {
++      // positive not in subquery case
++      var joinExec = assertJoin((
++        "select * from testData where key not in (select a from testData2)",
++        classOf[BroadcastHashJoinExec]))
++      assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++
++      // negative not in subquery case since multi-column is not supported
++      assertJoin((
++        "select * from testData where (key, key + 1) not in (select * from testData2)",
++        classOf[BroadcastNestedLoopJoinExec]))
++
++      // positive hand-written left anti join
++      // testData.key nullable false
++      // testData3.b nullable true
++      joinExec = assertJoin((
++        "select * from testData left anti join testData3 ON key = b or isnull(key = b)",
++        classOf[BroadcastHashJoinExec]))
++      assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++
++      // negative hand-written left anti join
++      // testData.key nullable false
++      // testData2.a nullable false
++      // isnull(key = a) will be optimized to true literal and removed
++      joinExec = assertJoin((
++        "select * from testData left anti join testData2 ON key = a or isnull(key = a)",
++        classOf[BroadcastHashJoinExec]))
++      assert(!joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++
++      // negative hand-written left anti join
++      // not match pattern Or(EqualTo(a=b), IsNull(EqualTo(a=b))
++      assertJoin((
++        "select * from testData2 left anti join testData3 ON testData2.a = testData3.b or " +
++          "isnull(testData2.b = testData3.b)",
++        classOf[BroadcastNestedLoopJoinExec]))
++    }
++  }
+ }
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/SubquerySuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/SubquerySuite.scala
+index 2bb9aa55e4579..a21c461e84588 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/SubquerySuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/SubquerySuite.scala
+@@ -24,6 +24,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan, Sort}
+ import org.apache.spark.sql.execution.{ColumnarToRowExec, ExecSubqueryExpression, FileSourceScanExec, InputAdapter, ReusedSubqueryExec, ScalarSubquery, SubqueryExec, WholeStageCodegenExec}
+ import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, DisableAdaptiveExecution}
+ import org.apache.spark.sql.execution.datasources.FileScanRDD
++import org.apache.spark.sql.execution.joins.{BaseJoinExec, BroadcastHashJoinExec, BroadcastNestedLoopJoinExec}
+ import org.apache.spark.sql.internal.SQLConf
+ import org.apache.spark.sql.test.SharedSparkSession
+ 
+@@ -1646,4 +1647,110 @@ class SubquerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
+     checkAnswer(df, df2)
+     checkAnswer(df, Nil)
+   }
++
++  test("SPARK-32290: SingleColumn Null Aware Anti Join Optimize") {
++    Seq(true, false).foreach { enableNAAJ =>
++      Seq(true, false).foreach { enableAQE =>
++        Seq(true, false).foreach { enableCodegen =>
++          withSQLConf(
++            SQLConf.OPTIMIZE_NULL_AWARE_ANTI_JOIN.key -> enableNAAJ.toString,
++            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> enableAQE.toString,
++            SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> enableCodegen.toString) {
++
++            def findJoinExec(df: DataFrame): BaseJoinExec = {
++              df.queryExecution.sparkPlan.collectFirst {
++                case j: BaseJoinExec => j
++              }.get
++            }
++
++            var df: DataFrame = null
++            var joinExec: BaseJoinExec = null
++
++            // single column not in subquery -- empty sub-query
++            df = sql("select * from l where a not in (select c from r where c > 10)")
++            checkAnswer(df, spark.table("l"))
++            if (enableNAAJ) {
++              joinExec = findJoinExec(df)
++              assert(joinExec.isInstanceOf[BroadcastHashJoinExec])
++              assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++            } else {
++              assert(findJoinExec(df).isInstanceOf[BroadcastNestedLoopJoinExec])
++            }
++
++            // single column not in subquery -- sub-query include null
++            df = sql("select * from l where a not in (select c from r where d < 6.0)")
++            checkAnswer(df, Seq.empty)
++            if (enableNAAJ) {
++              joinExec = findJoinExec(df)
++              assert(joinExec.isInstanceOf[BroadcastHashJoinExec])
++              assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++            } else {
++              assert(findJoinExec(df).isInstanceOf[BroadcastNestedLoopJoinExec])
++            }
++
++            // single column not in subquery -- streamedSide row is null
++            df =
++              sql("select * from l where b = 5.0 and a not in(select c from r where c is not null)")
++            checkAnswer(df, Seq.empty)
++            if (enableNAAJ) {
++              joinExec = findJoinExec(df)
++              assert(joinExec.isInstanceOf[BroadcastHashJoinExec])
++              assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++            } else {
++              assert(findJoinExec(df).isInstanceOf[BroadcastNestedLoopJoinExec])
++            }
++
++            // single column not in subquery -- streamedSide row is not null, match found
++            df =
++              sql("select * from l where a = 6 and a not in (select c from r where c is not null)")
++            checkAnswer(df, Seq.empty)
++            if (enableNAAJ) {
++              joinExec = findJoinExec(df)
++              assert(joinExec.isInstanceOf[BroadcastHashJoinExec])
++              assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++            } else {
++              assert(findJoinExec(df).isInstanceOf[BroadcastNestedLoopJoinExec])
++            }
++
++            // single column not in subquery -- streamedSide row is not null, match not found
++            df =
++              sql("select * from l where a = 1 and a not in (select c from r where c is not null)")
++            checkAnswer(df, Row(1, 2.0) :: Row(1, 2.0) :: Nil)
++            if (enableNAAJ) {
++              joinExec = findJoinExec(df)
++              assert(joinExec.isInstanceOf[BroadcastHashJoinExec])
++              assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++            } else {
++              assert(findJoinExec(df).isInstanceOf[BroadcastNestedLoopJoinExec])
++            }
++
++            // single column not in subquery -- d = b + 10 joinKey found, match ExtractEquiJoinKeys
++            df = sql("select * from l where a not in (select c from r where d = b + 10)")
++            checkAnswer(df, spark.table("l"))
++            joinExec = findJoinExec(df)
++            assert(joinExec.isInstanceOf[BroadcastHashJoinExec])
++            assert(!joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++
++            // single column not in subquery -- d = b + 10 and b = 5.0 => d = 15, joinKey not found
++            // match ExtractSingleColumnNullAwareAntiJoin
++            df =
++              sql("select * from l where b = 5.0 and a not in (select c from r where d = b + 10)")
++            checkAnswer(df, Row(null, 5.0) :: Nil)
++            if (enableNAAJ) {
++              joinExec = findJoinExec(df)
++              assert(joinExec.isInstanceOf[BroadcastHashJoinExec])
++              assert(joinExec.asInstanceOf[BroadcastHashJoinExec].isNullAwareAntiJoin)
++            } else {
++              assert(findJoinExec(df).isInstanceOf[BroadcastNestedLoopJoinExec])
++            }
++
++            // multi column not in subquery
++            df = sql("select * from l where (a, b) not in (select c, d from r where c > 10)")
++            checkAnswer(df, spark.table("l"))
++            assert(findJoinExec(df).isInstanceOf[BroadcastNestedLoopJoinExec])
++          }
++        }
++      }
++    }
++  }
+ }
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/WholeStageCodegenSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/WholeStageCodegenSuite.scala
+index f7396ee2a89c8..03596d8654c66 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/WholeStageCodegenSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/WholeStageCodegenSuite.scala
+@@ -342,7 +342,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
+         .join(baseTable, "idx")
+       assert(distinctWithId.queryExecution.executedPlan.collectFirst {
+         case WholeStageCodegenExec(
+-          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _))) => true
++          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
+       }.isDefined)
+       checkAnswer(distinctWithId, Seq(Row(1, 0), Row(1, 0)))
+ 
+@@ -353,7 +353,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
+         .join(baseTable, "idx")
+       assert(groupByWithId.queryExecution.executedPlan.collectFirst {
+         case WholeStageCodegenExec(
+-          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _))) => true
++          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
+       }.isDefined)
+       checkAnswer(groupByWithId, Seq(Row(1, 2, 0), Row(1, 2, 0)))
+     }
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/debug/DebuggingSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/debug/DebuggingSuite.scala
+index e9ef7c1a0c540..d2c9322685d94 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/debug/DebuggingSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/debug/DebuggingSuite.scala
+@@ -69,8 +69,9 @@ class DebuggingSuite extends SharedSparkSession with DisableAdaptiveExecutionSui
+     }
+ 
+     val output = captured.toString()
++    val hashedModeString = "HashedRelationBroadcastMode(List(input[0, bigint, false]),false)"
+     assert(output.replaceAll("\\[id=#\\d+\\]", "[id=#x]").contains(
+-      """== BroadcastExchange HashedRelationBroadcastMode(List(input[0, bigint, false])), [id=#x] ==
++      s"""== BroadcastExchange $hashedModeString, [id=#x] ==
+         |Tuples output: 0
+         | id LongType: {}
+         |== WholeStageCodegen (1) ==
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/HashedRelationSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/HashedRelationSuite.scala
+index 3526aa254c280..21ee88f0d7426 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/HashedRelationSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/joins/HashedRelationSuite.scala
+@@ -144,6 +144,7 @@ class HashedRelationSuite extends SharedSparkSession {
+     }
+ 
+     val longRelation2 = LongHashedRelation(rows.iterator ++ rows.iterator, key, 100, mm)
++        .asInstanceOf[LongHashedRelation]
+     assert(!longRelation2.keyIsUnique)
+     (0 until 100).foreach { i =>
+       val rows = longRelation2.get(i).toArray

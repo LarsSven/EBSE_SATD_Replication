@@ -1,0 +1,88 @@
+diff --git a/src/couch_replicator/src/couch_replicator_worker.erl b/src/couch_replicator/src/couch_replicator_worker.erl
+index 23a4ea10798..3d80f5883a6 100644
+--- a/src/couch_replicator/src/couch_replicator_worker.erl
++++ b/src/couch_replicator/src/couch_replicator_worker.erl
+@@ -269,16 +269,28 @@ fetch_doc(Source, {Id, Revs, PAs}, DocHandler, Acc) ->
+     end.
+ 
+ 
+-remote_doc_handler({ok, #doc{atts = []} = Doc}, {Parent, _} = Acc) ->
+-    ok = gen_server:call(Parent, {batch_doc, Doc}, infinity),
+-    {ok, Acc};
+-remote_doc_handler({ok, Doc}, {Parent, Target} = Acc) ->
++remote_doc_handler({ok, #doc{id = <<?DESIGN_DOC_PREFIX, _/binary>>} = Doc},
++        Acc) ->
++    % Flush design docs in their own PUT requests to correctly process
++    % authorization failures for design doc updates.
++    couch_log:debug("Worker flushing design doc", []),
++    doc_handler_flush_doc(Doc, Acc);
++remote_doc_handler({ok, #doc{atts = [_ | _]} = Doc}, Acc) ->
+     % Immediately flush documents with attachments received from a remote
+     % source. The data property of each attachment is a function that starts
+     % streaming the attachment data from the remote source, therefore it's
+     % convenient to call it ASAP to avoid ibrowse inactivity timeouts.
+-    Stats = couch_replicator_stats:new([{docs_read, 1}]),
+     couch_log:debug("Worker flushing doc with attachments", []),
++    doc_handler_flush_doc(Doc, Acc);
++remote_doc_handler({ok, #doc{atts = []} = Doc}, {Parent, _} = Acc) ->
++    ok = gen_server:call(Parent, {batch_doc, Doc}, infinity),
++    {ok, Acc};
++remote_doc_handler({{not_found, missing}, _}, _Acc) ->
++    throw(missing_doc).
++
++
++doc_handler_flush_doc(#doc{} = Doc, {Parent, Target} = Acc) ->
++    Stats = couch_replicator_stats:new([{docs_read, 1}]),
+     Success = (flush_doc(Target, Doc) =:= ok),
+     {Result, Stats2} = case Success of
+     true ->
+@@ -287,9 +299,7 @@ remote_doc_handler({ok, Doc}, {Parent, Target} = Acc) ->
+         {{skip, Acc}, couch_replicator_stats:increment(doc_write_failures, Stats)}
+     end,
+     ok = gen_server:call(Parent, {add_stats, Stats2}, infinity),
+-    Result;
+-remote_doc_handler({{not_found, missing}, _}, _Acc) ->
+-    throw(missing_doc).
++    Result.
+ 
+ 
+ spawn_writer(Target, #batch{docs = DocList, size = Size}) ->
+diff --git a/src/couch_replicator/test/eunit/couch_replicator_many_leaves_tests.erl b/src/couch_replicator/test/eunit/couch_replicator_many_leaves_tests.erl
+index be1bfa34449..c7933b47290 100644
+--- a/src/couch_replicator/test/eunit/couch_replicator_many_leaves_tests.erl
++++ b/src/couch_replicator/test/eunit/couch_replicator_many_leaves_tests.erl
+@@ -22,7 +22,8 @@
+ 
+ -define(DOCS_CONFLICTS, [
+     {<<"doc1">>, 10},
+-    {<<"doc2">>, 100},
++    % use some _design docs as well to test the special handling for them
++    {<<"_design/doc2">>, 100},
+     % a number > MaxURLlength (7000) / length(DocRevisionString)
+     {<<"doc3">>, 210}
+ ]).
+@@ -111,13 +112,13 @@ should_add_attachments_to_source({remote, Source}) ->
+     should_add_attachments_to_source(Source);
+ should_add_attachments_to_source(Source) ->
+     {timeout, ?TIMEOUT_EUNIT, ?_test(begin
+-        {ok, SourceDb} = couch_db:open_int(Source, []),
++        {ok, SourceDb} = couch_db:open_int(Source, [?ADMIN_CTX]),
+         add_attachments(SourceDb, ?NUM_ATTS, ?DOCS_CONFLICTS),
+         ok = couch_db:close(SourceDb)
+     end)}.
+ 
+ populate_db(DbName) ->
+-    {ok, Db} = couch_db:open_int(DbName, []),
++    {ok, Db} = couch_db:open_int(DbName, [?ADMIN_CTX]),
+     lists:foreach(
+        fun({DocId, NumConflicts}) ->
+             Value = <<"0">>,
+@@ -125,7 +126,7 @@ populate_db(DbName) ->
+                 id = DocId,
+                 body = {[ {<<"value">>, Value} ]}
+             },
+-            {ok, _} = couch_db:update_doc(Db, Doc, []),
++            {ok, _} = couch_db:update_doc(Db, Doc, [?ADMIN_CTX]),
+             {ok, _} = add_doc_siblings(Db, DocId, NumConflicts)
+         end, ?DOCS_CONFLICTS),
+     couch_db:close(Db).

@@ -1,0 +1,223 @@
+diff --git a/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterInputDStream.scala b/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterInputDStream.scala
+index 4eacc47da5699..a17f03f68c367 100644
+--- a/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterInputDStream.scala
++++ b/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterInputDStream.scala
+@@ -45,6 +45,13 @@ class TwitterInputDStream(
+     storageLevel: StorageLevel
+   ) extends ReceiverInputDStream[Status](ssc_)  {
+ 
++  private var locations: Seq[(Double, Double)] = Nil
++
++  def setLocations(locs: Seq[(Double, Double)]): ReceiverInputDStream[Status] = {
++    locations = locs
++    this
++  }
++ 
+   private def createOAuthAuthorization(): Authorization = {
+     new OAuthAuthorization(new ConfigurationBuilder().build())
+   }
+@@ -52,7 +59,7 @@ class TwitterInputDStream(
+   private val authorization = twitterAuth.getOrElse(createOAuthAuthorization())
+ 
+   override def getReceiver(): Receiver[Status] = {
+-    new TwitterReceiver(authorization, filters, storageLevel)
++    new TwitterReceiver(authorization, filters, locations, storageLevel)
+   }
+ }
+ 
+@@ -60,6 +67,7 @@ private[streaming]
+ class TwitterReceiver(
+     twitterAuth: Authorization,
+     filters: Seq[String],
++    locations: Seq[(Double, Double)],
+     storageLevel: StorageLevel
+   ) extends Receiver[Status](storageLevel) with Logging {
+ 
+@@ -85,9 +93,14 @@ class TwitterReceiver(
+         }
+       })
+ 
+-      val query = new FilterQuery
+-      if (filters.size > 0) {
+-        query.track(filters.toArray)
++      if (filters.nonEmpty || locations.nonEmpty) {
++        val query = new FilterQuery
++        if (filters.nonEmpty) {
++          query.track(filters.toArray)
++        }
++        if (locations.nonEmpty) {
++          query.locations(locations.map(l => Array(l._1, l._2)).toArray)
++        }
+         newTwitterStream.filter(query)
+       } else {
+         newTwitterStream.sample()
+diff --git a/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterUtils.scala b/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterUtils.scala
+index c6a9a2b73714f..57068938764ca 100644
+--- a/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterUtils.scala
++++ b/external/twitter/src/main/scala/org/apache/spark/streaming/twitter/TwitterUtils.scala
+@@ -43,6 +43,19 @@ object TwitterUtils {
+     ): ReceiverInputDStream[Status] = {
+     new TwitterInputDStream(ssc, twitterAuth, filters, storageLevel)
+   }
++ 
++  /**
++   * Set location filter for a input stream.
++   * @param locations Set of longitude, latitude pairs to get only those tweets
++   *        that falling within the requested bounding boxes
++   * @param storageLevel Storage level to use for storing the received objects
++   */
++  def setLocations(
++      stream: ReceiverInputDStream[Status],
++      locations: Seq[(Double, Double)]
++    ): ReceiverInputDStream[Status] = {
++    stream.asInstanceOf[TwitterInputDStream].setLocations(locations)
++  }
+ 
+   /**
+    * Create a input stream that returns tweets received from Twitter using Twitter4J's default
+@@ -128,4 +141,20 @@ object TwitterUtils {
+     ): JavaReceiverInputDStream[Status] = {
+     createStream(jssc.ssc, Some(twitterAuth), filters, storageLevel)
+   }
++ 
++  /**
++   * Set location filter for a input stream.
++   * @param locations Set of longitude, latitude pairs to get only those tweets
++   *        that falling within the requested bounding boxes
++   * @param storageLevel Storage level to use for storing the received objects
++   */
++  def setLocations(
++      jstream: JavaReceiverInputDStream[Status],
++      locations: Array[Array[Double]]
++    ): JavaReceiverInputDStream[Status] = {
++    val locationTuples = locations.collect{ case Array(x: Double, y: Double, _*) =>
++      (x, y)
++    }
++    jstream.receiverInputDStream.asInstanceOf[TwitterInputDStream].setLocations(locationTuples)
++  }
+ }
+diff --git a/external/twitter/src/test/java/org/apache/spark/streaming/twitter/JavaTwitterStreamSuite.java b/external/twitter/src/test/java/org/apache/spark/streaming/twitter/JavaTwitterStreamSuite.java
+index e46b4e5c7531d..47bd247931ba2 100644
+--- a/external/twitter/src/test/java/org/apache/spark/streaming/twitter/JavaTwitterStreamSuite.java
++++ b/external/twitter/src/test/java/org/apache/spark/streaming/twitter/JavaTwitterStreamSuite.java
+@@ -31,16 +31,34 @@ public class JavaTwitterStreamSuite extends LocalJavaStreamingContext {
+   @Test
+   public void testTwitterStream() {
+     String[] filters = (String[])Arrays.<String>asList("filter1", "filter2").toArray();
++    double[][] locations = { {-180.0, -90.0}, {180.0, 90.0} };
+     Authorization auth = NullAuthorization.getInstance();
+ 
+     // tests the API, does not actually test data receiving
+     JavaDStream<Status> test1 = TwitterUtils.createStream(ssc);
+     JavaDStream<Status> test2 = TwitterUtils.createStream(ssc, filters);
+-    JavaDStream<Status> test3 = TwitterUtils.createStream(
++
++    JavaDStream<Status> test3 = TwitterUtils.setLocations(
++      TwitterUtils.createStream(ssc, filters), locations);
++
++    JavaDStream<Status> test4 = TwitterUtils.createStream(
+       ssc, filters, StorageLevel.MEMORY_AND_DISK_SER_2());
+-    JavaDStream<Status> test4 = TwitterUtils.createStream(ssc, auth);
+-    JavaDStream<Status> test5 = TwitterUtils.createStream(ssc, auth, filters);
+-    JavaDStream<Status> test6 = TwitterUtils.createStream(ssc,
++
++    JavaDStream<Status> test5 = TwitterUtils.setLocations(
++      TwitterUtils.createStream(ssc, filters, StorageLevel.MEMORY_AND_DISK_SER_2()),
++      locations);
++ 
++    JavaDStream<Status> test6 = TwitterUtils.createStream(ssc, auth);
++    JavaDStream<Status> test7 = TwitterUtils.createStream(ssc, auth, filters);
++
++    JavaDStream<Status> test8 = TwitterUtils.setLocations(
++      TwitterUtils.createStream(ssc, auth, filters), locations);
++
++    JavaDStream<Status> test9 = TwitterUtils.createStream(ssc,
+       auth, filters, StorageLevel.MEMORY_AND_DISK_SER_2());
++
++    JavaDStream<Status> test10 = TwitterUtils.setLocations(
++      TwitterUtils.createStream(ssc, auth, filters, StorageLevel.MEMORY_AND_DISK_SER_2()),
++      locations);
+   }
+ }
+diff --git a/external/twitter/src/test/scala/org/apache/spark/streaming/twitter/TwitterStreamSuite.scala b/external/twitter/src/test/scala/org/apache/spark/streaming/twitter/TwitterStreamSuite.scala
+index 93741e0375164..b88ad569ffe61 100644
+--- a/external/twitter/src/test/scala/org/apache/spark/streaming/twitter/TwitterStreamSuite.scala
++++ b/external/twitter/src/test/scala/org/apache/spark/streaming/twitter/TwitterStreamSuite.scala
+@@ -17,32 +17,70 @@
+ 
+ package org.apache.spark.streaming.twitter
+ 
+-import org.apache.spark.streaming.{StreamingContext, TestSuiteBase}
+-import org.apache.spark.storage.StorageLevel
++
++import org.scalatest.{BeforeAndAfter, FunSuite}
++import twitter4j.Status
+ import twitter4j.auth.{NullAuthorization, Authorization}
++
++import org.apache.spark.Logging
++import org.apache.spark.streaming.{Seconds, StreamingContext}
++import org.apache.spark.storage.StorageLevel
+ import org.apache.spark.streaming.dstream.ReceiverInputDStream
+-import twitter4j.Status
+ 
+-class TwitterStreamSuite extends TestSuiteBase {
++class TwitterStreamSuite extends FunSuite with BeforeAndAfter with Logging {
++
++  val batchDuration = Seconds(1)
++
++  private val master: String = "local[2]"
++
++  private val framework: String = this.getClass.getSimpleName
+ 
+   test("twitter input stream") {
+     val ssc = new StreamingContext(master, framework, batchDuration)
+     val filters = Seq("filter1", "filter2")
++    val locations: Seq[(Double, Double)] = Seq((-180, -90), (180, 90))
+     val authorization: Authorization = NullAuthorization.getInstance()
+ 
+     // tests the API, does not actually test data receiving
+     val test1: ReceiverInputDStream[Status] = TwitterUtils.createStream(ssc, None)
+     val test2: ReceiverInputDStream[Status] =
+       TwitterUtils.createStream(ssc, None, filters)
++
+     val test3: ReceiverInputDStream[Status] =
+-      TwitterUtils.createStream(ssc, None, filters, StorageLevel.MEMORY_AND_DISK_SER_2)
++      TwitterUtils.createStream(ssc, None)
++    TwitterUtils.setLocations(test3, locations)
++
+     val test4: ReceiverInputDStream[Status] =
+-      TwitterUtils.createStream(ssc, Some(authorization))
++      TwitterUtils.createStream(ssc, None, filters)
++    TwitterUtils.setLocations(test4, locations)
++ 
+     val test5: ReceiverInputDStream[Status] =
++      TwitterUtils.createStream(ssc, None, filters, StorageLevel.MEMORY_AND_DISK_SER_2)
++
++    val test6: ReceiverInputDStream[Status] =
++      TwitterUtils.createStream(ssc, None, filters, StorageLevel.MEMORY_AND_DISK_SER_2)
++    TwitterUtils.setLocations(test6, locations)
++
++    val test7: ReceiverInputDStream[Status] =
++      TwitterUtils.createStream(ssc, Some(authorization))
++    val test8: ReceiverInputDStream[Status] =
++      TwitterUtils.createStream(ssc, Some(authorization), filters)
++
++    val test9: ReceiverInputDStream[Status] =
++      TwitterUtils.createStream(ssc, Some(authorization))
++    TwitterUtils.setLocations(test9, locations)
++
++    val test10: ReceiverInputDStream[Status] =
+       TwitterUtils.createStream(ssc, Some(authorization), filters)
+-    val test6: ReceiverInputDStream[Status] = TwitterUtils.createStream(
++    TwitterUtils.setLocations(test10, locations)
++ 
++    val test11: ReceiverInputDStream[Status] = TwitterUtils.createStream(
+       ssc, Some(authorization), filters, StorageLevel.MEMORY_AND_DISK_SER_2)
+ 
++    val test12: ReceiverInputDStream[Status] = TwitterUtils.createStream(
++      ssc, Some(authorization), filters, StorageLevel.MEMORY_AND_DISK_SER_2)
++    TwitterUtils.setLocations(test12, locations)
++ 
+     // Note that actually testing the data receiving is hard as authentication keys are
+     // necessary for accessing Twitter live stream
+     ssc.stop()

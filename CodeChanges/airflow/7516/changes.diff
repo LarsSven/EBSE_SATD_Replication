@@ -1,0 +1,120 @@
+diff --git a/airflow/providers/google/cloud/operators/cloud_sql.py b/airflow/providers/google/cloud/operators/cloud_sql.py
+index 6217a8830b3e6..22969d185a45a 100644
+--- a/airflow/providers/google/cloud/operators/cloud_sql.py
++++ b/airflow/providers/google/cloud/operators/cloud_sql.py
+@@ -808,7 +808,7 @@ def __init__(self,
+         self.gcp_cloudsql_conn_id = gcp_cloudsql_conn_id
+         self.autocommit = autocommit
+         self.parameters = parameters
+-        self.gcp_connection = BaseHook.get_connection(self.gcp_conn_id)
++        self.gcp_connection = None
+ 
+     def _execute_query(self, hook: CloudSQLDatabaseHook, database_hook: Union[PostgresHook, MySqlHook]):
+         cloud_sql_proxy_runner = None
+@@ -827,6 +827,7 @@ def _execute_query(self, hook: CloudSQLDatabaseHook, database_hook: Union[Postgr
+                 cloud_sql_proxy_runner.stop_proxy()
+ 
+     def execute(self, context):
++        self.gcp_connection = BaseHook.get_connection(self.gcp_conn_id)
+         hook = CloudSQLDatabaseHook(
+             gcp_cloudsql_conn_id=self.gcp_cloudsql_conn_id,
+             gcp_conn_id=self.gcp_conn_id,
+diff --git a/tests/test_example_dags.py b/tests/test_example_dags.py
+index f68a0d28ca034..6319bb9c0718b 100644
+--- a/tests/test_example_dags.py
++++ b/tests/test_example_dags.py
+@@ -20,11 +20,16 @@
+ from glob import glob
+ 
+ from airflow.models import DagBag
++from tests.test_utils.asserts import assert_queries_count
+ 
+ ROOT_FOLDER = os.path.realpath(
+     os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir)
+ )
+ 
++NO_DB_QUERY_EXCEPTION = [
++    "/airflow/example_dags/example_subdag_operator.py"
++]
++
+ 
+ class TestExampleDags(unittest.TestCase):
+     def test_should_be_importable(self):
+@@ -38,3 +43,19 @@ def test_should_be_importable(self):
+                 )
+                 self.assertEqual(0, len(dagbag.import_errors), f"import_errors={str(dagbag.import_errors)}")
+                 self.assertGreaterEqual(len(dagbag.dag_ids), 1)
++
++    def test_should_not_do_database_queries(self):
++        example_dags = glob(f"{ROOT_FOLDER}/airflow/**/example_dags/example_*.py", recursive=True)
++        example_dags = [
++            dag_file
++            for dag_file in example_dags
++            if any(not dag_file.endswith(e) for e in NO_DB_QUERY_EXCEPTION)
++        ]
++        for filepath in example_dags:
++            relative_filepath = os.path.relpath(filepath, ROOT_FOLDER)
++            with self.subTest(f"File {relative_filepath} shouldn't do database queries"):
++                with assert_queries_count(0):
++                    DagBag(
++                        dag_folder=filepath,
++                        include_examples=False,
++                    )
+diff --git a/tests/test_utils/asserts.py b/tests/test_utils/asserts.py
+index 3b2172aedf4f1..d50fae00951a1 100644
+--- a/tests/test_utils/asserts.py
++++ b/tests/test_utils/asserts.py
+@@ -16,9 +16,53 @@
+ # under the License.
+ 
+ import re
++from contextlib import contextmanager
++
++from sqlalchemy import event
++
++from airflow.settings import engine
+ 
+ 
+ def assert_equal_ignore_multiple_spaces(case, first, second, msg=None):
+     def _trim(s):
+         return re.sub(r"\s+", " ", s.strip())
+     return case.assertEqual(_trim(first), _trim(second), msg)
++
++
++class CountQueriesResult:
++    def __init__(self):
++        self.count = 0
++
++
++class CountQueries:
++    """
++    Counts the number of queries sent to Airflow Database in a given context.
++
++    Does not support multiple processes. When a new process is started in context, its queries will
++    not be included.
++    """
++    def __init__(self):
++        self.result = CountQueriesResult()
++
++    def __enter__(self):
++        event.listen(engine, "after_cursor_execute", self.after_cursor_execute)
++        return self.result
++
++    def __exit__(self, type_, value, traceback):
++        event.remove(engine, "after_cursor_execute", self.after_cursor_execute)
++
++    def after_cursor_execute(self, *args, **kwargs):
++        self.result.count += 1
++
++
++count_queries = CountQueries  # pylint: disable=invalid-name
++
++
++@contextmanager
++def assert_queries_count(expected_count, message_fmt=None):
++    with count_queries() as result:
++        yield None
++    message_fmt = message_fmt or "The expected number of db queries is {expected_count}. " \
++                                 "The current number is {current_count}."
++    message = message_fmt.format(current_count=result.count, expected_count=expected_count)
++    assert expected_count == result.count, message

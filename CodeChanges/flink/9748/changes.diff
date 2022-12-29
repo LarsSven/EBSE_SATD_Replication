@@ -1,0 +1,1210 @@
+diff --git a/flink-table/flink-table-common/src/main/java/org/apache/flink/table/functions/FunctionDefinition.java b/flink-table/flink-table-common/src/main/java/org/apache/flink/table/functions/FunctionDefinition.java
+index 16379285f2e28..e43e84121c325 100644
+--- a/flink-table/flink-table-common/src/main/java/org/apache/flink/table/functions/FunctionDefinition.java
++++ b/flink-table/flink-table-common/src/main/java/org/apache/flink/table/functions/FunctionDefinition.java
+@@ -40,6 +40,13 @@ public interface FunctionDefinition {
+ 	 */
+ 	FunctionKind getKind();
+ 
++	/**
++	 * Returns the language of function this definition describes.
++	 */
++	default FunctionLanguage getLanguage() {
++		return FunctionLanguage.JVM;
++	}
++
+ 	/**
+ 	 * Returns the set of requirements this definition demands.
+ 	 */
+diff --git a/flink-table/flink-table-common/src/main/java/org/apache/flink/table/functions/FunctionLanguage.java b/flink-table/flink-table-common/src/main/java/org/apache/flink/table/functions/FunctionLanguage.java
+new file mode 100644
+index 0000000000000..7b36b132a4719
+--- /dev/null
++++ b/flink-table/flink-table-common/src/main/java/org/apache/flink/table/functions/FunctionLanguage.java
+@@ -0,0 +1,32 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.functions;
++
++import org.apache.flink.annotation.PublicEvolving;
++
++/**
++ * Categorizes the language of a {@link FunctionDefinition}.
++ */
++@PublicEvolving
++public enum FunctionLanguage {
++
++	JVM,
++
++	PYTHON
++}
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/CalciteConfig.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/CalciteConfig.scala
+index 8064fa9b9aa43..4ba17131ddbdf 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/CalciteConfig.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/CalciteConfig.scala
+@@ -52,6 +52,12 @@ class CalciteConfigBuilder {
+   private var replaceLogicalOptRules: Boolean = false
+   private var logicalOptRuleSets: List[RuleSet] = Nil
+ 
++  /**
++    * Defines the logical rewrite rule set.
++    */
++  private var replaceLogicalRewriteRules: Boolean = false
++  private var logicalRewriteRuleSets: List[RuleSet] = Nil
++
+   /**
+     * Defines the physical optimization rule set.
+     */
+@@ -119,6 +125,25 @@ class CalciteConfigBuilder {
+     this
+   }
+ 
++  /**
++    * Replaces the built-in logical rewrite rule set with the given rule set.
++    */
++  def replaceLogicalRewriteRuleSet(replaceRuleSet: RuleSet): CalciteConfigBuilder = {
++    Preconditions.checkNotNull(replaceRuleSet)
++    logicalRewriteRuleSets = List(replaceRuleSet)
++    replaceLogicalRewriteRules = true
++    this
++  }
++
++  /**
++    * Appends the given logical rewrite rule set to the built-in rule set.
++    */
++  def addLogicalRewriteRuleSet(addedRuleSet: RuleSet): CalciteConfigBuilder = {
++    Preconditions.checkNotNull(addedRuleSet)
++    logicalRewriteRuleSets = addedRuleSet :: logicalRewriteRuleSets
++    this
++  }
++
+   /**
+     * Replaces the built-in optimization rule set with the given rule set.
+     */
+@@ -225,6 +250,8 @@ class CalciteConfigBuilder {
+     replaceNormRules,
+     getRuleSet(logicalOptRuleSets),
+     replaceLogicalOptRules,
++    getRuleSet(logicalRewriteRuleSets),
++    replaceLogicalRewriteRules,
+     getRuleSet(physicalOptRuleSets),
+     replacePhysicalOptRules,
+     getRuleSet(decoRuleSets),
+@@ -254,6 +281,10 @@ class CalciteConfig(
+   val logicalOptRuleSet: Option[RuleSet],
+   /** Whether this configuration replaces the built-in logical optimization rule set. */
+   val replacesLogicalOptRuleSet: Boolean,
++  /** A custom logical rewrite rule set. */
++  val logicalRewriteRuleSet: Option[RuleSet],
++  /** Whether this configuration replaces the built-in logical rewrite rule set.  */
++  val replacesLogicalRewriteRuleSet: Boolean,
+   /** A custom physical optimization rule set. */
+   val physicalOptRuleSet: Option[RuleSet],
+   /** Whether this configuration replaces the built-in physical optimization rule set. */
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/Optimizer.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/Optimizer.scala
+index 8506749dbe751..4336c074c3c94 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/Optimizer.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/Optimizer.scala
+@@ -86,6 +86,25 @@ abstract class Optimizer(
+     }
+   }
+ 
++  /**
++    * Returns the logical rewrite rule set for this optimizer
++    * including a custom RuleSet configuration.
++    */
++  protected def getLogicalRewriteRuleSet: RuleSet = {
++    materializedConfig.logicalRewriteRuleSet match {
++
++      case None =>
++        getBuiltInLogicalRewriteRuleSet
++
++      case Some(ruleSet) =>
++        if (materializedConfig.replacesLogicalRewriteRuleSet) {
++          ruleSet
++        } else {
++          RuleSets.ofList((getBuiltInLogicalRewriteRuleSet.asScala ++ ruleSet.asScala).asJava)
++        }
++    }
++  }
++
+   /**
+     * Returns the physical optimization rule set for this optimizer
+     * including a custom RuleSet configuration.
+@@ -117,6 +136,13 @@ abstract class Optimizer(
+     FlinkRuleSets.LOGICAL_OPT_RULES
+   }
+ 
++  /**
++    * Returns the built-in logical rewrite rules that are defined by the optimizer.
++    */
++  protected def getBuiltInLogicalRewriteRuleSet: RuleSet = {
++    FlinkRuleSets.LOGICAL_REWRITE_RULES
++  }
++
+   /**
+     * Returns the built-in physical optimization rules that are defined by the optimizer.
+     */
+@@ -153,6 +179,19 @@ abstract class Optimizer(
+     }
+   }
+ 
++  protected def optimizeLogicalRewritePlan(relNode: RelNode): RelNode = {
++    val logicalRewriteRuleSet = getLogicalRewriteRuleSet
++    if (logicalRewriteRuleSet.iterator().hasNext) {
++      runHepPlannerSimultaneously(
++        HepMatchOrder.TOP_DOWN,
++        logicalRewriteRuleSet,
++        relNode,
++        relNode.getTraitSet)
++    } else {
++      relNode
++    }
++  }
++
+   protected def optimizeLogicalPlan(relNode: RelNode): RelNode = {
+     val logicalOptRuleSet = getLogicalOptRuleSet
+     val logicalOutputProps = relNode.getTraitSet.replace(FlinkConventions.LOGICAL).simplify()
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/StreamOptimizer.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/StreamOptimizer.scala
+index 30ca4861ca695..1ef6d7017d260 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/StreamOptimizer.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/StreamOptimizer.scala
+@@ -64,8 +64,8 @@ class StreamOptimizer(
+       RelTimeIndicatorConverter.convert(decorPlan, relBuilder.getRexBuilder)
+     val normalizedPlan = optimizeNormalizeLogicalPlan(planWithMaterializedTimeAttributes)
+     val logicalPlan = optimizeLogicalPlan(normalizedPlan)
+-
+-    val physicalPlan = optimizePhysicalPlan(logicalPlan, FlinkConventions.DATASTREAM)
++    val logicalRewritePlan = optimizeLogicalRewritePlan(logicalPlan)
++    val physicalPlan = optimizePhysicalPlan(logicalRewritePlan, FlinkConventions.DATASTREAM)
+     optimizeDecoratePlan(physicalPlan, updatesAsRetraction)
+   }
+ 
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/CommonCalc.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/CommonCalc.scala
+index 36df67a0721a8..34f4ba84bda28 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/CommonCalc.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/CommonCalc.scala
+@@ -34,7 +34,6 @@ trait CommonCalc {
+   private[flink] def generateFunction[T <: Function](
+       generator: FunctionCodeGenerator,
+       ruleDescription: String,
+-      inputSchema: RowSchema,
+       returnSchema: RowSchema,
+       calcProjection: Seq[RexNode],
+       calcCondition: Option[RexNode],
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/dataset/DataSetCalc.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/dataset/DataSetCalc.scala
+index fd60bfe99cfc9..7d2aa58a6353e 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/dataset/DataSetCalc.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/dataset/DataSetCalc.scala
+@@ -105,7 +105,6 @@ class DataSetCalc(
+     val genFunction = generateFunction(
+       generator,
+       ruleDescription,
+-      new RowSchema(getInput.getRowType),
+       new RowSchema(getRowType),
+       projection,
+       condition,
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamCalc.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamCalc.scala
+index 07b53eb9cb49d..f3e6afa7e4791 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamCalc.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamCalc.scala
+@@ -18,18 +18,15 @@
+ 
+ package org.apache.flink.table.plan.nodes.datastream
+ 
+-import org.apache.calcite.plan.{RelOptCluster, RelOptCost, RelOptPlanner, RelTraitSet}
+-import org.apache.calcite.rel.`type`.RelDataType
++import org.apache.calcite.plan.{RelOptCluster, RelTraitSet}
+ import org.apache.calcite.rel.core.Calc
+-import org.apache.calcite.rel.metadata.RelMetadataQuery
+-import org.apache.calcite.rel.{RelNode, RelWriter}
++import org.apache.calcite.rel.RelNode
+ import org.apache.calcite.rex.RexProgram
+ import org.apache.flink.streaming.api.datastream.DataStream
+ import org.apache.flink.streaming.api.functions.ProcessFunction
+ import org.apache.flink.table.api.StreamQueryConfig
+ import org.apache.flink.table.calcite.RelTimeIndicatorConverter
+ import org.apache.flink.table.codegen.FunctionCodeGenerator
+-import org.apache.flink.table.plan.nodes.CommonCalc
+ import org.apache.flink.table.plan.schema.RowSchema
+ import org.apache.flink.table.planner.StreamPlanner
+ import org.apache.flink.table.runtime.CRowProcessRunner
+@@ -49,11 +46,14 @@ class DataStreamCalc(
+     schema: RowSchema,
+     calcProgram: RexProgram,
+     ruleDescription: String)
+-  extends Calc(cluster, traitSet, input, calcProgram)
+-  with CommonCalc
+-  with DataStreamRel {
+-
+-  override def deriveRowType(): RelDataType = schema.relDataType
++  extends DataStreamCalcBase(
++    cluster,
++    traitSet,
++    input,
++    inputSchema,
++    schema,
++    calcProgram,
++    ruleDescription) {
+ 
+   override def copy(traitSet: RelTraitSet, child: RelNode, program: RexProgram): Calc = {
+     new DataStreamCalc(
+@@ -66,28 +66,6 @@ class DataStreamCalc(
+       ruleDescription)
+   }
+ 
+-  override def toString: String = calcToString(calcProgram, getExpressionString)
+-
+-  override def explainTerms(pw: RelWriter): RelWriter = {
+-    pw.input("input", getInput)
+-      .item("select", selectionToString(calcProgram, getExpressionString))
+-      .itemIf("where",
+-        conditionToString(calcProgram, getExpressionString),
+-        calcProgram.getCondition != null)
+-  }
+-
+-  override def computeSelfCost(planner: RelOptPlanner, metadata: RelMetadataQuery): RelOptCost = {
+-    val child = this.getInput
+-    val rowCnt = metadata.getRowCount(child)
+-    computeSelfCost(calcProgram, planner, rowCnt)
+-  }
+-
+-  override def estimateRowCount(metadata: RelMetadataQuery): Double = {
+-    val child = this.getInput
+-    val rowCnt = metadata.getRowCount(child)
+-    estimateRowCount(calcProgram, rowCnt)
+-  }
+-
+   override def translateToPlan(
+       planner: StreamPlanner,
+       queryConfig: StreamQueryConfig): DataStream[CRow] = {
+@@ -117,7 +95,6 @@ class DataStreamCalc(
+     val genFunction = generateFunction(
+       generator,
+       ruleDescription,
+-      inputSchema,
+       schema,
+       projection,
+       condition,
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamCalcBase.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamCalcBase.scala
+new file mode 100644
+index 0000000000000..5e62a9f2ddfce
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamCalcBase.scala
+@@ -0,0 +1,68 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.plan.nodes.datastream
++
++import org.apache.calcite.plan.{RelOptCluster, RelOptCost, RelOptPlanner, RelTraitSet}
++import org.apache.calcite.rel.`type`.RelDataType
++import org.apache.calcite.rel.core.Calc
++import org.apache.calcite.rel.metadata.RelMetadataQuery
++import org.apache.calcite.rel.{RelNode, RelWriter}
++import org.apache.calcite.rex.RexProgram
++import org.apache.flink.table.plan.nodes.CommonCalc
++import org.apache.flink.table.plan.schema.RowSchema
++
++/**
++  * Base RelNode for data stream calc.
++  */
++abstract class DataStreamCalcBase(
++    cluster: RelOptCluster,
++    traitSet: RelTraitSet,
++    input: RelNode,
++    inputSchema: RowSchema,
++    schema: RowSchema,
++    calcProgram: RexProgram,
++    ruleDescription: String)
++  extends Calc(cluster, traitSet, input, calcProgram)
++  with CommonCalc
++  with DataStreamRel {
++
++  override def deriveRowType(): RelDataType = schema.relDataType
++
++  override def toString: String = calcToString(calcProgram, getExpressionString)
++
++  override def explainTerms(pw: RelWriter): RelWriter = {
++    pw.input("input", getInput)
++      .item("select", selectionToString(calcProgram, getExpressionString))
++      .itemIf("where",
++        conditionToString(calcProgram, getExpressionString),
++        calcProgram.getCondition != null)
++  }
++
++  override def computeSelfCost(planner: RelOptPlanner, metadata: RelMetadataQuery): RelOptCost = {
++    val child = this.getInput
++    val rowCnt = metadata.getRowCount(child)
++    computeSelfCost(calcProgram, planner, rowCnt)
++  }
++
++  override def estimateRowCount(metadata: RelMetadataQuery): Double = {
++    val child = this.getInput
++    val rowCnt = metadata.getRowCount(child)
++    estimateRowCount(calcProgram, rowCnt)
++  }
++}
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamPythonCalc.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamPythonCalc.scala
+new file mode 100644
+index 0000000000000..fbb7be14bc458
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamPythonCalc.scala
+@@ -0,0 +1,68 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.plan.nodes.datastream
++
++import org.apache.calcite.plan.{RelOptCluster, RelTraitSet}
++import org.apache.calcite.rel.RelNode
++import org.apache.calcite.rel.core.Calc
++import org.apache.calcite.rex.RexProgram
++import org.apache.flink.streaming.api.datastream.DataStream
++import org.apache.flink.table.api.StreamQueryConfig
++import org.apache.flink.table.plan.schema.RowSchema
++import org.apache.flink.table.planner.StreamPlanner
++import org.apache.flink.table.runtime.types.CRow
++
++/**
++  * RelNode for Python ScalarFunctions.
++  */
++class DataStreamPythonCalc(
++    cluster: RelOptCluster,
++    traitSet: RelTraitSet,
++    input: RelNode,
++    inputSchema: RowSchema,
++    schema: RowSchema,
++    calcProgram: RexProgram,
++    ruleDescription: String)
++  extends DataStreamCalcBase(
++    cluster,
++    traitSet,
++    input,
++    inputSchema,
++    schema,
++    calcProgram,
++    ruleDescription) {
++
++  override def copy(traitSet: RelTraitSet, child: RelNode, program: RexProgram): Calc = {
++    new DataStreamPythonCalc(
++      cluster,
++      traitSet,
++      child,
++      inputSchema,
++      schema,
++      program,
++      ruleDescription)
++  }
++
++  override def translateToPlan(
++      planner: StreamPlanner,
++      queryConfig: StreamQueryConfig): DataStream[CRow] = {
++    // Will add the implementation in FLINK-14018 as it's not testable for now.
++    null
++  }
++}
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/FlinkRuleSets.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/FlinkRuleSets.scala
+index b7701cdde0751..c13ed65ea465c 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/FlinkRuleSets.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/FlinkRuleSets.scala
+@@ -143,6 +143,13 @@ object FlinkRuleSets {
+     FlinkLogicalWindowTableAggregate.CONVERTER
+   )
+ 
++  /**
++    * RuleSet to do rewrite on FlinkLogicalRel
++    */
++  val LOGICAL_REWRITE_RULES: RuleSet = RuleSets.ofList(
++    PythonScalarFunctionSplitRule.INSTANCE
++  )
++
+   /**
+     * RuleSet to normalize plans for batch / DataSet execution
+     */
+@@ -233,7 +240,8 @@ object FlinkRuleSets {
+     StreamTableSourceScanRule.INSTANCE,
+     DataStreamMatchRule.INSTANCE,
+     DataStreamTableAggregateRule.INSTANCE,
+-    DataStreamGroupWindowTableAggregateRule.INSTANCE
++    DataStreamGroupWindowTableAggregateRule.INSTANCE,
++    DataStreamPythonCalcRule.INSTANCE
+   )
+ 
+   /**
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/datastream/DataStreamCalcRule.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/datastream/DataStreamCalcRule.scala
+index 0a1a31a7a5f3e..a7c16d9b84019 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/datastream/DataStreamCalcRule.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/datastream/DataStreamCalcRule.scala
+@@ -18,21 +18,30 @@
+ 
+ package org.apache.flink.table.plan.rules.datastream
+ 
+-import org.apache.calcite.plan.{RelOptRule, RelTraitSet}
++import org.apache.calcite.plan.{RelOptRule, RelOptRuleCall, RelTraitSet}
+ import org.apache.calcite.rel.RelNode
+ import org.apache.calcite.rel.convert.ConverterRule
++import org.apache.flink.table.functions.FunctionLanguage
+ import org.apache.flink.table.plan.nodes.FlinkConventions
+ import org.apache.flink.table.plan.nodes.datastream.DataStreamCalc
+ import org.apache.flink.table.plan.nodes.logical.FlinkLogicalCalc
+ import org.apache.flink.table.plan.schema.RowSchema
++import org.apache.flink.table.plan.util.PythonUtil.containsFunctionOf
++
++import scala.collection.JavaConverters._
+ 
+ class DataStreamCalcRule
+   extends ConverterRule(
+     classOf[FlinkLogicalCalc],
+     FlinkConventions.LOGICAL,
+     FlinkConventions.DATASTREAM,
+-    "DataStreamCalcRule")
+-{
++    "DataStreamCalcRule") {
++
++  override def matches(call: RelOptRuleCall): Boolean = {
++    val calc: FlinkLogicalCalc = call.rel(0).asInstanceOf[FlinkLogicalCalc]
++    val program = calc.getProgram
++    !program.getExprList.asScala.exists(containsFunctionOf(_, FunctionLanguage.PYTHON))
++  }
+ 
+   def convert(rel: RelNode): RelNode = {
+     val calc: FlinkLogicalCalc = rel.asInstanceOf[FlinkLogicalCalc]
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/datastream/DataStreamPythonCalcRule.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/datastream/DataStreamPythonCalcRule.scala
+new file mode 100644
+index 0000000000000..e164c0991047c
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/datastream/DataStreamPythonCalcRule.scala
+@@ -0,0 +1,64 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.plan.rules.datastream
++
++import org.apache.calcite.plan.{RelOptRule, RelOptRuleCall, RelTraitSet}
++import org.apache.calcite.rel.RelNode
++import org.apache.calcite.rel.convert.ConverterRule
++import org.apache.flink.table.functions.FunctionLanguage
++import org.apache.flink.table.plan.nodes.FlinkConventions
++import org.apache.flink.table.plan.nodes.datastream.DataStreamPythonCalc
++import org.apache.flink.table.plan.nodes.logical.FlinkLogicalCalc
++import org.apache.flink.table.plan.schema.RowSchema
++import org.apache.flink.table.plan.util.PythonUtil.containsFunctionOf
++
++import scala.collection.JavaConverters._
++
++class DataStreamPythonCalcRule
++  extends ConverterRule(
++    classOf[FlinkLogicalCalc],
++    FlinkConventions.LOGICAL,
++    FlinkConventions.DATASTREAM,
++    "DataStreamPythonCalcRule") {
++
++  override def matches(call: RelOptRuleCall): Boolean = {
++    val calc: FlinkLogicalCalc = call.rel(0).asInstanceOf[FlinkLogicalCalc]
++    val program = calc.getProgram
++    program.getExprList.asScala.exists(containsFunctionOf(_, FunctionLanguage.PYTHON))
++  }
++
++  def convert(rel: RelNode): RelNode = {
++    val calc: FlinkLogicalCalc = rel.asInstanceOf[FlinkLogicalCalc]
++    val traitSet: RelTraitSet = rel.getTraitSet.replace(FlinkConventions.DATASTREAM)
++    val convInput: RelNode = RelOptRule.convert(calc.getInput, FlinkConventions.DATASTREAM)
++
++    new DataStreamPythonCalc(
++      rel.getCluster,
++      traitSet,
++      convInput,
++      new RowSchema(convInput.getRowType),
++      new RowSchema(rel.getRowType),
++      calc.getProgram,
++      description)
++  }
++}
++
++object DataStreamPythonCalcRule {
++  val INSTANCE: RelOptRule = new DataStreamPythonCalcRule
++}
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/logical/PythonScalarFunctionSplitRule.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/logical/PythonScalarFunctionSplitRule.scala
+new file mode 100644
+index 0000000000000..deb56c55de8a0
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/logical/PythonScalarFunctionSplitRule.scala
+@@ -0,0 +1,211 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.plan.rules.logical
++
++import org.apache.calcite.plan.RelOptRule.{any, operand}
++import org.apache.calcite.plan.{RelOptRule, RelOptRuleCall}
++import org.apache.calcite.rex.{RexCall, RexInputRef, RexNode, RexProgram}
++import org.apache.calcite.sql.validate.SqlValidatorUtil
++import org.apache.flink.table.functions.FunctionLanguage
++import org.apache.flink.table.functions.ScalarFunction
++import org.apache.flink.table.functions.utils.ScalarSqlFunction
++import org.apache.flink.table.plan.nodes.logical.FlinkLogicalCalc
++import org.apache.flink.table.plan.util.PythonUtil.containsFunctionOf
++import org.apache.flink.table.plan.util.{InputRefVisitor, RexDefaultVisitor}
++
++import scala.collection.JavaConverters._
++import scala.collection.JavaConversions._
++import scala.collection.mutable
++
++/**
++  * Rule that splits [[FlinkLogicalCalc]] into multiple [[FlinkLogicalCalc]]s. After this rule
++  * is applied, each [[FlinkLogicalCalc]] will only contain Python [[ScalarFunction]]s or Java
++  * [[ScalarFunction]]s. This is to ensure that the Python [[ScalarFunction]]s which could be
++  * executed in a batch are grouped into the same [[FlinkLogicalCalc]] node.
++  */
++class PythonScalarFunctionSplitRule extends RelOptRule(
++  operand(classOf[FlinkLogicalCalc], any),
++  "PythonScalarFunctionSplitRule") {
++
++  override def matches(call: RelOptRuleCall): Boolean = {
++    val calc: FlinkLogicalCalc = call.rel(0).asInstanceOf[FlinkLogicalCalc]
++    val program = calc.getProgram
++
++    // This rule matches if one of the following cases is met:
++    // 1. There are Python functions and Java functions mixed in the Calc
++    // 2. There are Python functions in the condition of the Calc
++    (program.getExprList.exists(containsFunctionOf(_, FunctionLanguage.PYTHON)) &&
++      program.getExprList.exists(containsFunctionOf(_, FunctionLanguage.JVM))) ||
++    Option(program.getCondition)
++      .map(program.expandLocalRef)
++      .exists(containsFunctionOf(_, FunctionLanguage.PYTHON))
++  }
++
++  override def onMatch(call: RelOptRuleCall): Unit = {
++    val calc: FlinkLogicalCalc = call.rel(0).asInstanceOf[FlinkLogicalCalc]
++    val input = calc.getInput
++    val rexBuilder = call.builder().getRexBuilder
++    val program = calc.getProgram
++    val extractedRexCalls = new mutable.ArrayBuffer[RexCall]()
++
++    val convertPythonFunction =
++      program.getProjectList
++        .map(program.expandLocalRef)
++        .exists(containsFunctionOf(_, FunctionLanguage.JVM, recursive = false)) ||
++      Option(program.getCondition)
++        .map(program.expandLocalRef)
++        .exists(expr =>
++          containsFunctionOf(expr, FunctionLanguage.JVM, recursive = false) ||
++            containsFunctionOf(expr, FunctionLanguage.PYTHON))
++
++    val extractedFunctionOffset = input.getRowType.getFieldCount
++    val splitter = new ScalarFunctionSplitter(
++      extractedFunctionOffset,
++      extractedRexCalls,
++      convertPythonFunction)
++
++    val newProjects = program.getProjectList.map(program.expandLocalRef(_).accept(splitter))
++    val newCondition = Option(program.getCondition).map(program.expandLocalRef(_).accept(splitter))
++    val accessedFields = extractRefInputFields(newProjects, newCondition, extractedFunctionOffset)
++
++    val bottomCalcProjects =
++      accessedFields.map(RexInputRef.of(_, input.getRowType)) ++ extractedRexCalls
++    val bottomCalcFieldNames = SqlValidatorUtil.uniquify(
++      accessedFields.map(i => input.getRowType.getFieldNames.get(i)).toSeq ++
++        extractedRexCalls.indices.map("f" + _),
++      rexBuilder.getTypeFactory.getTypeSystem.isSchemaCaseSensitive)
++
++    val bottomCalc = new FlinkLogicalCalc(
++      calc.getCluster,
++      calc.getTraitSet,
++      input,
++      RexProgram.create(
++        input.getRowType,
++        bottomCalcProjects.toList,
++        null,
++        bottomCalcFieldNames,
++        rexBuilder))
++
++    val inputRewriter = new ExtractedFunctionInputRewriter(extractedFunctionOffset, accessedFields)
++    val topCalc = new FlinkLogicalCalc(
++      calc.getCluster,
++      calc.getTraitSet,
++      bottomCalc,
++      RexProgram.create(
++        bottomCalc.getRowType,
++        newProjects.map(_.accept(inputRewriter)),
++        newCondition.map(_.accept(inputRewriter)).orNull,
++        calc.getRowType,
++        rexBuilder))
++
++    call.transformTo(topCalc)
++  }
++
++  /**
++    * Extracts the indices of the input fields referred by the specified projects and condition.
++    */
++  private def extractRefInputFields(
++      projects: Seq[RexNode],
++      condition: Option[RexNode],
++      inputFieldsCount: Int): Array[Int] = {
++    val visitor = new InputRefVisitor
++
++    // extract referenced input fields from projections
++    projects.foreach(exp => exp.accept(visitor))
++
++    // extract referenced input fields from condition
++    condition.foreach(_.accept(visitor))
++
++    // fields of indexes greater than inputFieldsCount is the extracted functions and
++    // should be filtered as they are not from the original input
++    visitor.getFields.filter(_ < inputFieldsCount)
++  }
++}
++
++private class ScalarFunctionSplitter(
++    extractedFunctionOffset: Int,
++    extractedRexCalls: mutable.ArrayBuffer[RexCall],
++    convertPythonFunction: Boolean)
++  extends RexDefaultVisitor[RexNode] {
++
++  override def visitCall(call: RexCall): RexNode = {
++    call.getOperator match {
++      case sfc: ScalarSqlFunction if sfc.getScalarFunction.getLanguage ==
++        FunctionLanguage.PYTHON =>
++        visit(convertPythonFunction, call)
++
++      case _ =>
++        visit(!convertPythonFunction, call)
++    }
++  }
++
++  override def visitNode(rexNode: RexNode): RexNode = rexNode
++
++  private def visit(needConvert: Boolean, call: RexCall): RexNode = {
++    if (needConvert) {
++      val newNode = new RexInputRef(
++        extractedFunctionOffset + extractedRexCalls.length, call.getType)
++      extractedRexCalls.append(call)
++      newNode
++    } else {
++      call.clone(call.getType, call.getOperands.asScala.map(_.accept(this)))
++    }
++  }
++}
++
++/**
++  * Rewrite field accesses of a RexNode as not all the fields from the original input are forwarded:
++  * 1) Fields of index greater than or equal to extractedFunctionOffset refer to the
++  *    extracted function.
++  * 2) Fields of index less than extractedFunctionOffset refer to the original input field.
++  *
++  * @param extractedFunctionOffset the original start offset of the extracted functions
++  * @param accessedFields the accessed fields which will be forwarded
++  */
++private class ExtractedFunctionInputRewriter(
++    extractedFunctionOffset: Int,
++    accessedFields: Array[Int])
++  extends RexDefaultVisitor[RexNode] {
++
++  /** old input fields ref index -> new input fields ref index mappings */
++  private val fieldMap: Map[Int, Int] = accessedFields.zipWithIndex.toMap
++
++  override def visitInputRef(inputRef: RexInputRef): RexNode = {
++    if (inputRef.getIndex >= extractedFunctionOffset) {
++      new RexInputRef(
++        inputRef.getIndex - extractedFunctionOffset + accessedFields.length,
++        inputRef.getType)
++    } else {
++      new RexInputRef(
++        fieldMap.getOrElse(inputRef.getIndex,
++          throw new IllegalArgumentException("input field contains invalid index")),
++        inputRef.getType)
++    }
++  }
++
++  override def visitCall(call: RexCall): RexNode = {
++    call.clone(call.getType, call.getOperands.asScala.map(_.accept(this)))
++  }
++
++  override def visitNode(rexNode: RexNode): RexNode = rexNode
++}
++
++object PythonScalarFunctionSplitRule {
++  val INSTANCE: RelOptRule = new PythonScalarFunctionSplitRule
++}
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/util/PythonUtil.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/util/PythonUtil.scala
+new file mode 100644
+index 0000000000000..cd4efd9c770c7
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/util/PythonUtil.scala
+@@ -0,0 +1,68 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.flink.table.plan.util
++
++import org.apache.calcite.rex.{RexCall, RexNode}
++import org.apache.flink.table.functions.FunctionLanguage
++import org.apache.flink.table.functions.utils.ScalarSqlFunction
++
++import scala.collection.JavaConversions._
++
++object PythonUtil {
++
++  /**
++    * Checks whether it contains the specified kind of function in the specified node.
++    *
++    * @param node the RexNode to check
++    * @param language the expected kind of function to find
++    * @param recursive whether check the inputs of the specified node
++    * @return true if it contains the specified kind of function in the specified node.
++    */
++  def containsFunctionOf(
++      node: RexNode,
++      language: FunctionLanguage,
++      recursive: Boolean = true): Boolean = {
++    node.accept(new FunctionFinder(language, recursive))
++  }
++
++  /**
++    * Checks whether it contains the specified kind of function in a RexNode.
++    *
++    * @param expectedLanguage the expected kind of function to find
++    * @param recursive whether check the inputs
++    */
++  class FunctionFinder(expectedLanguage: FunctionLanguage, recursive: Boolean)
++    extends RexDefaultVisitor[Boolean] {
++
++    override def visitCall(call: RexCall): Boolean = {
++      call.getOperator match {
++        case sfc: ScalarSqlFunction if sfc.getScalarFunction.getLanguage ==
++          FunctionLanguage.PYTHON =>
++          findInternal(FunctionLanguage.PYTHON, call)
++        case _ =>
++          findInternal(FunctionLanguage.JVM, call)
++      }
++    }
++
++    override def visitNode(rexNode: RexNode): Boolean = false
++
++    private def findInternal(actualLanguage: FunctionLanguage, call: RexCall): Boolean =
++      actualLanguage == expectedLanguage ||
++        (recursive && call.getOperands.exists(_.accept(this)))
++  }
++}
+diff --git a/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/calcite/CalciteConfigBuilderTest.scala b/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/calcite/CalciteConfigBuilderTest.scala
+index a7ffa594a9893..9dc36065cada5 100644
+--- a/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/calcite/CalciteConfigBuilderTest.scala
++++ b/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/calcite/CalciteConfigBuilderTest.scala
+@@ -47,6 +47,9 @@ class CalciteConfigBuilderTest {
+ 
+     assertFalse(cc.replacesDecoRuleSet)
+     assertFalse(cc.decoRuleSet.isDefined)
++
++    assertFalse(cc.replacesLogicalRewriteRuleSet)
++    assertFalse(cc.logicalRewriteRuleSet.isDefined)
+   }
+ 
+   @Test
+@@ -56,6 +59,7 @@ class CalciteConfigBuilderTest {
+       .addNormRuleSet(RuleSets.ofList(ReduceExpressionsRule.FILTER_INSTANCE))
+       .replaceLogicalOptRuleSet(RuleSets.ofList(FilterMergeRule.INSTANCE))
+       .replacePhysicalOptRuleSet(RuleSets.ofList(FilterMergeRule.INSTANCE))
++      .replaceLogicalRewriteRuleSet(RuleSets.ofList(FilterMergeRule.INSTANCE))
+       .replaceDecoRuleSet(RuleSets.ofList(DataStreamRetractionRules.DEFAULT_RETRACTION_INSTANCE))
+       .build()
+ 
+@@ -65,6 +69,9 @@ class CalciteConfigBuilderTest {
+     assertTrue(cc.replacesLogicalOptRuleSet)
+     assertTrue(cc.logicalOptRuleSet.isDefined)
+ 
++    assertTrue(cc.replacesLogicalOptRuleSet)
++    assertTrue(cc.logicalRewriteRuleSet.isDefined)
++
+     assertTrue(cc.replacesPhysicalOptRuleSet)
+     assertTrue(cc.physicalOptRuleSet.isDefined)
+ 
+@@ -182,6 +189,54 @@ class CalciteConfigBuilderTest {
+     assertTrue(cSet.contains(CalcSplitRule.INSTANCE))
+   }
+ 
++  @Test
++  def testReplaceLogicalRewriteRules(): Unit = {
++
++    val cc: CalciteConfig = new CalciteConfigBuilder()
++      .replaceLogicalRewriteRuleSet(RuleSets.ofList(FilterMergeRule.INSTANCE))
++      .build()
++
++    assertEquals(true, cc.replacesLogicalRewriteRuleSet)
++    assertTrue(cc.logicalRewriteRuleSet.isDefined)
++    val cSet = cc.logicalRewriteRuleSet.get.iterator().asScala.toSet
++    assertEquals(1, cSet.size)
++    assertTrue(cSet.contains(FilterMergeRule.INSTANCE))
++  }
++
++  @Test
++  def testReplaceLogicalRewriteAddRules(): Unit = {
++
++    val cc: CalciteConfig = new CalciteConfigBuilder()
++      .replaceLogicalRewriteRuleSet(RuleSets.ofList(FilterMergeRule.INSTANCE))
++      .addLogicalRewriteRuleSet(RuleSets.ofList(CalcMergeRule.INSTANCE, CalcSplitRule.INSTANCE))
++      .build()
++
++    assertEquals(true, cc.replacesLogicalRewriteRuleSet)
++    assertTrue(cc.logicalRewriteRuleSet.isDefined)
++    val cSet = cc.logicalRewriteRuleSet.get.iterator().asScala.toSet
++    assertEquals(3, cSet.size)
++    assertTrue(cSet.contains(FilterMergeRule.INSTANCE))
++    assertTrue(cSet.contains(CalcMergeRule.INSTANCE))
++    assertTrue(cSet.contains(CalcSplitRule.INSTANCE))
++  }
++
++  @Test
++  def testAddLogicalRewriteRules(): Unit = {
++
++    val cc: CalciteConfig = new CalciteConfigBuilder()
++      .addLogicalRewriteRuleSet(RuleSets.ofList(FilterMergeRule.INSTANCE))
++      .addLogicalRewriteRuleSet(RuleSets.ofList(CalcMergeRule.INSTANCE, CalcSplitRule.INSTANCE))
++      .build()
++
++    assertEquals(false, cc.replacesLogicalRewriteRuleSet)
++    assertTrue(cc.logicalRewriteRuleSet.isDefined)
++    val cSet = cc.logicalRewriteRuleSet.get.iterator().asScala.toSet
++    assertEquals(3, cSet.size)
++    assertTrue(cSet.contains(FilterMergeRule.INSTANCE))
++    assertTrue(cSet.contains(CalcMergeRule.INSTANCE))
++    assertTrue(cSet.contains(CalcSplitRule.INSTANCE))
++  }
++
+   @Test
+   def testReplacePhysicalOptimizationRules(): Unit = {
+ 
+diff --git a/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/plan/PythonScalarFunctionSplitRuleTest.scala b/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/plan/PythonScalarFunctionSplitRuleTest.scala
+new file mode 100644
+index 0000000000000..3db9398733376
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/plan/PythonScalarFunctionSplitRuleTest.scala
+@@ -0,0 +1,238 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.plan
++
++import org.apache.flink.api.common.typeinfo.{BasicTypeInfo, TypeInformation}
++import org.apache.flink.api.scala._
++import org.apache.flink.table.api.scala._
++import org.apache.flink.table.functions.{FunctionLanguage, ScalarFunction}
++import org.apache.flink.table.utils.TableTestUtil._
++import org.apache.flink.table.utils.TableTestBase
++import org.junit.Test
++
++class PythonScalarFunctionSplitRuleTest extends TableTestBase {
++
++  @Test
++  def testPythonFunctionAsInputOfJavaFunction(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++
++    val resultTable = table
++      .select("pyFunc1(a, b) + 1")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "pyFunc1(a, b) AS f0")
++      ),
++      term("select", "+(f0, 1) AS _c0")
++    )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testPythonFunctionMixedWithJavaFunction(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++
++    val resultTable = table
++      .select("pyFunc1(a, b), c + 1")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "c", "pyFunc1(a, b) AS f0")
++      ),
++      term("select", "f0 AS _c0", "+(c, 1) AS _c1")
++    )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testPythonFunctionMixedWithJavaFunctionInWhereClause(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++    util.tableEnv.registerFunction("pyFunc2", new PythonScalarFunction("pyFunc2"))
++
++    val resultTable = table
++      .where("pyFunc2(a, c) > 0")
++      .select("pyFunc1(a, b), c + 1")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "c", "pyFunc1(a, b) AS f0", "pyFunc2(a, c) AS f1")
++        ),
++      term("select", "f0 AS _c0", "+(c, 1) AS _c1"),
++      term("where", ">(f1, 0)")
++      )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testPythonFunctionInWhereClause(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++    util.tableEnv.registerFunction("pyFunc2", new BooleanPythonScalarFunction("pyFunc2"))
++
++    val resultTable = table
++      .where("pyFunc2(a, c)")
++      .select("pyFunc1(a, b)")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "pyFunc1(a, b) AS f0", "pyFunc2(a, c) AS f1")
++      ),
++      term("select", "f0 AS _c0"),
++      term("where", "f1")
++    )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testChainingPythonFunction(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++    util.tableEnv.registerFunction("pyFunc2", new PythonScalarFunction("pyFunc2"))
++    util.tableEnv.registerFunction("pyFunc3", new PythonScalarFunction("pyFunc3"))
++
++    val resultTable = table
++      .select("pyFunc3(pyFunc2(a + pyFunc1(a, c), b), c)")
++
++    val expected = unaryNode(
++      "DataStreamPythonCalc",
++      unaryNode(
++        "DataStreamCalc",
++        unaryNode(
++          "DataStreamPythonCalc",
++          streamTableNode(table),
++          term("select", "b", "c", "a", "pyFunc1(a, c) AS f0")
++        ),
++        term("select", "b", "c", "+(a, f0) AS f0")
++      ),
++      term("select", "pyFunc3(pyFunc2(f0, b), c) AS _c0")
++    )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testOnlyOnePythonFunction(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++
++    val resultTable = table
++      .select("pyFunc1(a, b)")
++
++    val expected = unaryNode(
++      "DataStreamPythonCalc",
++      streamTableNode(table),
++      term("select", "pyFunc1(a, b) AS _c0")
++      )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testOnlyOnePythonFunctionInWhereClause(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new BooleanPythonScalarFunction("pyFunc1"))
++
++    val resultTable = table
++      .where("pyFunc1(a, c)")
++      .select("a, b")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "a", "b", "pyFunc1(a, c) AS f0")
++      ),
++      term("select", "a", "b"),
++      term("where", "f0")
++    )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testFieldNameUniquify(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'f0, 'f1, 'f2)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++
++    val resultTable = table
++      .select("pyFunc1(f1, f2), f0 + 1")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "f0", "pyFunc1(f1, f2) AS f00")
++        ),
++      term("select", "f00 AS _c0", "+(f0, 1) AS _c1")
++      )
++
++    util.verifyTable(resultTable, expected)
++  }
++}
++
++class PythonScalarFunction(name: String) extends ScalarFunction {
++  def eval(i: Int, j: Int): Int = i + j
++
++  override def getResultType(signature: Array[Class[_]]): TypeInformation[_] =
++    BasicTypeInfo.INT_TYPE_INFO
++
++  override def getLanguage: FunctionLanguage = FunctionLanguage.PYTHON
++
++  override def toString: String = name
++}
++
++class BooleanPythonScalarFunction(name: String) extends ScalarFunction {
++  def eval(i: Int, j: Int): Boolean = i + j > 1
++
++  override def getResultType(signature: Array[Class[_]]): TypeInformation[_] =
++    BasicTypeInfo.BOOLEAN_TYPE_INFO
++
++  override def getLanguage: FunctionLanguage = FunctionLanguage.PYTHON
++
++  override def toString: String = name
++}

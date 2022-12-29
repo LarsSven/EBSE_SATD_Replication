@@ -1,0 +1,1619 @@
+diff --git a/src/ports/postgres/modules/deep_learning/madlib_keras.py_in b/src/ports/postgres/modules/deep_learning/madlib_keras.py_in
+index 47ce306a8..8220dd855 100644
+--- a/src/ports/postgres/modules/deep_learning/madlib_keras.py_in
++++ b/src/ports/postgres/modules/deep_learning/madlib_keras.py_in
+@@ -51,6 +51,11 @@ from utilities.validate_args import get_col_value_and_type
+ from utilities.validate_args import get_expr_type
+ from utilities.validate_args import quote_ident
+ from utilities.control import MinWarning
++import tensorflow as tf
++
++class SD_NAMES:
++    SESS = 'sess'
++    SEGMENT_MODEL = 'segment_model'
+ 
+ @MinWarning("warning")
+ def fit(schema_madlib, source_table, model, model_arch_table,
+@@ -80,7 +85,7 @@ def fit(schema_madlib, source_table, model, model_arch_table,
+     segments_per_host, gpus_per_host = get_segments_and_gpus(gpus_per_host)
+     warm_start = bool(warm_start)
+ 
+-    #TODO add a unit test for this in a future PR
++    # TODO add a unit test for this in a future PR
+     # save the original value of the env variable so that we can reset it later.
+     original_cuda_env = None
+     if CUDA_VISIBLE_DEVICES_KEY in os.environ:
+@@ -93,7 +98,7 @@ def fit(schema_madlib, source_table, model, model_arch_table,
+         model_arch_table, ModelArchSchema.MODEL_ID,
+         model_arch_id)
+     model_arch_result = plpy.execute(model_arch_query)
+-    if not  model_arch_result:
++    if not model_arch_result:
+         plpy.error("no model arch found in table {0} with id {1}".format(
+             model_arch_table, model_arch_id))
+     model_arch_result = model_arch_result[0]
+@@ -131,10 +136,11 @@ def fit(schema_madlib, source_table, model, model_arch_table,
+             ARRAY{images_per_seg_train},
+             {gpus_per_host},
+             {segments_per_host},
+-            $1
++            $1,
++            $2
+         ) AS iteration_result
+         FROM {source_table}
+-        """.format(**locals()), ["bytea"])
++        """.format(**locals()), ["bytea", "boolean"])
+ 
+     # Define the state for the model and loss/metric storage lists
+     training_loss, training_metrics, metrics_elapsed_time = [], [], []
+@@ -146,8 +152,9 @@ def fit(schema_madlib, source_table, model, model_arch_table,
+     # Run distributed training for specified number of iterations
+     for i in range(1, num_iterations+1):
+         start_iteration = time.time()
++        is_final_iteration = (i == num_iterations)
+         iteration_result = plpy.execute(run_training_iteration,
+-                                        [serialized_weights])[0]['iteration_result']
++                                        [serialized_weights, is_final_iteration])[0]['iteration_result']
+         end_iteration = time.time()
+         info_str = "\tTime for training in iteration {0}: {1} sec".format(i,
+             end_iteration - start_iteration)
+@@ -160,7 +167,7 @@ def fit(schema_madlib, source_table, model, model_arch_table,
+             compute_out = compute_loss_and_metrics(
+                 schema_madlib, source_table, compile_params_to_pass, model_arch,
+                 serialized_weights, gpus_per_host, segments_per_host, seg_ids_train,
+-                images_per_seg_train, training_metrics, training_loss, i)
++                images_per_seg_train, training_metrics, training_loss, i, is_final_iteration)
+             metrics_iters.append(i)
+             compute_time, compute_metrics, compute_loss = compute_out
+ 
+@@ -177,7 +184,7 @@ def fit(schema_madlib, source_table, model, model_arch_table,
+                     schema_madlib, validation_table, compile_params_to_pass,
+                     model_arch, serialized_weights, gpus_per_host, segments_per_host,
+                     seg_ids_val, images_per_seg_val, validation_metrics,
+-                    validation_loss, i)
++                    validation_loss, i, is_final_iteration)
+                 val_compute_time, val_compute_metrics, val_compute_loss = val_compute_out
+ 
+                 info_str += "\n\tTime for evaluating validation dataset in "\
+@@ -286,9 +293,10 @@ def fit(schema_madlib, source_table, model, model_arch_table,
+         $2 as {1}""".format(model, ModelArchSchema.MODEL_ARCH), ["bytea", "json"])
+     plpy.execute(create_output_table, [serialized_weights, model_arch])
+ 
+-    #TODO add a unit test for this in a future PR
++    # TODO add a unit test for this in a future PR
+     reset_cuda_env(original_cuda_env)
+ 
++
+ def get_initial_weights(model_table, model_arch_result, warm_start, gpus_per_host):
+     """
+         If warm_start is True, return back initial weights from model table.
+@@ -360,7 +368,7 @@ def get_metrics_sql_string(metrics_list, is_metrics_specified):
+ def compute_loss_and_metrics(schema_madlib, table, compile_params, model_arch,
+                              serialized_weights, gpus_per_host, segments_per_host,
+                              seg_ids, images_per_seg_val, metrics_list, loss_list,
+-                             curr_iter):
++                             curr_iter, is_final_iteration):
+     """
+     Compute the loss and metric using a given model (serialized_weights) on the
+     given dataset (table.)
+@@ -374,7 +382,8 @@ def compute_loss_and_metrics(schema_madlib, table, compile_params, model_arch,
+                                                    gpus_per_host,
+                                                    segments_per_host,
+                                                    seg_ids,
+-                                                   images_per_seg_val)
++                                                   images_per_seg_val,
++                                                   is_final_iteration)
+     end_val = time.time()
+ 
+     if len(evaluate_result) not in [1, 2]:
+@@ -403,10 +412,13 @@ def should_compute_metrics_this_iter(curr_iter, metrics_compute_frequency,
+     return (curr_iter)%metrics_compute_frequency == 0 or \
+            curr_iter == num_iterations
+ 
++
+ def fit_transition(state, dependent_var, independent_var, model_architecture,
+                    compile_params, fit_params, current_seg_id, seg_ids,
+                    images_per_seg, gpus_per_host, segments_per_host,
+-                   prev_serialized_weights, **kwargs):
++                   prev_serialized_weights, is_final_iteration=True,
++                   is_multiple_model=False, **kwargs):
++
+     if not independent_var or not dependent_var:
+         return state
+ 
+@@ -414,18 +426,50 @@ def fit_transition(state, dependent_var, independent_var, model_architecture,
+     SD = kwargs['SD']
+     device_name = get_device_name_and_set_cuda_env(gpus_per_host,
+                                                    current_seg_id)
+-    # Set up system if this is the first buffer on segment'
+-    if not state:
+-        set_keras_session(device_name, gpus_per_host, segments_per_host)
+-        segment_model = model_from_json(model_architecture)
+-        compile_and_set_weights(segment_model, compile_params, device_name,
+-                                prev_serialized_weights)
+ 
+-        SD['segment_model'] = segment_model
+-        agg_image_count = 0
++    # Cerebro state has the weights passed from the previous segment
++    if is_multiple_model:
++        prev_serialized_weights = madlib_keras_serializer.\
++            get_serialized_1d_weights_from_state(prev_serialized_weights)
++
++    # If a live session is present, re-use it. Otherwise, recreate it.
++    if SD_NAMES.SESS in SD:
++        sess = SD[SD_NAMES.SESS]
+     else:
+-        segment_model = SD['segment_model']
+-        agg_image_count = madlib_keras_serializer.get_image_count_from_state(state)
++        sess = get_keras_session(device_name, gpus_per_host, segments_per_host)
++        SD[SD_NAMES.SESS] = sess
++        K.set_session(sess)
++
++    # Set up system if this is the first buffer on segment.
++
++    # On model hopper training, clean the session on the first row.
++    agg_image_count = madlib_keras_serializer.get_image_count_from_state(state)
++    if is_multiple_model:
++        if not state:
++            K.clear_session()
++            segment_model = model_from_json(model_architecture)
++            compile_and_set_weights(segment_model, compile_params, device_name,
++                    prev_serialized_weights)
++            SD[SD_NAMES.SEGMENT_MODEL] = segment_model
++
++        else:
++            segment_model = SD[SD_NAMES.SEGMENT_MODEL]
++
++
++    # On single model fit, reuse the model if it exists
++    else:
++        if SD_NAMES.SEGMENT_MODEL in SD:
++            segment_model = SD[SD_NAMES.SEGMENT_MODEL]
++            if not state:
++                model_shapes = get_model_shapes(segment_model)
++                model_weights = madlib_keras_serializer.deserialize_as_nd_weights(
++                    prev_serialized_weights, model_shapes)
++                segment_model.set_weights(model_weights)
++        else:
++            segment_model = model_from_json(model_architecture)
++            compile_and_set_weights(segment_model, compile_params, device_name,
++                            prev_serialized_weights)
++            SD[SD_NAMES.SEGMENT_MODEL] = segment_model
+ 
+     # Prepare the data
+     x_train = np_array_float32(independent_var)
+@@ -433,19 +477,15 @@ def fit_transition(state, dependent_var, independent_var, model_architecture,
+ 
+     # Fit segment model on data
+     start_fit = time.time()
+-    with K.tf.device(device_name):
+-        #TODO consider not doing this every time
+-        fit_params = parse_and_validate_fit_params(fit_params)
+-        history = segment_model.fit(x_train, y_train, **fit_params)
++    #TODO consider not doing this every time
++    fit_params = parse_and_validate_fit_params(fit_params)
++    history = segment_model.fit(x_train, y_train, **fit_params)
+     end_fit = time.time()
+-
+     image_count = len(x_train)
++
+     # Aggregating number of images, loss and accuracy
+     agg_image_count += image_count
+-
+-    with K.tf.device(device_name):
+-        updated_weights = segment_model.get_weights()
+-
++    updated_weights = segment_model.get_weights()
+     total_images = get_image_count_per_seg_from_array(current_seg_id, seg_ids,
+                                                       images_per_seg)
+ 
+@@ -455,17 +495,22 @@ def fit_transition(state, dependent_var, independent_var, model_architecture,
+         # Once done with all images on a segment, we update weights
+         # with the total number of images here instead of the merge function.
+         # The merge function only deals with aggregating them.
+-        updated_weights = [ total_images * w for w in updated_weights ]
+-            # In GPDB, each segment would have a keras session, so clear
+-            # them after the last buffer is processed.
+-        clear_keras_session()
++        if not is_multiple_model:
++            updated_weights = [ total_images * w for w in updated_weights ]
++
++        # In GPDB, each segment would have a keras session, so clear
++        # them at the end of final iteration and also every final buffer for cerebro
++        if is_final_iteration or is_multiple_model:
++            K.clear_session()
++            sess.close()
++            del SD[SD_NAMES.SEGMENT_MODEL]
++            del SD[SD_NAMES.SESS]
+ 
+     new_state = madlib_keras_serializer.serialize_state_with_nd_weights(
+         agg_image_count, updated_weights)
+ 
+     del x_train
+     del y_train
+-
+     end_transition = time.time()
+ 
+     return new_state
+@@ -539,11 +584,11 @@ def evaluate(schema_madlib, model_table, test_table, output_table, gpus_per_host
+     compile_params = "$madlib$" + res['compile_params'] + "$madlib$"
+ 
+     seg_ids, images_per_seg = get_image_count_per_seg_for_minibatched_data_from_db(test_table)
+-
++    is_final_iteration = True
+     loss, metric =\
+         get_loss_metric_from_keras_eval(schema_madlib, test_table, compile_params, model_arch,
+                                         model_data, gpus_per_host, segments_per_host,
+-                                        seg_ids, images_per_seg)
++                                        seg_ids, images_per_seg, is_final_iteration)
+ 
+     if not metrics_type:
+         metrics_type = None
+@@ -557,7 +602,8 @@ def evaluate(schema_madlib, model_table, test_table, output_table, gpus_per_host
+ 
+ def get_loss_metric_from_keras_eval(schema_madlib, table, compile_params,
+                                     model_arch, serialized_weights, gpus_per_host,
+-                                    segments_per_host, seg_ids, images_per_seg):
++                                    segments_per_host, seg_ids, images_per_seg,
++                                    is_final_iteration=True):
+ 
+     gp_segment_id_col = '0' if is_platform_pg() else 'gp_segment_id'
+ 
+@@ -578,7 +624,8 @@ def get_loss_metric_from_keras_eval(schema_madlib, table, compile_params,
+                                             ARRAY{seg_ids},
+                                             ARRAY{images_per_seg},
+                                             {gpus_per_host},
+-                                            {segments_per_host}
++                                            {segments_per_host},
++                                            {is_final_iteration}
+                                             )) as loss_metric
+         from {table}
+     """.format(**locals()), ["bytea"])
+@@ -589,31 +636,49 @@ def get_loss_metric_from_keras_eval(schema_madlib, table, compile_params,
+ def internal_keras_eval_transition(state, dependent_var, independent_var,
+                                    model_architecture, serialized_weights, compile_params,
+                                    current_seg_id, seg_ids, images_per_seg,
+-                                   gpus_per_host, segments_per_host, **kwargs):
++                                   gpus_per_host, segments_per_host,
++                                   is_final_iteration, **kwargs):
+     SD = kwargs['SD']
+     device_name = get_device_name_and_set_cuda_env(gpus_per_host, current_seg_id)
+ 
+     agg_loss, agg_metric, agg_image_count = state
+ 
+-    if not agg_image_count:
+-        set_keras_session(device_name, gpus_per_host, segments_per_host)
+-        model = model_from_json(model_architecture)
+-        compile_and_set_weights(model, compile_params, device_name,
+-                                serialized_weights)
++    # User called evaluate will always set is_final_iteration to true.
++    # If is_final_iteration is false, that means the fit already created a session and a graph
++    # Otherwise, we may (last iteration of fit) or may not (user evaluate call)
++    # have a session.
++    if is_final_iteration and SD_NAMES.SESS not in SD:
++        sess = get_keras_session(device_name, gpus_per_host, segments_per_host)
++        SD[SD_NAMES.SESS] = sess
++        K.set_session(sess)
++        # Popping the segment model kept in the SD of internal_keras_eval_transition,
++        # which is leftover from the previous iteration. But the session is already
++        # cleared by fit_transition at this time, so the model cannot be re-used.
++        SD.pop(SD_NAMES.SEGMENT_MODEL, None)
++
++    if SD_NAMES.SEGMENT_MODEL in SD:
++        segment_model = SD[SD_NAMES.SEGMENT_MODEL]
++        if not agg_image_count:
++            model_shapes = get_model_shapes(segment_model)
++            model_weights = madlib_keras_serializer.deserialize_as_nd_weights(
++                serialized_weights, model_shapes)
++            segment_model.set_weights(model_weights)
++    else:
++        segment_model = model_from_json(model_architecture)
++        compile_and_set_weights(segment_model, compile_params, device_name,
++                        serialized_weights)
++        SD[SD_NAMES.SEGMENT_MODEL] = segment_model
+ 
+-        SD['segment_model'] = model
++    if not agg_image_count:
+         # These should already be 0, but just in case make sure
+         agg_metric = 0
+         agg_loss = 0
+-    else:
+-        # Same model every time, no need to re-compile or update weights
+-        model = SD['segment_model']
+ 
+     x_val = np_array_float32(independent_var)
+     y_val = np_array_int16(dependent_var)
+ 
+     with K.tf.device(device_name):
+-        res = model.evaluate(x_val, y_val)
++        res = segment_model.evaluate(x_val, y_val)
+ 
+     # if metric is None, model.evaluate will only return loss as a scalar
+     # Otherwise, it will return a list which has loss and metric
+@@ -632,9 +697,12 @@ def internal_keras_eval_transition(state, dependent_var, independent_var,
+     total_images = get_image_count_per_seg_from_array(current_seg_id, seg_ids,
+                                                       images_per_seg)
+ 
+-    if agg_image_count == total_images:
+-        SD.pop('segment_model', None)
+-        clear_keras_session()
++    # Clean the session on the last buffer of last iteration
++    if agg_image_count == total_images and is_final_iteration:
++        K.clear_session()
++        SD[SD_NAMES.SESS].close()
++        del SD[SD_NAMES.SEGMENT_MODEL]
++        del SD[SD_NAMES.SESS]
+ 
+     state[0] = agg_loss
+     state[1] = agg_metric
+@@ -670,7 +738,6 @@ def internal_keras_eval_final(state, **kwargs):
+     return loss, metric
+ 
+ 
+-
+ def fit_help(schema_madlib, message, **kwargs):
+     """
+     Help function for keras fit
+diff --git a/src/ports/postgres/modules/deep_learning/madlib_keras.sql_in b/src/ports/postgres/modules/deep_learning/madlib_keras.sql_in
+index c5d8d3587..3fc8c72c3 100644
+--- a/src/ports/postgres/modules/deep_learning/madlib_keras.sql_in
++++ b/src/ports/postgres/modules/deep_learning/madlib_keras.sql_in
+@@ -1493,6 +1493,20 @@ CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.madlib_keras_fit(
+ $$ LANGUAGE sql VOLATILE
+ m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA');
+ 
++CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.madlib_keras_fit_multiple_model(
++    source_table            VARCHAR,
++    model_output_table      VARCHAR,
++    model_arch_table        VARCHAR,
++    model_selection_table   VARCHAR,
++    num_iterations          INTEGER,
++    gpus_per_host           INTEGER
++) RETURNS VOID AS $$
++    PythonFunctionBodyOnly(`deep_learning', `madlib_keras_fit_multiple_model')
++    with AOControl(False):
++        fit_obj = madlib_keras_fit_multiple_model.FitMultipleModel(**globals())
++$$ LANGUAGE plpythonu VOLATILE
++m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA', `');
++
+ CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.fit_transition(
+     state                      BYTEA,
+     dependent_var              SMALLINT[],
+@@ -1505,13 +1519,35 @@ CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.fit_transition(
+     images_per_seg             INTEGER[],
+     gpus_per_host              INTEGER,
+     segments_per_host          INTEGER,
+-    prev_serialized_weights    BYTEA
++    prev_serialized_weights    BYTEA,
++    is_final_iteration         BOOLEAN
+ ) RETURNS BYTEA AS $$
+ PythonFunctionBodyOnlyNoSchema(`deep_learning', `madlib_keras')
+     return madlib_keras.fit_transition(**globals())
+ $$ LANGUAGE plpythonu
+ m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `NO SQL', `');
+ 
++CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.fit_transition_multiple_model(
++    state                      BYTEA,
++    dependent_var              SMALLINT[],
++    independent_var            REAL[],
++    model_architecture         TEXT,
++    compile_params             TEXT,
++    fit_params                 TEXT,
++    current_seg_id             INTEGER,
++    seg_ids                    INTEGER[],
++    images_per_seg             INTEGER[],
++    gpus_per_host              INTEGER,
++    segments_per_host          INTEGER,
++    prev_serialized_weights    BYTEA,
++    is_final_iteration         BOOLEAN
++) RETURNS BYTEA AS $$
++PythonFunctionBodyOnlyNoSchema(`deep_learning', `madlib_keras')
++    return madlib_keras.fit_transition(is_multiple_model = True, **globals())
++$$ LANGUAGE plpythonu
++m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `NO SQL', `');
++
++
+ CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.fit_merge(
+     state1          BYTEA,
+     state2          BYTEA
+@@ -1540,7 +1576,8 @@ DROP AGGREGATE IF EXISTS MADLIB_SCHEMA.fit_step(
+     INTEGER[],
+     INTEGER,
+     INTEGER,
+-    BYTEA);
++    BYTEA,
++    BOOLEAN);
+ CREATE AGGREGATE MADLIB_SCHEMA.fit_step(
+     /* dep_var */                SMALLINT[],
+     /* ind_var */                REAL[],
+@@ -1552,7 +1589,8 @@ CREATE AGGREGATE MADLIB_SCHEMA.fit_step(
+     /* images_per_seg*/          INTEGER[],
+     /* gpus_per_host  */         INTEGER,
+     /* segments_per_host  */     INTEGER,
+-    /* serialized_weights */     BYTEA
++    /* serialized_weights */     BYTEA,
++    /* is_final_iteration */     BOOLEAN
+ )(
+     STYPE=BYTEA,
+     SFUNC=MADLIB_SCHEMA.fit_transition,
+@@ -1560,6 +1598,24 @@ CREATE AGGREGATE MADLIB_SCHEMA.fit_step(
+     FINALFUNC=MADLIB_SCHEMA.fit_final
+ );
+ 
++CREATE AGGREGATE MADLIB_SCHEMA.fit_step_multiple_model(
++    /* dep_var */                SMALLINT[],
++    /* ind_var */                REAL[],
++    /* model_architecture */     TEXT,
++    /* compile_params */         TEXT,
++    /* fit_params */             TEXT,
++    /* current_seg_id */         INTEGER,
++    /* seg_ids*/                 INTEGER[],
++    /* images_per_seg*/          INTEGER[],
++    /* gpus_per_host  */         INTEGER,
++    /* segments_per_host  */     INTEGER,
++    /* serialized_weights */     BYTEA,
++    /* is_final_iteration */     BOOLEAN
++)(
++    STYPE=BYTEA,
++    SFUNC=MADLIB_SCHEMA.fit_transition_multiple_model
++);
++
+ CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.madlib_keras_predict(
+     model_table             VARCHAR,
+     test_table              VARCHAR,
+@@ -1652,7 +1708,8 @@ CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.internal_keras_eval_transition(
+     seg_ids                            INTEGER[],
+     images_per_seg                     INTEGER[],
+     gpus_per_host                      INTEGER,
+-    segments_per_host                  INTEGER
++    segments_per_host                  INTEGER,
++    is_final_iteration                 BOOLEAN
+ ) RETURNS REAL[3] AS $$
+ PythonFunctionBodyOnlyNoSchema(`deep_learning', `madlib_keras')
+     return madlib_keras.internal_keras_eval_transition(**globals())
+@@ -1686,7 +1743,8 @@ DROP AGGREGATE IF EXISTS MADLIB_SCHEMA.internal_keras_evaluate(
+                                        INTEGER[],
+                                        INTEGER[],
+                                        INTEGER,
+-                                       INTEGER);
++                                       INTEGER,
++                                       BOOLEAN);
+ 
+ CREATE AGGREGATE MADLIB_SCHEMA.internal_keras_evaluate(
+     /* dependent_var */                SMALLINT[],
+@@ -1698,7 +1756,8 @@ CREATE AGGREGATE MADLIB_SCHEMA.internal_keras_evaluate(
+     /* seg_ids */                      INTEGER[],
+     /* images_per_seg*/                INTEGER[],
+     /* gpus_per_host */                INTEGER,
+-    /* segments_per_host */            INTEGER
++    /* segments_per_host */            INTEGER,
++    /* is_final_iteration */           BOOLEAN
+ )(
+     STYPE=REAL[3],
+     INITCOND='{0,0,0}',
+diff --git a/src/ports/postgres/modules/deep_learning/madlib_keras_fit_multiple_model.py_in b/src/ports/postgres/modules/deep_learning/madlib_keras_fit_multiple_model.py_in
+new file mode 100644
+index 000000000..5a5b7cfba
+--- /dev/null
++++ b/src/ports/postgres/modules/deep_learning/madlib_keras_fit_multiple_model.py_in
+@@ -0,0 +1,414 @@
++# coding=utf-8
++#
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++import plpy
++import time
++import sys
++# Do not remove `import keras` although it's not directly used in this file.
++# For ex if the user passes in the optimizer as keras.optimizers.SGD instead of just
++# SGD, then without this import this python file won't find the SGD module
++import keras
++
++# from keras import backend as K
++# from keras import utils as keras_utils
++from keras.layers import *
++from keras.models import *
++from keras.optimizers import *
++from keras.regularizers import *
++import madlib_keras_serializer
++from madlib_keras import compute_loss_and_metrics
++from madlib_keras import get_initial_weights
++from madlib_keras import get_segments_and_gpus
++from madlib_keras import get_source_summary_table_dict
++from madlib_keras import reset_cuda_env
++from madlib_keras_helper import *
++from madlib_keras_validator import *
++from madlib_keras_wrapper import *
++from keras_model_arch_table import ModelArchSchema
++
++from utilities.control import MinWarning
++from utilities.control import OptimizerControl
++from utilities.utilities import unique_string
++from utilities.utilities import add_postfix
++from utilities.utilities import rotate
++from utilities.utilities import madlib_version
++from utilities.utilities import is_platform_pg
++import json
++from collections import defaultdict
++import random
++import datetime
++mb_dep_var_col = MINIBATCH_OUTPUT_DEPENDENT_COLNAME_DL
++mb_indep_var_col = MINIBATCH_OUTPUT_INDEPENDENT_COLNAME_DL
++
++
++class ModelSelectionSchema:
++    MST_KEY = 'mst_key'
++    MODEL_ARCH_ID = 'model_arch_id'
++    COMPILE_PARAMS = 'compile_params'
++    FIT_PARAMS = 'fit_params'
++    col_types = ('SERIAL', 'INTEGER', 'VARCHAR', 'VARCHAR')
++
++@MinWarning("warning")
++class FitMultipleModel():
++    def __init__(self, schema_madlib, source_table, model_output_table,
++                 model_arch_table, model_selection_table, num_iterations,
++                 gpus_per_host=0, **kwargs):
++
++        if is_platform_pg():
++            plpy.error("DL: Multiple model training is not supported on Postgresql.")
++        self.source_table = source_table
++        self.model_arch_table = model_arch_table
++        self.model_selection_table = model_selection_table
++        self.model_output_table = model_output_table
++        if self.model_output_table:
++            self.model_info_table = add_postfix(model_output_table, '_info')
++            self.model_summary_table = add_postfix(
++                model_output_table, '_summary')
++        self.num_iterations = num_iterations
++        self.module_name = 'madlib_keras_fit_multiple_model'
++        self.schema_madlib = schema_madlib
++        self.version = madlib_version(self.schema_madlib)
++        self.fit_validator = FitInputValidator(
++            self.source_table, None, self.model_output_table,
++            self.model_arch_table, mb_dep_var_col, mb_indep_var_col,
++            self.num_iterations, 1, False)
++        input_tbl_valid(self.model_selection_table, self.module_name)
++        output_tbl_valid(self.model_info_table, self.module_name)
++        self.msts = self.query_msts()
++        self.mst_key_col = ModelSelectionSchema.MST_KEY
++        self.model_arch_id_col = ModelSelectionSchema.MODEL_ARCH_ID
++        self.compile_params_col = ModelSelectionSchema.COMPILE_PARAMS
++        self.fit_params_col = ModelSelectionSchema.FIT_PARAMS
++        self.dist_keys = self.query_dist_keys()
++        self.grand_schedule = self.generate_schedule()
++
++        self.seg_ids_train, self.images_per_seg_train = \
++            get_image_count_per_seg_for_minibatched_data_from_db(
++                self.source_table)
++        self.segments_per_host, self.gpus_per_host = get_segments_and_gpus(
++            gpus_per_host)
++        self.create_model_output_table()
++        self.train_mst_metric_eval_time = defaultdict(list)
++        self.train_mst_loss = defaultdict(list)
++        self.train_mst_metric = defaultdict(list)
++        self.mst_weights = 'mst_weights'+unique_string()
++        self.fit_multiple_model()
++
++    def fit_multiple_model(self):
++        begin_time = time.time()
++        # WARNING: set orca off to prevent unwanted redistribution
++        with OptimizerControl(False):
++            original_cuda_env = None
++            if CUDA_VISIBLE_DEVICES_KEY in os.environ:
++                original_cuda_env = os.environ[CUDA_VISIBLE_DEVICES_KEY]
++            self.start_training_time = datetime.datetime.now()
++            self.train_multiple_model()
++            self.end_training_time = datetime.datetime.now()
++            self.insert_info_table()
++            self.create_model_summary_table()
++        plpy.info(
++            "End to end execution time: {}".format(time.time() - begin_time))
++        reset_cuda_env(original_cuda_env)
++
++    def train_multiple_model(self):
++        self.weights_map = {}
++        for e in range(self.num_iterations):
++            plpy.info("Iteration: {}".format(e))
++            for i in range(len(self.msts)):
++                mst_row = [self.grand_schedule[dist_key][i]
++                           for dist_key in self.dist_keys]
++                self.create_mst_schedule_table(mst_row)
++                self.run_training()
++            self.evaluate_train_output(e)
++
++    def evaluate_train_output(self, epoch):
++        res = self.query_weights()
++        res_map = {x['mst_key']: x['weights'] for x in res if x['weights']}
++        weights_map_one_epoch = {}
++        for mst in self.msts:
++            model_arch = self.query_arch(mst[self.model_arch_id_col]
++                                         )[ModelArchSchema.MODEL_ARCH]
++            state = res_map[mst[self.mst_key_col]]
++            serialized_weights = \
++                madlib_keras_serializer.get_serialized_1d_weights_from_state(
++                    state)
++            loss_metric = compute_loss_and_metrics(
++                self.schema_madlib, self.source_table, "$madlib${}$madlib$".format(
++                    mst[self.compile_params_col]), model_arch,
++                serialized_weights, 0, 3, self.seg_ids_train,
++                self.images_per_seg_train, [], [], epoch, True)
++            metric_eval_time, metric, loss = loss_metric
++            weights_map_one_epoch[mst[self.mst_key_col]] = loss_metric
++            self.train_mst_metric_eval_time[mst[self.mst_key_col]] \
++                .append(metric_eval_time)
++            self.train_mst_loss[mst[self.mst_key_col]].append(loss)
++            self.train_mst_metric[mst[self.mst_key_col]].append(metric)
++        self.weights_map[epoch] = weights_map_one_epoch
++
++    def generate_schedule(self):
++        grand_schedule = {}
++        for index, dist_key in enumerate(self.dist_keys):
++            grand_schedule[dist_key] = rotate(self.msts, index)
++        return grand_schedule
++
++    def query_arch(self, model_arch_id):
++        model_arch_query = """
++                            SELECT {0}, {1} FROM {2} WHERE {3} = {4}
++                           """.format(ModelArchSchema.MODEL_ARCH,
++                                      ModelArchSchema.MODEL_WEIGHTS,
++                                      self.model_arch_table,
++                                      ModelArchSchema.MODEL_ID,
++                                      model_arch_id)
++        model_arch_result = plpy.execute(model_arch_query)[0]
++        return model_arch_result
++
++    def query_msts(self):
++        msts_query = """
++                     SELECT * FROM {}
++                     ORDER BY mst_key
++                     """.format(self.model_selection_table)
++        res = list(plpy.execute(msts_query))
++        return res
++
++    def query_dist_keys(self):
++        dist_key_query = """
++                         SELECT DISTINCT(dist_key) FROM {}
++                         ORDER BY dist_key
++                         """.format(self.source_table)
++        res = list(plpy.execute(dist_key_query))
++        res = [x['dist_key'] for x in res]
++        return res
++
++    def create_mst_schedule_table(self, mst_row):
++        mst_temp_query = """DROP TABLE IF EXISTS mst_current_schedule;
++                            CREATE TABLE mst_current_schedule(model_arch_id INTEGER,
++                                                               compile_params VARCHAR,
++                                                               fit_params VARCHAR,
++                                                               dist_key INTEGER,
++                                                               mst_key INTEGER primary key)
++                         """
++        plpy.execute(mst_temp_query)
++        for mst, dist_key in zip(mst_row, self.dist_keys):
++            mst_insert_query = """
++                                INSERT INTO mst_current_schedule
++                                    VALUES ({},
++                                            $madlib${}$madlib$,
++                                            $madlib${}$madlib$,
++                                            {},
++                                            {})
++                                """.format(mst[self.model_arch_id_col], mst[self.compile_params_col],
++                                           mst[self.fit_params_col], dist_key, mst[self.mst_key_col])
++            plpy.execute(mst_insert_query)
++
++    def create_model_output_table(self):
++        output_table_create_query = """CREATE TABLE {}
++                                (mst_key INTEGER PRIMARY KEY,
++                                 weights BYTEA,
++                                 model_arch JSON
++                                )
++                               """.format(self.model_output_table)
++        info_table_create_query = """CREATE TABLE {}
++                                (mst_key INTEGER PRIMARY KEY,
++                                 model_arch_id INTEGER,
++                                 compile_params TEXT,
++                                 fit_params TEXT,
++                                 model_type TEXT,
++                                 model_size DOUBLE PRECISION,
++                                 metrics_elapsed_time DOUBLE PRECISION[],
++                                 metrics_type TEXT[],
++                                 training_metrics_final DOUBLE PRECISION,
++                                 training_loss_final DOUBLE PRECISION,
++                                 training_metrics DOUBLE PRECISION[],
++                                 training_loss DOUBLE PRECISION[],
++                                 validation_metrics_final DOUBLE PRECISION,
++                                 validation_loss_final DOUBLE PRECISION,
++                                 validation_metrics DOUBLE PRECISION[],
++                                 validation_loss DOUBLE PRECISION[])
++                               """.format(self.model_info_table)
++
++        plpy.execute(output_table_create_query)
++        plpy.execute(info_table_create_query)
++        for mst in self.msts:
++            model_arch_result = self.query_arch(mst[self.model_arch_id_col])
++            model_arch = model_arch_result[ModelArchSchema.MODEL_ARCH]
++            random.seed(42)
++            serialized_weights = get_initial_weights(self.model_output_table,
++                                                     model_arch_result,
++                                                     False,
++                                                     self.gpus_per_host
++                                                     )
++            model_size = sys.getsizeof(serialized_weights) / 1024.0
++            model = model_from_json(
++                model_arch_result[ModelArchSchema.MODEL_ARCH])
++
++            serialized_state = \
++                madlib_keras_serializer.serialize_state_with_nd_weights(
++                    0, model.get_weights())
++            metrics_list = get_metrics_from_compile_param(
++                mst[self.compile_params_col])
++            is_metrics_specified = True if metrics_list else False
++            metrics_type = 'ARRAY{0}'.format(
++                metrics_list) if is_metrics_specified else 'NULL'
++
++            output_table_insert_query = """
++                                INSERT INTO {self.model_output_table}(
++                                    mst_key, weights, model_arch)
++                                VALUES ({mst_key}, $1, $2)
++                                   """.format(self=self,
++                                              mst_key=mst[self.mst_key_col])
++            output_table_insert_query_prepared = plpy.prepare(
++                output_table_insert_query, ["bytea", "json"])
++            plpy.execute(output_table_insert_query_prepared, [
++                         serialized_state, json.dumps(model_arch)])
++            info_table_insert_query = """
++                    INSERT INTO {}(mst_key, model_arch_id, compile_params,
++                                   fit_params, model_type, model_size,
++                                   metrics_type)
++                        VALUES ({}, {}, $madlib${}$madlib$,
++                                $madlib${}$madlib$, '{}', {}, {})
++                """.format(self.model_info_table,
++                           mst[self.mst_key_col],
++                           mst[self.model_arch_id_col],
++                           mst[self.compile_params_col],
++                           mst[self.fit_params_col],
++                           'madlib_keras',
++                           model_size,
++                           metrics_type)
++            plpy.execute(info_table_insert_query)
++
++    def create_model_summary_table(self):
++        src_summary_dict = get_source_summary_table_dict(self.fit_validator)
++        class_values = src_summary_dict['class_values']
++        dep_vartype = src_summary_dict['dep_vartype']
++        dependent_varname = \
++            src_summary_dict['dependent_varname_in_source_table']
++        independent_varname = \
++            src_summary_dict['independent_varname_in_source_table']
++        norm_const = src_summary_dict['norm_const']
++        num_classes = len(class_values)
++        class_values_colname = CLASS_VALUES_COLNAME
++        dependent_vartype_colname = DEPENDENT_VARTYPE_COLNAME
++        normalizing_const_colname = NORMALIZING_CONST_COLNAME
++        float32_sql_type = FLOAT32_SQL_TYPE
++        update_query = """
++                CREATE TABLE {self.model_summary_table} AS
++                SELECT
++                    $MAD${self.source_table}$MAD$::TEXT AS source_table,
++                    NULL::TEXT AS validation_table,
++                    $MAD${self.model_output_table}$MAD$::TEXT AS model,
++                    $MAD${self.model_info_table}$MAD$::TEXT AS model_info,
++                    $MAD${dependent_varname}$MAD$::TEXT AS dependent_varname,
++                    $MAD${independent_varname}$MAD$::TEXT AS independent_varname,
++                    $MAD${self.model_arch_table}$MAD$::TEXT AS model_arch_table,
++                    {self.num_iterations}::INTEGER AS num_iterations,
++                    '{self.start_training_time}'::TIMESTAMP AS start_training_time,
++                    '{self.end_training_time}'::TIMESTAMP AS end_training_time,
++                    '{self.version}'::TEXT AS madlib_version,
++                    {num_classes}::INTEGER AS num_classes,
++                    ARRAY{class_values}::TEXT[] AS {class_values_colname},
++                    $MAD${dep_vartype}$MAD$::TEXT AS {dependent_vartype_colname},
++                    {norm_const}::{float32_sql_type} AS {normalizing_const_colname}
++            """.format(**locals())
++        plpy.execute(update_query)
++
++    def insert_info_table(self):
++        for mst in self.msts:
++            mst_key = mst[self.mst_key_col]
++            training_metrics, training_metrics_final, metrics_elapsed_time = \
++                "NULL", "NULL", "NULL"
++            training_loss_final = "NULL"
++            training_loss = "NULL"
++            if mst_key in self.train_mst_metric:
++                training_metrics = self.train_mst_metric[mst_key]
++                training_metrics_final = training_metrics[-1]
++                metrics_elapsed_time = self.train_mst_metric_eval_time[mst_key]
++                training_metrics = "ARRAY{}".format(training_metrics)
++                metrics_elapsed_time = "ARRAY{}".format(metrics_elapsed_time)
++            training_loss = self.train_mst_loss[mst_key]
++            training_loss_final = training_loss[-1]
++            training_loss = "ARRAY{}".format(training_loss)
++            update_query = """
++                           UPDATE {} SET training_metrics_final = {},
++                           training_loss_final = {},
++                           metrics_elapsed_time = {},
++                           training_metrics = {},
++                           training_loss = {}
++                           WHERE mst_key = {}
++                           """.format(self.model_info_table,
++                                      training_metrics_final,
++                                      training_loss_final,
++                                      metrics_elapsed_time,
++                                      training_metrics,
++                                      training_loss,
++                                      mst_key
++                                      )
++            plpy.execute(update_query)
++
++    def run_training(self):
++        # TODO: fix distributed by
++        mst_weights_query = """
++            DROP TABLE IF EXISTS {self.mst_weights};
++            CREATE TEMP TABLE {self.mst_weights} AS
++                SELECT mst.*, wgh.weights, model_arch.model_arch
++                FROM
++                    mst_current_schedule mst JOIN {self.model_output_table} wgh
++                    ON mst.mst_key = wgh.mst_key
++                        JOIN {self.model_arch_table} model_arch
++                        ON mst.model_arch_id = model_arch.model_id
++                DISTRIBUTED BY (dist_key)
++        """.format(**locals())
++        plpy.execute(mst_weights_query)
++        # WARNING weights_one_schedule.weights is the state returned by
++        # the step function, which is img_count and weights concatnated
++        mlp_uda_query = """
++            UPDATE {self.model_output_table} SET weights = weights_one_schedule.weights
++            FROM (SELECT {self.schema_madlib}.fit_step_multiple_model({mb_dep_var_col},
++                                                      {mb_indep_var_col},
++                                                      {self.mst_weights}.model_arch::TEXT,
++                                                      {self.mst_weights}.compile_params::TEXT,
++                                                      {self.mst_weights}.fit_params::TEXT,
++                                                      iris.gp_segment_id,
++                                                      ARRAY{self.seg_ids_train},
++                                                      ARRAY{self.images_per_seg_train},
++                                                      {self.gpus_per_host},
++                                                      {self.segments_per_host},
++                                                      {self.mst_weights}.weights::BYTEA,
++                                                      {is_final_iteration}::BOOLEAN
++                                                      )::BYTEA AS weights,
++                {self.mst_weights}.mst_key AS mst_key
++                FROM {self.source_table} iris JOIN {self.mst_weights}
++                USING (dist_key)
++                GROUP BY iris.dist_key, {self.mst_weights}.mst_key
++                ) weights_one_schedule
++            WHERE {self.model_output_table}.mst_key = weights_one_schedule.mst_key
++            """.format(mb_dep_var_col=mb_dep_var_col,
++                        mb_indep_var_col=mb_indep_var_col,
++                        is_final_iteration=True,
++                        self=self
++                       )
++        plpy.execute(mlp_uda_query)
++        plpy.execute("DROP TABLE IF EXISTS {0}".format(self.mst_weights))
++
++    def query_weights(self):
++        mlp_weights_query = """
++                            SELECT weights, mst_key FROM {}
++                            """.format(self.model_output_table)
++
++        res = plpy.execute(mlp_weights_query)
++        return res
+diff --git a/src/ports/postgres/modules/deep_learning/madlib_keras_serializer.py_in b/src/ports/postgres/modules/deep_learning/madlib_keras_serializer.py_in
+index b2ccce481..6a9002a8e 100644
+--- a/src/ports/postgres/modules/deep_learning/madlib_keras_serializer.py_in
++++ b/src/ports/postgres/modules/deep_learning/madlib_keras_serializer.py_in
+@@ -53,7 +53,10 @@ def get_image_count_from_state(state):
+     and weights
+     :return: image count as float
+     """
+-    image_count , _  = deserialize_as_image_1d_weights(state)
++    if not state:
++        image_count = 0
++    else:
++        image_count , _  = deserialize_as_image_1d_weights(state)
+     return image_count
+ 
+ def get_serialized_1d_weights_from_state(state):
+diff --git a/src/ports/postgres/modules/deep_learning/madlib_keras_wrapper.py_in b/src/ports/postgres/modules/deep_learning/madlib_keras_wrapper.py_in
+index c61bc2fbb..f1671eaee 100644
+--- a/src/ports/postgres/modules/deep_learning/madlib_keras_wrapper.py_in
++++ b/src/ports/postgres/modules/deep_learning/madlib_keras_wrapper.py_in
+@@ -82,6 +82,21 @@ def set_keras_session(device_name, gpus_per_host, segments_per_host):
+         session = K.tf.Session(config=config)
+         K.set_session(session)
+ 
++def get_keras_session(device_name, gpus_per_host, segments_per_host):
++    config = K.tf.ConfigProto()
++    if gpus_per_host > 0:
++        memory_fraction = get_gpu_memory_fraction(gpus_per_host, segments_per_host)
++        config.gpu_options.allow_growth = False
++        config.gpu_options.per_process_gpu_memory_fraction = memory_fraction
++    session = tf.Session(config=config)
++    return session
++
++def clear_keras_session():
++    sess = K.get_session()
++    K.clear_session()
++    sess.close()
++
++
+ def get_gpu_memory_fraction(gpus_per_host, segments_per_host):
+     """
+     We cap the gpu memory usage to 90% of the total available gpu memory.
+@@ -92,11 +107,6 @@ def get_gpu_memory_fraction(gpus_per_host, segments_per_host):
+     """
+     return 0.9 / ceil(1.0 * segments_per_host / gpus_per_host)
+ 
+-def clear_keras_session():
+-    sess = K.get_session()
+-    K.clear_session()
+-    sess.close()
+-
+ def get_model_shapes(model):
+     model_shapes = []
+     for a in model.get_weights():
+@@ -106,20 +116,18 @@ def get_model_shapes(model):
+ def compile_and_set_weights(segment_model, compile_params, device_name,
+                             serialized_weights):
+     model_shapes = get_model_shapes(segment_model)
+-    with K.tf.device(device_name):
+-        compile_model(segment_model, compile_params)
+-        model_weights = madlib_keras_serializer.deserialize_as_nd_weights(
+-            serialized_weights, model_shapes)
+-        segment_model.set_weights(model_weights)
++    compile_model(segment_model, compile_params)
++    model_weights = madlib_keras_serializer.deserialize_as_nd_weights(
++        serialized_weights, model_shapes)
++    segment_model.set_weights(model_weights)
+ 
+ # TODO: This can be refactored to be part of compile_and_set_weights(),
+ # by making compile_params an optional param in that function. Doing that
+ # now might create more merge conflicts with other JIRAs, so get to this later.
+ def set_model_weights(segment_model, device_name, serialized_weights, model_shapes):
+-    with K.tf.device(device_name):
+-        model_weights = madlib_keras_serializer.deserialize_as_nd_weights(
+-            serialized_weights, model_shapes)
+-        segment_model.set_weights(model_weights)
++    model_weights = madlib_keras_serializer.deserialize_as_nd_weights(
++        serialized_weights, model_shapes)
++    segment_model.set_weights(model_weights)
+ 
+ """
+ Used to convert compile_params and fit_params to actual argument dictionaries
+diff --git a/src/ports/postgres/modules/deep_learning/test/madlib_keras.sql_in b/src/ports/postgres/modules/deep_learning/test/madlib_keras.sql_in
+index dacf23685..1051b76da 100644
+--- a/src/ports/postgres/modules/deep_learning/test/madlib_keras.sql_in
++++ b/src/ports/postgres/modules/deep_learning/test/madlib_keras.sql_in
+@@ -18,6 +18,7 @@
+  * under the License.
+  *
+  *//* ---------------------------------------------------------------------*/
++m4_include(`SQLCommon.m4')
+ drop table if exists cifar_10_sample;
+ create table cifar_10_sample(id INTEGER, y SMALLINT, y_text TEXT, imgpath TEXT, x  REAL[]);
+ copy cifar_10_sample from stdin delimiter '|';
+@@ -1179,3 +1180,104 @@ SELECT assert(
+   abs(first.training_metrics_final-second.training_metrics[2]) < 1e-10,
+   'Transfer learning test failed because training loss and metrics don''t match the expected value.')
+ FROM iris_model_first_run AS first, iris_model_transfer_summary AS second;
++
++-- Multiple models test
++DROP TABLE if exists iris_data_packed_dist, iris_data_packed_dist_summary;
++CREATE TABLE iris_data_packed_dist AS
++	SELECT *, (row_number() over())%3 AS dist_key FROM iris_data_packed;
++CREATE TABLE iris_data_packed_dist_summary AS SELECT * FROM iris_data_packed_summary;
++
++DROP TABLE IF EXISTS mst_table;
++CREATE TABLE mst_table (mst_key INTEGER,
++		                model_arch_id INTEGER,
++		                compile_params VARCHAR,
++		                fit_params VARCHAR,
++                 		unique (model_arch_id, compile_params, fit_params));
++INSERT INTO mst_table(mst_key,
++	model_arch_id,
++	compile_params,
++	fit_params)
++	VALUES (1, 1,
++	       'loss=''categorical_crossentropy'', optimizer=''Adam(lr=0.01)'', metrics=[''accuracy'']',
++	       'batch_size=16, epochs=1'),
++	       (2, 1,
++	       'loss=''categorical_crossentropy'', optimizer=''Adam(lr=0.001)'', metrics=[''accuracy'']',
++	       'batch_size=16, epochs=1'),
++	       (3, 1,
++	       'loss=''categorical_crossentropy'', optimizer=''Adam(lr=0.0001)'', metrics=[''accuracy'']',
++	       'batch_size=16, epochs=1');
++
++CREATE FUNCTION test_mult_models()
++RETURNS VOID AS $$
++begin
++DROP TABLE if exists iris_multiple_model, iris_multiple_model_summary, iris_multiple_model_info;
++
++PERFORM madlib_keras_fit_multiple_model(
++	'iris_data_packed_dist',
++	'iris_multiple_model',
++	'iris_model_arch',
++	'mst_table',
++	5,
++	0
++);
++
++PERFORM assert(
++        model_arch_table = 'iris_model_arch' AND
++        model_info = 'iris_multiple_model_info' AND
++        source_table = 'iris_data_packed_dist' AND
++        model = 'iris_multiple_model' AND
++        dependent_varname = 'class_text' AND
++        independent_varname = 'attributes' AND
++        madlib_version is NOT NULL AND
++        num_iterations = 5 AND
++        num_classes = 3 AND
++        class_values = '{Iris-setosa,Iris-versicolor,Iris-virginica}' AND
++        normalizing_const = 1,
++        'Keras Fit Multiple Output Summary Validation failed. Actual:' || __to_char(summary))
++FROM (SELECT * FROM iris_multiple_model_summary) summary;
++
++PERFORM assert(COUNT(*)=3, 'Info table must have exactly same rows as the number of msts.')
++FROM iris_multiple_model_info;
++
++PERFORM assert(
++        model_arch_id = 1 AND
++        model_type = 'madlib_keras' AND
++        model_size > 0 AND
++        fit_params = $MAD$batch_size=16, epochs=1$MAD$::text AND
++        metrics_type = '{accuracy}' AND
++        training_metrics_final >= 0  AND
++        training_loss_final  >= 0  AND
++        array_upper(training_metrics, 1) = 5 AND
++        array_upper(training_loss, 1) = 5 AND
++        array_upper(metrics_elapsed_time, 1) = 5,
++        'Keras Fit Multiple Output Info Validation failed. Actual:' || __to_char(info))
++FROM (SELECT * FROM iris_multiple_model_info) info;
++
++PERFORM assert(
++	compile_params = $MAD$loss='categorical_crossentropy', optimizer='Adam(lr=0.01)', metrics=['accuracy']$MAD$::text,
++	'Keras Fit Multiple Output Info compile params validation failed for model 1. Actual:' || __to_char(info))
++FROM (SELECT * FROM iris_multiple_model_info WHERE mst_key=1) info;
++
++PERFORM assert(
++	compile_params = $MAD$loss='categorical_crossentropy', optimizer='Adam(lr=0.001)', metrics=['accuracy']$MAD$::text,
++	'Keras Fit Multiple Output Info compile params validation failed for model 2. Actual:' || __to_char(info))
++FROM (SELECT * FROM iris_multiple_model_info WHERE mst_key=2) info;
++
++PERFORM assert(
++	compile_params = $MAD$loss='categorical_crossentropy', optimizer='Adam(lr=0.0001)', metrics=['accuracy']$MAD$::text,
++	'Keras Fit Multiple Output Info compile params validation failed for model 3. Actual:' || __to_char(info))
++FROM (SELECT * FROM iris_multiple_model_info WHERE mst_key=3) info;
++
++PERFORM assert(
++  training_loss[5]-training_loss[1] < 0 AND
++  training_metrics[5]-training_metrics[1] > 0,
++    'The loss and accuracy should have improved with more iterations.'
++)
++FROM iris_model_summary;
++
++
++end
++$$ LANGUAGE plpgsql VOLATILE;
++
++
++m4_ifdef(`__POSTGRESQL__', `', `SELECT test_mult_models()');
+diff --git a/src/ports/postgres/modules/deep_learning/test/unit_tests/test_madlib_keras.py_in b/src/ports/postgres/modules/deep_learning/test/unit_tests/test_madlib_keras.py_in
+index 2a1c39ead..66968d15d 100644
+--- a/src/ports/postgres/modules/deep_learning/test/unit_tests/test_madlib_keras.py_in
++++ b/src/ports/postgres/modules/deep_learning/test/unit_tests/test_madlib_keras.py_in
+@@ -77,12 +77,37 @@ class MadlibKerasFitTestCase(unittest.TestCase):
+ 
+     def _test_fit_transition_first_buffer_pass(self, is_platform_pg):
+         #TODO should we mock tensorflow's close_session and keras'
+-        # clear_session instead of mocking the function `clear_keras_session`
++        # clear_session instead of mocking the function `K.clear_session`
+         self.subject.K.set_session = Mock()
+-        self.subject.clear_keras_session = Mock()
++        self.subject.K.clear_session = Mock()
+         self.subject.is_platform_pg = Mock(return_value = is_platform_pg)
+         starting_image_count = 0
+         ending_image_count = len(self.dependent_var)
++
++        # Final Call
++        previous_state = np.array(self.model_weights, dtype=np.float32)
++
++        k = {'SD': {}}
++
++        new_state = self.subject.fit_transition(
++            None, self.dependent_var, self.independent_var , self.model.to_json(),
++            self.compile_params, self.fit_params, 0, self.all_seg_ids,
++            self.total_images_per_seg, 0, 4, previous_state.tostring(), True, **k)
++        state = np.fromstring(new_state, dtype=np.float32)
++        image_count = state[0]
++        weights = np.rint(state[1:]).astype(np.int)
++        self.assertEqual(ending_image_count, image_count)
++        # weights should not be modified yet
++        self.assertTrue((self.model_weights == weights).all())
++        # set_session must get called ONLY once, when its the first buffer
++        self.assertEqual(1, self.subject.K.set_session.call_count)
++        # Clear session and sess.close must not get called for the first buffer
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
++        self.assertTrue(k['SD']['segment_model'])
++
++        # Non-Final Call
++        self.subject.K.set_session.reset_mock()
++        self.subject.K.clear_session.reset_mock()
+         previous_state = np.array(self.model_weights, dtype=np.float32)
+ 
+         k = {'SD' : {}}
+@@ -90,7 +115,7 @@ class MadlibKerasFitTestCase(unittest.TestCase):
+         new_state = self.subject.fit_transition(
+             None, self.dependent_var, self.independent_var , self.model.to_json(),
+             self.compile_params, self.fit_params, 0, self.all_seg_ids,
+-            self.total_images_per_seg, 0, 4, previous_state.tostring(), **k)
++            self.total_images_per_seg, 0, 4, previous_state.tostring(), False, **k)
+         state = np.fromstring(new_state, dtype=np.float32)
+         image_count = state[0]
+         weights = np.rint(state[1:]).astype(np.int)
+@@ -100,31 +125,127 @@ class MadlibKerasFitTestCase(unittest.TestCase):
+         # set_session must get called ONLY once, when its the first buffer
+         self.assertEqual(1, self.subject.K.set_session.call_count)
+         # Clear session and sess.close must not get called for the first buffer
+-        self.assertEqual(0, self.subject.clear_keras_session.call_count)
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
++        self.assertTrue(k['SD']['segment_model'])
++
++    def test_fit_transition_cerebro_first_buffer_pass(self):
++        #TODO should we mock tensorflow's close_session and keras'
++        # clear_session instead of mocking the function `K.clear_session`
++        self.subject.K.set_session = Mock()
++        self.subject.K.clear_session = Mock()
++        starting_image_count = 0
++        ending_image_count = len(self.dependent_var)
++
++        previous_state = [starting_image_count]
++        previous_state.extend(self.model_weights)
++        previous_state = np.array(previous_state, dtype=np.float32)
++
++        k = {'SD': {}}
++
++        new_state = self.subject.fit_transition(
++            None, self.dependent_var, self.independent_var , self.model.to_json(),
++            self.compile_params, self.fit_params, 0, self.all_seg_ids,
++            self.total_images_per_seg, 0, 4, previous_state.tostring(), True,
++            True, **k)
++        state = np.fromstring(new_state, dtype=np.float32)
++        image_count = state[0]
++        weights = np.rint(state[1:]).astype(np.int)
++        self.assertEqual(ending_image_count, image_count)
++        # weights should not be modified yet
++        self.assertTrue((self.model_weights == weights).all())
++        # set_session must get called ONLY once, when its the first buffer
++        self.assertEqual(1, self.subject.K.set_session.call_count)
++        # Clear session must get called once for the first buffer
++        self.assertEqual(1, self.subject.K.clear_session.call_count)
+         self.assertTrue(k['SD']['segment_model'])
+ 
+     def _test_fit_transition_middle_buffer_pass(self, is_platform_pg):
+         #TODO should we mock tensorflow's close_session and keras'
+-        # clear_session instead of mocking the function `clear_keras_session`
++        # clear_session instead of mocking the function `K.clear_session`
+         self.subject.K.set_session = Mock()
+-        self.subject.clear_keras_session = Mock()
++        self.subject.K.clear_session = Mock()
+         self.subject.is_platform_pg = Mock(return_value = is_platform_pg)
+ 
+         starting_image_count = len(self.dependent_var)
+         ending_image_count = starting_image_count + len(self.dependent_var)
+ 
++        # Final Call
++
++        state = [starting_image_count]
++        state.extend(self.model_weights)
++        state = np.array(state, dtype=np.float32)
++
++        self.subject.compile_and_set_weights(self.model, self.compile_params,
++                                             '/cpu:0', self.serialized_weights)
++        k = {'SD': {'segment_model': self.model, 'sess': Mock()}}
++
++        new_state = self.subject.fit_transition(
++            state.tostring(), self.dependent_var, self.independent_var,
++            self.model.to_json(), None, self.fit_params, 0, self.all_seg_ids,
++            self.total_images_per_seg, 0, 4, 'dummy_previous_state', True, **k)
++
++        state = np.fromstring(new_state, dtype=np.float32)
++        image_count = state[0]
++        weights = np.rint(state[1:]).astype(np.int)
++        self.assertEqual(ending_image_count, image_count)
++        # weights should not be modified yet
++        self.assertTrue((self.model_weights == weights).all())
++        # set_session must get called ONLY once, when its the first buffer
++        self.assertEqual(0, self.subject.K.set_session.call_count)
++        # Clear session and sess.close must not get called for the middle buffer
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
++
++        # Non-Final Call
++
++        self.subject.K.set_session.reset_mock()
++        self.subject.K.clear_session.reset_mock()
++        state = [starting_image_count]
++        state.extend(self.model_weights)
++        state = np.array(state, dtype=np.float32)
++
++        self.subject.compile_and_set_weights(self.model, self.compile_params,
++                                             '/cpu:0', self.serialized_weights)
++        k = {'SD': {'segment_model': self.model, 'sess': Mock()}}
++
++        new_state = self.subject.fit_transition(
++            state.tostring(), self.dependent_var, self.independent_var,
++            self.model.to_json(), None, self.fit_params, 0, self.all_seg_ids,
++            self.total_images_per_seg, 0, 4, 'dummy_previous_state', False, **k)
++
++        state = np.fromstring(new_state, dtype=np.float32)
++        image_count = state[0]
++        weights = np.rint(state[1:]).astype(np.int)
++        self.assertEqual(ending_image_count, image_count)
++        # weights should not be modified yet
++        self.assertTrue((self.model_weights == weights).all())
++        # set_session must get called ONLY once, when its the first buffer
++        self.assertEqual(0, self.subject.K.set_session.call_count)
++        # Clear session and sess.close must not get called for the middle buffer
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
++
++    def test_fit_transition_cerebro_middle_buffer_pass(self):
++        #TODO should we mock tensorflow's close_session and keras'
++        # clear_session instead of mocking the function `K.clear_session`
++        self.subject.K.set_session = Mock()
++        self.subject.K.clear_session = Mock()
++
++        starting_image_count = len(self.dependent_var)
++        ending_image_count = starting_image_count + len(self.dependent_var)
++
++        # Final Call
++
+         state = [starting_image_count]
+         state.extend(self.model_weights)
+         state = np.array(state, dtype=np.float32)
+ 
+         self.subject.compile_and_set_weights(self.model, self.compile_params,
+                                              '/cpu:0', self.serialized_weights)
+-        k = {'SD': {'segment_model': self.model}}
++        k = {'SD': {'segment_model': self.model, 'sess': Mock()}}
+ 
+         new_state = self.subject.fit_transition(
+             state.tostring(), self.dependent_var, self.independent_var,
+             self.model.to_json(), None, self.fit_params, 0, self.all_seg_ids,
+-            self.total_images_per_seg, 0, 4, 'dummy_previous_state', **k)
++            self.total_images_per_seg, 0, 4, 'dummy_previous_state', True, True, **k)
+ 
+         state = np.fromstring(new_state, dtype=np.float32)
+         image_count = state[0]
+@@ -135,18 +256,19 @@ class MadlibKerasFitTestCase(unittest.TestCase):
+         # set_session must get called ONLY once, when its the first buffer
+         self.assertEqual(0, self.subject.K.set_session.call_count)
+         # Clear session and sess.close must not get called for the middle buffer
+-        self.assertEqual(0, self.subject.clear_keras_session.call_count)
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
+ 
+     def _test_fit_transition_last_buffer_pass(self, is_platform_pg):
+         #TODO should we mock tensorflow's close_session and keras'
+-        # clear_session instead of mocking the function `clear_keras_session`
++        # clear_session instead of mocking the function `K.clear_session`
+         self.subject.K.set_session = Mock()
+-        self.subject.clear_keras_session = Mock()
++        self.subject.K.clear_session = Mock()
+         self.subject.is_platform_pg = Mock(return_value = is_platform_pg)
+ 
+         starting_image_count = 2*len(self.dependent_var)
+         ending_image_count = starting_image_count + len(self.dependent_var)
+ 
++        # Final Call
+         state = [starting_image_count]
+         state.extend(self.model_weights)
+         state = np.array(state, dtype=np.float32)
+@@ -155,11 +277,11 @@ class MadlibKerasFitTestCase(unittest.TestCase):
+ 
+         self.subject.compile_and_set_weights(self.model, self.compile_params,
+                                              '/cpu:0', self.serialized_weights)
+-        k = {'SD': {'segment_model' :self.model}}
++        k = {'SD': {'segment_model' :self.model, 'sess': Mock()}}
+         new_state = self.subject.fit_transition(
+             state.tostring(), self.dependent_var, self.independent_var , self.model.to_json(),
+             None, self.fit_params, 0, self.all_seg_ids, self.total_images_per_seg,
+-            0, 4, 'dummy_previous_state', **k)
++            0, 4, 'dummy_previous_state', True, **k)
+ 
+         state = np.fromstring(new_state, dtype=np.float32)
+         image_count = state[0]
+@@ -171,7 +293,69 @@ class MadlibKerasFitTestCase(unittest.TestCase):
+         self.assertEqual(0, self.subject.K.set_session.call_count)
+         # Clear session and sess.close must get called for the last buffer in gpdb,
+         #  but not in postgres
+-        self.assertEqual(1, self.subject.clear_keras_session.call_count)
++        self.assertEqual(1, self.subject.K.clear_session.call_count)
++
++        # Non-Final Call
++        self.subject.K.set_session.reset_mock()
++        self.subject.K.clear_session.reset_mock()
++        state = [starting_image_count]
++        state.extend(self.model_weights)
++        state = np.array(state, dtype=np.float32)
++
++        multiplied_weights = mult(self.total_images_per_seg[0],self.model_weights)
++
++        self.subject.compile_and_set_weights(self.model, self.compile_params,
++                                             '/cpu:0', self.serialized_weights)
++        k = {'SD': {'segment_model' :self.model, 'sess': Mock()}}
++        new_state = self.subject.fit_transition(
++            state.tostring(), self.dependent_var, self.independent_var , self.model.to_json(),
++            None, self.fit_params, 0, self.all_seg_ids, self.total_images_per_seg,
++            0, 4, 'dummy_previous_state', False, **k)
++
++        state = np.fromstring(new_state, dtype=np.float32)
++        image_count = state[0]
++        weights = np.rint(state[1:]).astype(np.int)
++        self.assertEqual(ending_image_count, image_count)
++        # weights should be multiplied by final image count
++        self.assertTrue((multiplied_weights == weights).all())
++        # set_session must be not be called in transition func for PG
++        self.assertEqual(0, self.subject.K.set_session.call_count)
++        # Clear session and sess.close must get called for the last buffer in gpdb,
++        #  but not in postgres
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
++
++    def test_fit_transition_cerebro_last_buffer_pass(self):
++        #TODO should we mock tensorflow's close_session and keras'
++        # clear_session instead of mocking the function `K.clear_session`
++        self.subject.K.set_session = Mock()
++        self.subject.K.clear_session = Mock()
++
++        starting_image_count = 2*len(self.dependent_var)
++        ending_image_count = starting_image_count + len(self.dependent_var)
++
++        # Final Call
++        state = [starting_image_count]
++        state.extend(self.model_weights)
++        state = np.array(state, dtype=np.float32)
++
++
++        self.subject.compile_and_set_weights(self.model, self.compile_params,
++                                             '/cpu:0', self.serialized_weights)
++        k = {'SD': {'segment_model' :self.model, 'sess': Mock()}}
++        new_state = self.subject.fit_transition(
++            state.tostring(), self.dependent_var, self.independent_var , self.model.to_json(),
++            None, self.fit_params, 0, self.all_seg_ids, self.total_images_per_seg,
++            0, 4, 'dummy_previous_state', True, True, **k)
++
++        state = np.fromstring(new_state, dtype=np.float32)
++        image_count = state[0]
++        weights = np.rint(state[1:]).astype(np.int)
++        self.assertEqual(ending_image_count, image_count)
++        # set_session must be not be called in transition func for PG
++        self.assertEqual(0, self.subject.K.set_session.call_count)
++        # Clear session and sess.close must get called for the last buffer in gpdb,
++        #  but not in postgres
++        self.assertEqual(1, self.subject.K.clear_session.call_count)
+ 
+     def test_fit_transition_first_buffer_pass_pg(self):
+         self._test_fit_transition_first_buffer_pass(True)
+@@ -1004,18 +1188,19 @@ class MadlibKerasEvaluationTestCase(unittest.TestCase):
+ 
+     def _test_internal_keras_eval_transition_first_buffer(self, is_platform_pg):
+         self.subject.K.set_session = Mock()
+-        self.subject.clear_keras_session = Mock()
++        self.subject.K.clear_session = Mock()
+         self.subject.is_platform_pg = Mock(return_value = is_platform_pg)
+         starting_image_count = 0
+         ending_image_count = len(self.dependent_var)
+ 
++        # Final call
++
+         k = {'SD' : {}}
+         state = [0,0,0]
+-
+         new_state = self.subject.internal_keras_eval_transition(
+             state, self.dependent_var , self.independent_var, self.model.to_json(),
+             self.serialized_weights, self.compile_params, 0, self.all_seg_ids,
+-            self.total_images_per_seg, 0, 3, **k)
++            self.total_images_per_seg, 0, 3, True, **k)
+ 
+         agg_loss, agg_accuracy, image_count = new_state
+ 
+@@ -1026,19 +1211,43 @@ class MadlibKerasEvaluationTestCase(unittest.TestCase):
+         self.assertAlmostEqual(self.loss * image_count, agg_loss, 4)
+         self.assertAlmostEqual(self.accuracy * image_count, agg_accuracy, 4)
+         # Clear session and sess.close must not get called for the first buffer
+-        self.assertEqual(0, self.subject.clear_keras_session.call_count)
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
++        self.assertTrue(k['SD']['segment_model'])
++
++        # Non-final call
++
++        self.subject.K.set_session.reset_mock()
++        self.subject.K.clear_session.reset_mock()
++        k = {'SD' : {}}
++        state = [0,0,0]
++        new_state = self.subject.internal_keras_eval_transition(
++            state, self.dependent_var , self.independent_var, self.model.to_json(),
++            self.serialized_weights, self.compile_params, 0, self.all_seg_ids,
++            self.total_images_per_seg, 0, 3, False, **k)
++        agg_loss, agg_accuracy, image_count = new_state
++
++        self.assertEqual(ending_image_count, image_count)
++        # set_session must not get called for the first buffer
++        self.assertEqual(0, self.subject.K.set_session.call_count)
++        # loss and accuracy should be unchanged
++        self.assertAlmostEqual(self.loss * image_count, agg_loss, 4)
++        self.assertAlmostEqual(self.accuracy * image_count, agg_accuracy, 4)
++        # Clear session and sess.close must not get called for the first buffer
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
+         self.assertTrue(k['SD']['segment_model'])
+ 
+     def _test_internal_keras_eval_transition_middle_buffer(self, is_platform_pg):
+         #TODO should we mock tensorflow's close_session and keras'
+-        # clear_session instead of mocking the function `clear_keras_session`
++        # clear_session instead of mocking the function `K.clear_session`
+         self.subject.K.set_session = Mock()
+-        self.subject.clear_keras_session = Mock()
++        self.subject.K.clear_session = Mock()
+         self.subject.is_platform_pg = Mock(return_value = is_platform_pg)
+ 
+         starting_image_count = len(self.dependent_var)
+         ending_image_count = starting_image_count + len(self.dependent_var)
+ 
++        # Final call
++
+         k = {'SD' : {}}
+ 
+         self.subject.compile_and_set_weights(self.model, self.compile_params,
+@@ -1046,11 +1255,12 @@ class MadlibKerasEvaluationTestCase(unittest.TestCase):
+ 
+         state = [self.loss * starting_image_count, self.accuracy * starting_image_count, starting_image_count]
+         k['SD']['segment_model'] = self.model
++        k['SD']['sess'] = Mock()
+ 
+         new_state = self.subject.internal_keras_eval_transition(
+             state, self.dependent_var , self.independent_var, self.model.to_json(),
+             'dummy_model_data', None, 0,self.all_seg_ids,
+-            self.total_images_per_seg, 0, 3, **k)
++            self.total_images_per_seg, 0, 3, True, **k)
+ 
+         agg_loss, agg_accuracy, image_count = new_state
+ 
+@@ -1061,17 +1271,48 @@ class MadlibKerasEvaluationTestCase(unittest.TestCase):
+         self.assertAlmostEqual(self.loss * ending_image_count, agg_loss, 4)
+         self.assertAlmostEqual(self.accuracy * ending_image_count, agg_accuracy, 4)
+         # Clear session and sess.close must not get called for the middle buffer
+-        self.assertEqual(0, self.subject.clear_keras_session.call_count)
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
++
++        # Non-final call
++
++        self.subject.K.set_session.reset_mock()
++        self.subject.K.clear_session.reset_mock()
++        k = {'SD' : {}}
++
++        self.subject.compile_and_set_weights(self.model, self.compile_params,
++                                             '/cpu:0', self.serialized_weights)
++
++        state = [self.loss * starting_image_count, self.accuracy * starting_image_count, starting_image_count]
++        k['SD']['segment_model'] = self.model
++        k['SD']['sess'] = Mock()
++
++        new_state = self.subject.internal_keras_eval_transition(
++            state, self.dependent_var , self.independent_var, self.model.to_json(),
++            'dummy_model_data', None, 0,self.all_seg_ids,
++            self.total_images_per_seg, 0, 3, False, **k)
++
++        agg_loss, agg_accuracy, image_count = new_state
++
++        self.assertEqual(ending_image_count, image_count)
++        # set_session is only called in first buffer, not here
++        self.assertEqual(0, self.subject.K.set_session.call_count)
++         # loss and accuracy should be unchanged
++        self.assertAlmostEqual(self.loss * ending_image_count, agg_loss, 4)
++        self.assertAlmostEqual(self.accuracy * ending_image_count, agg_accuracy, 4)
++        # Clear session and sess.close must not get called for the middle buffer
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
+ 
+     def _test_internal_keras_eval_transition_last_buffer(self, is_platform_pg):
+         #TODO should we mock tensorflow's close_session and keras'
+-        # clear_session instead of mocking the function `clear_keras_session`
++        # clear_session instead of mocking the function `K.clear_session`
+         self.subject.K.set_session = Mock()
+-        self.subject.clear_keras_session = Mock()
++        self.subject.K.clear_session = Mock()
+         self.subject.is_platform_pg = Mock(return_value = is_platform_pg)
+ 
+         starting_image_count = 2*len(self.dependent_var)
+         ending_image_count = starting_image_count + len(self.dependent_var)
++
++        # Final call
+         k = {'SD' : {}}
+ 
+         self.subject.compile_and_set_weights(self.model, self.compile_params,
+@@ -1082,10 +1323,12 @@ class MadlibKerasEvaluationTestCase(unittest.TestCase):
+                  starting_image_count]
+ 
+         k['SD']['segment_model'] = self.model
++        k['SD']['sess'] = Mock()
++
+         new_state = self.subject.internal_keras_eval_transition(
+             state, self.dependent_var , self.independent_var, self.model.to_json(),
+             'dummy_model_data', None, 0, self.all_seg_ids,
+-            self.total_images_per_seg, 0, 3, **k)
++            self.total_images_per_seg, 0, 3, True, **k)
+ 
+         agg_loss, agg_accuracy, image_count = new_state
+ 
+@@ -1097,7 +1340,39 @@ class MadlibKerasEvaluationTestCase(unittest.TestCase):
+         self.assertAlmostEqual(self.accuracy * ending_image_count, agg_accuracy, 4)
+         # Clear session and sess.close must get called for the last buffer in gpdb,
+         #  but not in postgres
+-        self.assertEqual(1, self.subject.clear_keras_session.call_count)
++        self.assertEqual(1, self.subject.K.clear_session.call_count)
++
++        # Non-final call
++
++        self.subject.K.set_session.reset_mock()
++        self.subject.K.clear_session.reset_mock()
++        k = {'SD' : {}}
++
++        self.subject.compile_and_set_weights(self.model, self.compile_params,
++                                             '/cpu:0', self.serialized_weights)
++
++        state = [self.loss * starting_image_count,
++                 self.accuracy * starting_image_count,
++                 starting_image_count]
++
++        k['SD']['segment_model'] = self.model
++        k['SD']['sess'] = Mock()
++
++        new_state = self.subject.internal_keras_eval_transition(
++            state, self.dependent_var , self.independent_var, self.model.to_json(),
++            'dummy_model_data', None, 0, self.all_seg_ids,
++            self.total_images_per_seg, 0, 3, False, **k)
++
++        agg_loss, agg_accuracy, image_count = new_state
++
++        self.assertEqual(ending_image_count, image_count)
++        # set_session is only called in first buffer, not here
++        self.assertEqual(0, self.subject.K.set_session.call_count)
++        # loss and accuracy should be unchanged
++        self.assertAlmostEqual(self.loss * ending_image_count, agg_loss, 4)
++        self.assertAlmostEqual(self.accuracy * ending_image_count, agg_accuracy, 4)
++        # Clear session and sess.close must not get called in non-final iterations
++        self.assertEqual(0, self.subject.K.clear_session.call_count)
+ 
+     def test_internal_keras_eval_transition_first_buffer_pg(self):
+         self._test_internal_keras_eval_transition_first_buffer(True)
+diff --git a/src/ports/postgres/modules/utilities/utilities.py_in b/src/ports/postgres/modules/utilities/utilities.py_in
+index 4e142aaf2..909735224 100644
+--- a/src/ports/postgres/modules/utilities/utilities.py_in
++++ b/src/ports/postgres/modules/utilities/utilities.py_in
+@@ -1112,3 +1112,17 @@ def create_table_drop_cols(source_table, out_table, cols_to_drop, **kwargs):
+                    out_table=out_table,
+                    source_table=source_table))
+ # ------------------------------------------------------------------------------
++
++
++def rotate(l, n):
++    """Summary
++    Rotate the list l to right(the index increasing direction) for n elements.
++    Args:
++        l (list): The input list to rotate
++        n (integer): The number of elements to rotate
++
++    Returns:
++        list: The rotated list
++    """
++    return l[-n:] + l[:-n]
++# ------------------------------------------------------------------------------

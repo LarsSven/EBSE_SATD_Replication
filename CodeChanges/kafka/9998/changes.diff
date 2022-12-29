@@ -1,0 +1,566 @@
+diff --git a/build.gradle b/build.gradle
+index d47e9233e39f..28e69e32c28d 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -1227,6 +1227,7 @@ project(':raft') {
+ 
+   dependencies {
+     compile project(':clients')
++    compile project(':metadata')
+     compile libs.slf4jApi
+     compile libs.jacksonDatabind
+ 
+diff --git a/checkstyle/import-control.xml b/checkstyle/import-control.xml
+index cd8b4c894d74..890a5fcf382c 100644
+--- a/checkstyle/import-control.xml
++++ b/checkstyle/import-control.xml
+@@ -337,10 +337,12 @@
+ 
+   <subpackage name="raft">
+     <allow pkg="org.apache.kafka.raft" />
++    <allow pkg="org.apache.kafka.metadata" />
+     <allow pkg="org.apache.kafka.snapshot" />
+     <allow pkg="org.apache.kafka.clients" />
+     <allow pkg="org.apache.kafka.common.config" />
+     <allow pkg="org.apache.kafka.common.message" />
++    <allow pkg="org.apache.kafka.common.metadata" />
+     <allow pkg="org.apache.kafka.common.metrics" />
+     <allow pkg="org.apache.kafka.common.record" />
+     <allow pkg="org.apache.kafka.common.requests" />
+diff --git a/core/src/main/scala/kafka/tools/TestRaftServer.scala b/core/src/main/scala/kafka/tools/TestRaftServer.scala
+index 68b2d0609e64..5cab6ae2ee11 100644
+--- a/core/src/main/scala/kafka/tools/TestRaftServer.scala
++++ b/core/src/main/scala/kafka/tools/TestRaftServer.scala
+@@ -29,7 +29,7 @@ import kafka.utils.{CommandDefaultOptions, CommandLineUtils, CoreUtils, Exit, Lo
+ import org.apache.kafka.common.metrics.Metrics
+ import org.apache.kafka.common.metrics.stats.Percentiles.BucketSizing
+ import org.apache.kafka.common.metrics.stats.{Meter, Percentile, Percentiles}
+-import org.apache.kafka.common.protocol.Writable
++import org.apache.kafka.common.protocol.{ObjectSerializationCache, Writable}
+ import org.apache.kafka.common.security.scram.internals.ScramMechanism
+ import org.apache.kafka.common.security.token.delegation.internals.DelegationTokenCache
+ import org.apache.kafka.common.utils.{Time, Utils}
+@@ -261,11 +261,11 @@ object TestRaftServer extends Logging {
+   }
+ 
+   private class ByteArraySerde extends RecordSerde[Array[Byte]] {
+-    override def recordSize(data: Array[Byte], context: Any): Int = {
++    override def recordSize(data: Array[Byte], serializationCache: ObjectSerializationCache): Int = {
+       data.length
+     }
+ 
+-    override def write(data: Array[Byte], context: Any, out: Writable): Unit = {
++    override def write(data: Array[Byte], serializationCache: ObjectSerializationCache, out: Writable): Unit = {
+       out.writeByteArray(data)
+     }
+ 
+diff --git a/generator/src/main/java/org/apache/kafka/message/MetadataRecordTypeGenerator.java b/generator/src/main/java/org/apache/kafka/message/MetadataRecordTypeGenerator.java
+index 6d70631f2917..cb3db0c64a4c 100644
+--- a/generator/src/main/java/org/apache/kafka/message/MetadataRecordTypeGenerator.java
++++ b/generator/src/main/java/org/apache/kafka/message/MetadataRecordTypeGenerator.java
+@@ -73,6 +73,10 @@ private void generate() {
+         buffer.printf("%n");
+         generateAccessor("id", "short");
+         buffer.printf("%n");
++        generateAccessor("lowestSupportedVersion", "short");
++        buffer.printf("%n");
++        generateAccessor("highestSupportedVersion", "short");
++        buffer.printf("%n");
+         generateToString();
+         buffer.decrementIndent();
+         buffer.printf("}%n");
+@@ -85,10 +89,12 @@ private void generateEnumValues() {
+             MessageSpec spec = entry.getValue();
+             String name = spec.name();
+             numProcessed++;
+-            buffer.printf("%s(\"%s\", (short) %d)%s%n",
++            buffer.printf("%s(\"%s\", (short) %d, (short) %d, (short) %d)%s%n",
+                 MessageGenerator.toSnakeCase(name).toUpperCase(Locale.ROOT),
+                 MessageGenerator.capitalizeFirst(name),
+                 entry.getKey(),
++                entry.getValue().validVersions().lowest(),
++                entry.getValue().validVersions().highest(),
+                 (numProcessed == apis.size()) ? ";" : ",");
+         }
+     }
+@@ -96,13 +102,17 @@ private void generateEnumValues() {
+     private void generateInstanceVariables() {
+         buffer.printf("private final String name;%n");
+         buffer.printf("private final short id;%n");
++        buffer.printf("private final short lowestSupportedVersion;%n");
++        buffer.printf("private final short highestSupportedVersion;%n");
+     }
+ 
+     private void generateEnumConstructor() {
+-        buffer.printf("MetadataRecordType(String name, short id) {%n");
++        buffer.printf("MetadataRecordType(String name, short id, short lowestSupportedVersion, short highestSupportedVersion) {%n");
+         buffer.incrementIndent();
+         buffer.printf("this.name = name;%n");
+         buffer.printf("this.id = id;%n");
++        buffer.printf("this.lowestSupportedVersion = lowestSupportedVersion;%n");
++        buffer.printf("this.highestSupportedVersion = highestSupportedVersion;%n");
+         buffer.decrementIndent();
+         buffer.printf("}%n");
+     }
+diff --git a/metadata/src/main/java/org/apache/kafka/metadata/ApiMessageAndVersion.java b/metadata/src/main/java/org/apache/kafka/metadata/ApiMessageAndVersion.java
+new file mode 100644
+index 000000000000..75ccb4807b1d
+--- /dev/null
++++ b/metadata/src/main/java/org/apache/kafka/metadata/ApiMessageAndVersion.java
+@@ -0,0 +1,62 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.kafka.metadata;
++
++import org.apache.kafka.common.protocol.ApiMessage;
++
++import java.util.Objects;
++
++/**
++ * An ApiMessage and an associated version.
++ */
++public class ApiMessageAndVersion {
++    private final ApiMessage message;
++    private final short version;
++
++    public ApiMessageAndVersion(ApiMessage message, short version) {
++        this.message = message;
++        this.version = version;
++    }
++
++    public ApiMessage message() {
++        return message;
++    }
++
++    public short version() {
++        return version;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o) return true;
++        if (o == null || getClass() != o.getClass()) return false;
++        ApiMessageAndVersion that = (ApiMessageAndVersion) o;
++        return version == that.version &&
++            Objects.equals(message, that.message);
++    }
++
++    @Override
++    public int hashCode() {
++        return Objects.hash(message, version);
++    }
++
++    @Override
++    public String toString() {
++        return "ApiMessageAndVersion(" + message + " at version " + version + ")";
++    }
++}
+diff --git a/raft/src/main/java/org/apache/kafka/raft/RecordSerde.java b/raft/src/main/java/org/apache/kafka/raft/RecordSerde.java
+index 2921314b548a..9581297de32b 100644
+--- a/raft/src/main/java/org/apache/kafka/raft/RecordSerde.java
++++ b/raft/src/main/java/org/apache/kafka/raft/RecordSerde.java
+@@ -16,39 +16,36 @@
+  */
+ package org.apache.kafka.raft;
+ 
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
+ import org.apache.kafka.common.protocol.Readable;
+ import org.apache.kafka.common.protocol.Writable;
+ 
++/**
++ * Serde interface for records written to the Raft log. This class assumes
++ * a two-pass serialization, with the first pass used to compute the size of the
++ * serialized record, and the second pass to write the object.
++ */
+ public interface RecordSerde<T> {
+     /**
+-     * Create a new context object for to be used when serializing a batch of records.
+-     * This allows for state to be shared between {@link #recordSize(Object, Object)}
+-     * and {@link #write(Object, Object, Writable)}, which is useful in order to avoid
+-     * redundant work (see e.g. {@link org.apache.kafka.common.protocol.ObjectSerializationCache}).
+-     *
+-     * @return context object or null if none is needed
+-     */
+-    default Object newWriteContext() {
+-        return null;
+-    }
+-
+-    /**
+-     * Get the size of a record.
++     * Get the size of a record. This must be called first before writing
++     * the data through {@link #write(Object, ObjectSerializationCache, Writable)}.
+      *
+      * @param data the record that will be serialized
+-     * @param context context object created by {@link #newWriteContext()}
++     * @param serializationCache serialization cache
+      * @return the size in bytes of the serialized record
+      */
+-    int recordSize(T data, Object context);
++    int recordSize(T data, ObjectSerializationCache serializationCache);
+ 
+     /**
+-     * Write the record to the output stream.
++     * Write the record to the output stream. This must be called after
++     * computing the size with {@link #recordSize(Object, ObjectSerializationCache)}.
++     * The same {@link ObjectSerializationCache} instance must be used in both calls.
+      *
+      * @param data the record to serialize and write
+-     * @param context context object created by {@link #newWriteContext()}
++     * @param serializationCache serialization cache
+      * @param out the output stream to write the record to
+      */
+-    void write(T data, Object context, Writable out);
++    void write(T data, ObjectSerializationCache serializationCache, Writable out);
+ 
+     /**
+      * Read a record from a {@link Readable} input.
+diff --git a/raft/src/main/java/org/apache/kafka/raft/internals/BatchAccumulator.java b/raft/src/main/java/org/apache/kafka/raft/internals/BatchAccumulator.java
+index 96438d1ab7ca..4aa2c337d5c0 100644
+--- a/raft/src/main/java/org/apache/kafka/raft/internals/BatchAccumulator.java
++++ b/raft/src/main/java/org/apache/kafka/raft/internals/BatchAccumulator.java
+@@ -17,6 +17,7 @@
+ package org.apache.kafka.raft.internals;
+ 
+ import org.apache.kafka.common.memory.MemoryPool;
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
+ import org.apache.kafka.common.record.CompressionType;
+ import org.apache.kafka.common.record.MemoryRecords;
+ import org.apache.kafka.common.record.RecordBatch;
+@@ -100,10 +101,10 @@ public Long append(int epoch, List<T> records) {
+             return Long.MAX_VALUE;
+         }
+ 
+-        Object serdeContext = serde.newWriteContext();
++        ObjectSerializationCache serializationCache = new ObjectSerializationCache();
+         int batchSize = 0;
+         for (T record : records) {
+-            batchSize += serde.recordSize(record, serdeContext);
++            batchSize += serde.recordSize(record, serializationCache);
+         }
+ 
+         if (batchSize > maxBatchSize) {
+@@ -126,7 +127,7 @@ public Long append(int epoch, List<T> records) {
+             }
+ 
+             for (T record : records) {
+-                batch.appendRecord(record, serdeContext);
++                batch.appendRecord(record, serializationCache);
+                 nextOffset += 1;
+             }
+ 
+diff --git a/raft/src/main/java/org/apache/kafka/raft/internals/BatchBuilder.java b/raft/src/main/java/org/apache/kafka/raft/internals/BatchBuilder.java
+index a264f7bfeb7c..542bb5197c58 100644
+--- a/raft/src/main/java/org/apache/kafka/raft/internals/BatchBuilder.java
++++ b/raft/src/main/java/org/apache/kafka/raft/internals/BatchBuilder.java
+@@ -17,6 +17,7 @@
+ package org.apache.kafka.raft.internals;
+ 
+ import org.apache.kafka.common.protocol.DataOutputStreamWritable;
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
+ import org.apache.kafka.common.protocol.Writable;
+ import org.apache.kafka.common.record.AbstractRecords;
+ import org.apache.kafka.common.record.CompressionType;
+@@ -36,7 +37,7 @@
+ 
+ /**
+  * Collect a set of records into a single batch. New records are added
+- * through {@link #appendRecord(Object, Object)}, but the caller must first
++ * through {@link #appendRecord(Object, ObjectSerializationCache)}, but the caller must first
+  * check whether there is room using {@link #hasRoomFor(int)}. Once the
+  * batch is ready, then {@link #build()} should be used to get the resulting
+  * {@link MemoryRecords} instance.
+@@ -97,10 +98,10 @@ public BatchBuilder(
+      * using {@link #hasRoomFor(int)}.
+      *
+      * @param record the record to append
+-     * @param serdeContext serialization context for use in {@link RecordSerde#write(Object, Object, Writable)}
++     * @param serializationCache serialization cache for use in {@link RecordSerde#write(Object, ObjectSerializationCache, Writable)}
+      * @return the offset of the appended batch
+      */
+-    public long appendRecord(T record, Object serdeContext) {
++    public long appendRecord(T record, ObjectSerializationCache serializationCache) {
+         if (!isOpenForAppends) {
+             throw new IllegalArgumentException("Cannot append new records after the batch has been built");
+         }
+@@ -114,7 +115,7 @@ public long appendRecord(T record, Object serdeContext) {
+         int recordSizeInBytes = writeRecord(
+             offset,
+             record,
+-            serdeContext
++            serializationCache
+         );
+         unflushedBytes += recordSizeInBytes;
+         records.add(record);
+@@ -273,12 +274,12 @@ public MemoryRecords build() {
+     public int writeRecord(
+         long offset,
+         T payload,
+-        Object serdeContext
++        ObjectSerializationCache serializationCache
+     ) {
+         int offsetDelta = (int) (offset - baseOffset);
+         long timestampDelta = 0;
+ 
+-        int payloadSize = serde.recordSize(payload, serdeContext);
++        int payloadSize = serde.recordSize(payload, serializationCache);
+         int sizeInBytes = DefaultRecord.sizeOfBodyInBytes(
+             offsetDelta,
+             timestampDelta,
+@@ -300,7 +301,7 @@ public int writeRecord(
+ 
+         // Write value
+         recordOutput.writeVarint(payloadSize);
+-        serde.write(payload, serdeContext, recordOutput);
++        serde.write(payload, serializationCache, recordOutput);
+ 
+         // Write headers (currently unused)
+         recordOutput.writeVarint(0);
+diff --git a/raft/src/main/java/org/apache/kafka/raft/internals/StringSerde.java b/raft/src/main/java/org/apache/kafka/raft/internals/StringSerde.java
+index c3f9244d5a0b..cf096dfe69a9 100644
+--- a/raft/src/main/java/org/apache/kafka/raft/internals/StringSerde.java
++++ b/raft/src/main/java/org/apache/kafka/raft/internals/StringSerde.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.kafka.raft.internals;
+ 
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
+ import org.apache.kafka.common.protocol.Readable;
+ import org.apache.kafka.common.protocol.Writable;
+ import org.apache.kafka.common.utils.Utils;
+@@ -24,7 +25,7 @@
+ public class StringSerde implements RecordSerde<String> {
+ 
+     @Override
+-    public int recordSize(String data, Object context) {
++    public int recordSize(String data, ObjectSerializationCache serializationCache) {
+         return recordSize(data);
+     }
+ 
+@@ -33,7 +34,7 @@ public int recordSize(String data) {
+     }
+ 
+     @Override
+-    public void write(String data, Object context, Writable out) {
++    public void write(String data, ObjectSerializationCache serializationCache, Writable out) {
+         out.writeByteArray(Utils.utf8(data));
+     }
+ 
+diff --git a/raft/src/main/java/org/apache/kafka/raft/metadata/MetadataRecordSerde.java b/raft/src/main/java/org/apache/kafka/raft/metadata/MetadataRecordSerde.java
+new file mode 100644
+index 000000000000..c740497fb317
+--- /dev/null
++++ b/raft/src/main/java/org/apache/kafka/raft/metadata/MetadataRecordSerde.java
+@@ -0,0 +1,66 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.raft.metadata;
++
++import org.apache.kafka.common.errors.SerializationException;
++import org.apache.kafka.common.metadata.MetadataRecordType;
++import org.apache.kafka.common.protocol.ApiMessage;
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
++import org.apache.kafka.common.protocol.Readable;
++import org.apache.kafka.common.protocol.Writable;
++import org.apache.kafka.common.utils.ByteUtils;
++import org.apache.kafka.metadata.ApiMessageAndVersion;
++import org.apache.kafka.raft.RecordSerde;
++
++public class MetadataRecordSerde implements RecordSerde<ApiMessageAndVersion> {
++    private static final short DEFAULT_FRAME_VERSION = 0;
++    private static final int DEFAULT_FRAME_VERSION_SIZE = ByteUtils.sizeOfUnsignedVarint(DEFAULT_FRAME_VERSION);
++
++    @Override
++    public int recordSize(ApiMessageAndVersion data, ObjectSerializationCache serializationCache) {
++        int size = DEFAULT_FRAME_VERSION_SIZE;
++        size += ByteUtils.sizeOfUnsignedVarint(data.message().apiKey());
++        size += ByteUtils.sizeOfUnsignedVarint(data.version());
++        size += data.message().size(serializationCache, data.version());
++        return size;
++    }
++
++    @Override
++    public void write(ApiMessageAndVersion data, ObjectSerializationCache serializationCache, Writable out) {
++        out.writeUnsignedVarint(DEFAULT_FRAME_VERSION);
++        out.writeUnsignedVarint(data.message().apiKey());
++        out.writeUnsignedVarint(data.version());
++        data.message().write(out, serializationCache, data.version());
++    }
++
++    @Override
++    public ApiMessageAndVersion read(Readable input, int size) {
++        short frameVersion = (short) input.readUnsignedVarint();
++        if (frameVersion != DEFAULT_FRAME_VERSION) {
++            throw new SerializationException("Could not deserialize metadata record due to unknown frame version "
++                + frameVersion + "(only frame version " + DEFAULT_FRAME_VERSION + " is supported)");
++        }
++
++        short apiKey = (short) input.readUnsignedVarint();
++        short version = (short) input.readUnsignedVarint();
++        MetadataRecordType recordType = MetadataRecordType.fromId(apiKey);
++        ApiMessage record = recordType.newMetadataRecord();
++        record.read(input, version);
++        return new ApiMessageAndVersion(record, version);
++    }
++
++}
+diff --git a/raft/src/test/java/org/apache/kafka/raft/RaftEventSimulationTest.java b/raft/src/test/java/org/apache/kafka/raft/RaftEventSimulationTest.java
+index 2b548d5a6050..f94b85a8e8ba 100644
+--- a/raft/src/test/java/org/apache/kafka/raft/RaftEventSimulationTest.java
++++ b/raft/src/test/java/org/apache/kafka/raft/RaftEventSimulationTest.java
+@@ -19,6 +19,7 @@
+ import org.apache.kafka.common.TopicPartition;
+ import org.apache.kafka.common.memory.MemoryPool;
+ import org.apache.kafka.common.metrics.Metrics;
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
+ import org.apache.kafka.common.protocol.Readable;
+ import org.apache.kafka.common.protocol.Writable;
+ import org.apache.kafka.common.protocol.types.Type;
+@@ -1124,12 +1125,12 @@ void deliverAll() {
+ 
+     private static class IntSerde implements RecordSerde<Integer> {
+         @Override
+-        public int recordSize(Integer data, Object context) {
++        public int recordSize(Integer data, ObjectSerializationCache serializationCache) {
+             return Type.INT32.sizeOf(data);
+         }
+ 
+         @Override
+-        public void write(Integer data, Object context, Writable out) {
++        public void write(Integer data, ObjectSerializationCache serializationCache, Writable out) {
+             out.writeInt(data);
+         }
+ 
+diff --git a/raft/src/test/java/org/apache/kafka/raft/internals/BatchAccumulatorTest.java b/raft/src/test/java/org/apache/kafka/raft/internals/BatchAccumulatorTest.java
+index edd1a779a5c5..a1053c181fa0 100644
+--- a/raft/src/test/java/org/apache/kafka/raft/internals/BatchAccumulatorTest.java
++++ b/raft/src/test/java/org/apache/kafka/raft/internals/BatchAccumulatorTest.java
+@@ -17,6 +17,7 @@
+ package org.apache.kafka.raft.internals;
+ 
+ import org.apache.kafka.common.memory.MemoryPool;
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
+ import org.apache.kafka.common.protocol.Writable;
+ import org.apache.kafka.common.record.CompressionType;
+ import org.apache.kafka.common.utils.MockTime;
+@@ -277,8 +278,11 @@ public void testDrainDoesNotBlockWithConcurrentAppend() throws Exception {
+             releaseLockLatch.await();
+             writable.writeByteArray(Utils.utf8("b"));
+             return null;
+-        }).when(serde)
+-            .write(Mockito.eq("b"), Mockito.eq(null), Mockito.any(Writable.class));
++        }).when(serde).write(
++            Mockito.eq("b"),
++            Mockito.any(ObjectSerializationCache.class),
++            Mockito.any(Writable.class)
++        );
+ 
+         Thread appendThread = new Thread(() -> acc.append(leaderEpoch, singletonList("b")));
+         appendThread.start();
+diff --git a/raft/src/test/java/org/apache/kafka/raft/metadata/MetadataRecordSerdeTest.java b/raft/src/test/java/org/apache/kafka/raft/metadata/MetadataRecordSerdeTest.java
+new file mode 100644
+index 000000000000..2071814ed953
+--- /dev/null
++++ b/raft/src/test/java/org/apache/kafka/raft/metadata/MetadataRecordSerdeTest.java
+@@ -0,0 +1,72 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.raft.metadata;
++
++import org.apache.kafka.common.Uuid;
++import org.apache.kafka.common.errors.SerializationException;
++import org.apache.kafka.common.metadata.TopicRecord;
++import org.apache.kafka.common.protocol.ByteBufferAccessor;
++import org.apache.kafka.common.protocol.ObjectSerializationCache;
++import org.apache.kafka.common.utils.ByteUtils;
++import org.apache.kafka.metadata.ApiMessageAndVersion;
++import org.junit.jupiter.api.Test;
++
++import java.nio.ByteBuffer;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++
++class MetadataRecordSerdeTest {
++
++    @Test
++    public void testSerde() {
++        TopicRecord topicRecord = new TopicRecord()
++            .setName("foo")
++            .setTopicId(Uuid.randomUuid());
++
++        MetadataRecordSerde serde = new MetadataRecordSerde();
++
++        for (short version = TopicRecord.LOWEST_SUPPORTED_VERSION; version <= TopicRecord.HIGHEST_SUPPORTED_VERSION; version++) {
++            ApiMessageAndVersion messageAndVersion = new ApiMessageAndVersion(topicRecord, version);
++
++            ObjectSerializationCache cache = new ObjectSerializationCache();
++            int size = serde.recordSize(messageAndVersion, cache);
++
++            ByteBuffer buffer = ByteBuffer.allocate(size);
++            ByteBufferAccessor bufferAccessor = new ByteBufferAccessor(buffer);
++
++            serde.write(messageAndVersion, cache, bufferAccessor);
++            buffer.flip();
++
++            assertEquals(size, buffer.remaining());
++            ApiMessageAndVersion readMessageAndVersion = serde.read(bufferAccessor, size);
++            assertEquals(messageAndVersion, readMessageAndVersion);
++        }
++    }
++
++    @Test
++    public void testDeserializeWithUnhandledFrameVersion() {
++        ByteBuffer buffer = ByteBuffer.allocate(16);
++        ByteUtils.writeUnsignedVarint(15, buffer);
++        buffer.flip();
++
++        MetadataRecordSerde serde = new MetadataRecordSerde();
++        assertThrows(SerializationException.class,
++            () -> serde.read(new ByteBufferAccessor(buffer), 16));
++    }
++
++}
+\ No newline at end of file

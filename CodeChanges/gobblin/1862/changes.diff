@@ -1,0 +1,1816 @@
+diff --git a/gobblin-api/src/main/java/gobblin/broker/ResourceEntry.java b/gobblin-api/src/main/java/gobblin/broker/ResourceEntry.java
+new file mode 100644
+index 0000000000..a801b7d5c0
+--- /dev/null
++++ b/gobblin-api/src/main/java/gobblin/broker/ResourceEntry.java
+@@ -0,0 +1,47 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package gobblin.broker;
++
++import gobblin.broker.iface.SharedResourceFactoryResponse;
++
++
++/**
++ * A {@link SharedResourceFactoryResponse} containing a instance of a resource.
++ */
++public interface ResourceEntry<T> extends SharedResourceFactoryResponse<T> {
++  /**
++   * @return The instance of the resource.
++   */
++  T getResource();
++
++  /**
++   * @return Whether this entry is valid. If the entry is invalid, it will be invalidated from the cache, causing a new
++   * call to the {@link gobblin.broker.iface.SharedResourceFactory}.
++   */
++  boolean isValid();
++
++  /**
++   * This method will be called when the entry is invalidated. It may or may not close the contained resource depending
++   * on the semantics the {@link gobblin.broker.iface.SharedResourceFactory} wishes to provide (e.g. whether already
++   * acquired objects should be closed).
++   *
++   * Note that for consistency, the broker runs this method synchronously before a new instance is created for the same
++   * key, blocking all requests for that key. As suck, this method should be reasonably fast.
++   */
++  void onInvalidate();
++}
+diff --git a/gobblin-api/src/main/java/gobblin/broker/iface/SharedResourceFactory.java b/gobblin-api/src/main/java/gobblin/broker/iface/SharedResourceFactory.java
+index 97bd47af2f..b5dc7256e8 100644
+--- a/gobblin-api/src/main/java/gobblin/broker/iface/SharedResourceFactory.java
++++ b/gobblin-api/src/main/java/gobblin/broker/iface/SharedResourceFactory.java
+@@ -31,7 +31,7 @@
+   /**
+    * Requests an object for the provided {@link SharedResourceKey}, with the provided configuration.
+    * The factory can return a variety of responses:
+-   * * {@link gobblin.broker.ResourceInstance}: a newly built resource of type T for the input key and scope.
++   * * {@link gobblin.broker.ResourceEntry}: a newly built resource of type T for the input key and scope.
+    * * {@link gobblin.broker.ResourceCoordinate}: the coordinates (factory, key, scope) of another resource of type T that
+    *    should be used instead (this allows, for example, to use a different factory, or always return a global scoped object.)
+    */
+diff --git a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/common/impl/ConfigStoreBackedValueInspector.java b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/common/impl/ConfigStoreBackedValueInspector.java
+index 9477b4aea9..b7536ef54a 100644
+--- a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/common/impl/ConfigStoreBackedValueInspector.java
++++ b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/common/impl/ConfigStoreBackedValueInspector.java
+@@ -21,7 +21,9 @@
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
++import com.google.common.collect.Sets;
+ import com.typesafe.config.Config;
+ import com.typesafe.config.ConfigFactory;
+ 
+@@ -98,35 +100,15 @@ public Map<ConfigKeyPath, Config> getOwnConfigs(Collection<ConfigKeyPath> config
+     return result;
+   }
+ 
+-  private Config getResolvedConfigRecursive(ConfigKeyPath configKey) {
++  private Config getResolvedConfigRecursive(ConfigKeyPath configKey, Set<String> alreadyLoadedPaths) {
+ 
+     if (this.cs instanceof ConfigStoreWithResolution) {
+       return ((ConfigStoreWithResolution) this.cs).getResolvedConfig(configKey, this.version);
+     }
+ 
+-    /**
+-     * currently use this function to check the circular dependency for the entire store, the result
+-     * is NOT used
+-     *
+-     *     root
+-     *    /
+-     *   l1 -> t1 (imports t1)
+-     *   /
+-     *   l2 -> t2 (imports t2)
+-     *
+-     * getImportsRecursively(l2) will return {t2,t1} as current implementation did NOT return the implicit
+-     * imports ( l1 ), otherwise, there will be a lot of result for both getImportsRecursively and
+-     * getImportedByRecursively
+-     *
+-     * if we use the result, the getResolvedConfig may equals
+-     * l2.ownConfig withFallback t2.ownConfig withFallback t1.ownConfig withFallback l1.ownConfig
+-     *
+-     *  but the correct result should be
+-     *  l2.ownConfig withFallback t2.ownConfig withFallback l1.ownConfig withFallback t1.ownConfig
+-     *
+-     *  The wrong ordering for those is because of we did NOT include the implicit imports l1
+-     */
+-    this.topology.getImportsRecursively(configKey);
++    if (!alreadyLoadedPaths.add(configKey.getAbsolutePathString())) {
++      return ConfigFactory.empty();
++    }
+ 
+     Config initialConfig = this.getOwnConfig(configKey);
+     if (configKey.isRootPath()) {
+@@ -137,12 +119,12 @@ private Config getResolvedConfigRecursive(ConfigKeyPath configKey) {
+     // merge with other configs from imports
+     if (ownImports != null) {
+       for (ConfigKeyPath p : ownImports) {
+-        initialConfig = initialConfig.withFallback(this.getResolvedConfigRecursive(p));
++        initialConfig = initialConfig.withFallback(this.getResolvedConfigRecursive(p, alreadyLoadedPaths));
+       }
+     }
+ 
+     // merge with configs from parent for Non root
+-    initialConfig = initialConfig.withFallback(this.getResolvedConfigRecursive(configKey.getParent()));
++    initialConfig = initialConfig.withFallback(this.getResolvedConfigRecursive(configKey.getParent(), alreadyLoadedPaths));
+ 
+     return initialConfig;
+ 
+@@ -161,7 +143,7 @@ private Config getResolvedConfigRecursive(ConfigKeyPath configKey) {
+    */
+   @Override
+   public Config getResolvedConfig(ConfigKeyPath configKey) {
+-    return getResolvedConfigRecursive(configKey).withFallback(ConfigFactory.defaultOverrides())
++    return getResolvedConfigRecursive(configKey, Sets.<String>newHashSet()).withFallback(ConfigFactory.defaultOverrides())
+         .withFallback(ConfigFactory.systemEnvironment()).resolve();
+   }
+ 
+diff --git a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/UserDirectoryHDFSConfigStoreFactory.java b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/DefaultCapableLocalConfigStoreFactory.java
+similarity index 57%
+rename from gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/UserDirectoryHDFSConfigStoreFactory.java
+rename to gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/DefaultCapableLocalConfigStoreFactory.java
+index ffeac7d175..b1c5c2613e 100644
+--- a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/UserDirectoryHDFSConfigStoreFactory.java
++++ b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/DefaultCapableLocalConfigStoreFactory.java
+@@ -17,20 +17,42 @@
+ 
+ package gobblin.config.store.hdfs;
+ 
+-import org.apache.hadoop.fs.Path;
++import java.net.URI;
++import java.net.URISyntaxException;
++
++import org.apache.hadoop.fs.FileSystem;
++
++import com.google.common.base.Optional;
++import com.typesafe.config.Config;
+ 
+ 
+ /**
+  * A {@link SimpleHDFSConfigStoreFactory} that uses the user directory as the config store location. Use scheme
+  * "default-file".
+  */
+-public class UserDirectoryHDFSConfigStoreFactory extends SimpleLocalHDFSConfigStoreFactory {
++public class DefaultCapableLocalConfigStoreFactory extends SimpleLocalHDFSConfigStoreFactory {
++
++  public DefaultCapableLocalConfigStoreFactory() {
++  }
++
++  public DefaultCapableLocalConfigStoreFactory(Config factoryConfig) {
++    super(factoryConfig);
++  }
+ 
+   public static final String SCHEME_PREFIX = "default-";
+ 
+   @Override
+-  protected Path getDefaultRootDir() {
+-    return new Path(System.getProperty("user.dir"));
++  protected URI getDefaultRootDir(Config factoryConfig, FileSystem defaultFileSystem,
++      Optional<URI> configDefinedDefaultURI) {
++    try {
++      if (configDefinedDefaultURI.isPresent()) {
++        return configDefinedDefaultURI.get();
++      } else {
++        return new URI(System.getProperty("user.dir"));
++      }
++    } catch (URISyntaxException use) {
++      throw new RuntimeException(use);
++    }
+   }
+ 
+   @Override
+diff --git a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSConfigStoreFactory.java b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSConfigStoreFactory.java
+index 476384d920..2c61ce05c0 100644
+--- a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSConfigStoreFactory.java
++++ b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSConfigStoreFactory.java
+@@ -36,24 +36,15 @@
+ 
+ 
+ /**
+- * An implementation of {@link ConfigStoreFactory} for creating {@link SimpleHDFSConfigStore}s. This class only works
++ * An implementation of {@link ConfigStoreFactory} for creating {@link SimpleHadoopFilesystemConfigStore}s. This class only works
+  * the physical scheme {@link #HDFS_SCHEME_NAME}.
+  *
+- * @see SimpleHDFSConfigStore
++ * @see SimpleHadoopFilesystemConfigStore
+  */
+-public class SimpleHDFSConfigStoreFactory implements ConfigStoreFactory<SimpleHDFSConfigStore> {
++public class SimpleHDFSConfigStoreFactory extends SimpleHadoopFilesystemConfigStoreFactory {
+ 
+-  protected static final String SIMPLE_HDFS_SCHEME_PREFIX = "simple-";
+   protected static final String HDFS_SCHEME_NAME = "hdfs";
+ 
+-  /** Global namespace for properties if no scope is used */
+-  public static final String DEFAULT_CONFIG_NAMESPACE = SimpleHDFSConfigStoreFactory.class.getName();
+-  /** Scoped configuration properties */
+-  public static final String DEFAULT_STORE_URI_KEY = "default_store_uri";
+-
+-  private final Optional<URI> defaultStoreURI;
+-  private final FileSystem defaultStoreFS;
+-
+   /** Instantiates a new instance using standard typesafe config defaults:
+    * {@link ConfigFactory#load()} */
+   public SimpleHDFSConfigStoreFactory() {
+@@ -65,185 +56,31 @@ public SimpleHDFSConfigStoreFactory() {
+    * expected to be scoped, i.e. the properties should not be prefixed.
+    */
+   public SimpleHDFSConfigStoreFactory(Config factoryConfig) {
++    super(factoryConfig);
++  }
++
++  @Override
++  protected FileSystem getDefaultStoreFs(Config factoryConfig, Optional<URI> configDefinedDefaultURI) {
+     try {
+-      if (factoryConfig.hasPath(DEFAULT_STORE_URI_KEY)) {
+-        String uri = factoryConfig.getString(DEFAULT_STORE_URI_KEY);
+-        if (Strings.isNullOrEmpty(uri)) {
+-          throw new IllegalArgumentException("Default store URI should be non-empty!");
+-        }
+-        Path defStorePath = new Path(uri);
+-        this.defaultStoreFS = defStorePath.getFileSystem(new Configuration());
+-        this.defaultStoreURI = Optional.of(this.defaultStoreFS.makeQualified(defStorePath).toUri());
+-        if (!isValidStoreRootPath(this.defaultStoreFS, defStorePath)) {
+-          throw new IllegalArgumentException("Path does not appear to be a config store root: " + this.defaultStoreFS);
+-        }
++      if (configDefinedDefaultURI.isPresent() && configDefinedDefaultURI.get().getAuthority() != null) {
++        return FileSystem.get(configDefinedDefaultURI.get(), new Configuration());
+       } else {
+-        this.defaultStoreFS = FileSystem.get(new Configuration());
+-        Path candidateStorePath = getDefaultRootDir();
+-        if (candidateStorePath != null && isValidStoreRootPath(this.defaultStoreFS, candidateStorePath)) {
+-          this.defaultStoreURI = Optional.of(this.defaultStoreFS.makeQualified(candidateStorePath).toUri());
+-        } else {
+-          this.defaultStoreURI = Optional.absent();
+-        }
++        FileSystem fs = FileSystem.get(new Configuration());
++        return HDFS_SCHEME_NAME.equals(fs.getScheme()) ? fs : null;
+       }
+-    } catch (IOException e) {
+-      throw new RuntimeException("Unable to initialize Hadoop FS store factory:" + e, e);
++    } catch (IOException ioe) {
++      throw new RuntimeException("Could not create default store fs for scheme " + getScheme());
+     }
+   }
+ 
+-  private static boolean isValidStoreRootPath(FileSystem fs, Path storeRootPath) throws IOException {
+-    Path storeRoot = new Path(storeRootPath, SimpleHDFSConfigStore.CONFIG_STORE_NAME);
+-    return fs.exists(storeRoot);
+-  }
+-
+   @Override
+-  public String getScheme() {
+-    return getSchemePrefix() + getPhysicalScheme();
++  protected URI getDefaultRootDir(Config factoryConfig, FileSystem defaultFileSystem,
++      Optional<URI> configDefinedDefaultURI) {
++    return configDefinedDefaultURI.or(defaultFileSystem.getHomeDirectory().toUri());
+   }
+ 
+-  /**
+-   * Creates a {@link SimpleHDFSConfigStore} for the given {@link URI}. The {@link URI} specified should be the fully
+-   * qualified path to the dataset in question. For example,
+-   * {@code simple-hdfs://[authority]:[port][path-to-config-store][path-to-dataset]}. It is important to note that the
+-   * path to the config store on HDFS must also be specified. The combination
+-   * {@code [path-to-config-store][path-to-dataset]} need not specify an actual {@link Path} on HDFS.
+-   *
+-   * <p>
+-   *   If the {@link URI} does not contain an authority, a default authority and root directory are provided. The
+-   *   default authority is taken from the NameNode {@link URI} the current process is co-located with. The default path
+-   *   is "/user/[current-user]/".
+-   * </p>
+-   *
+-   * @param  configKey       The URI of the config key that needs to be accessed.
+-   *
+-   * @return a {@link SimpleHDFSConfigStore} configured with the the given {@link URI}.
+-   *
+-   * @throws ConfigStoreCreationException if the {@link SimpleHDFSConfigStore} could not be created.
+-   */
+   @Override
+-  public SimpleHDFSConfigStore createConfigStore(URI configKey) throws ConfigStoreCreationException {
+-    FileSystem fs = createFileSystem(configKey);
+-    URI physicalStoreRoot = getStoreRoot(fs, configKey);
+-    URI logicalStoreRoot = URI.create(getSchemePrefix() + physicalStoreRoot);
+-    return new SimpleHDFSConfigStore(fs, physicalStoreRoot, logicalStoreRoot);
+-  }
+-
+-  protected String getSchemePrefix() {
+-    return SIMPLE_HDFS_SCHEME_PREFIX;
+-  }
+-
+-  /**
+-   * Returns the physical scheme this {@link ConfigStoreFactory} is responsible for. To support new HDFS
+-   * {@link FileSystem} implementations, subclasses should override this method.
+-   */
+   protected String getPhysicalScheme() {
+-    return this.defaultStoreFS.getUri().getScheme();
+-  }
+-
+-  /**
+-   * Gets a default root directory if one is not specified. The default root dir is {@code /jobs/[current-user]/}.
+-   */
+-  protected Path getDefaultRootDir() throws IOException {
+-    return this.defaultStoreFS.getHomeDirectory();
+-  }
+-
+-  /**
+-   * Gets a default authority if one is not specified. The default authority is the authority
+-   * configured as part of the {@link #DEFAULT_STORE_URI_KEY} configuration setting or the {@link FileSystem}
+-   * the current process is running if the setting is missing.. For example, when running on a
+-   * HDFS node, the authority will taken from the NameNode {@link URI}.
+-   */
+-  private String getDefaultAuthority() throws IOException {
+-    return this.defaultStoreFS.getUri().getAuthority();
+-  }
+-
+-  /**
+-   * Creates a {@link FileSystem} given a user specified configKey.
+-   */
+-  private FileSystem createFileSystem(URI configKey) throws ConfigStoreCreationException {
+-    try {
+-      return FileSystem.get(createFileSystemURI(configKey), new Configuration());
+-    } catch (IOException | URISyntaxException e) {
+-      throw new ConfigStoreCreationException(configKey, e);
+-    }
+-  }
+-
+-  /**
+-   * Creates a Hadoop FS {@link URI} given a user-specified configKey. If the given configKey does not have an authority,
+-   * a default one is used instead, provided by the {@link #getDefaultAuthority()} method.
+-   */
+-  private URI createFileSystemURI(URI configKey) throws URISyntaxException, IOException {
+-    // Validate the scheme
+-    String configKeyScheme = configKey.getScheme();
+-    if (!configKeyScheme.startsWith(getSchemePrefix())) {
+-      throw new IllegalArgumentException(
+-          String.format("Scheme for configKey \"%s\" must begin with \"%s\"!", configKey, getSchemePrefix()));
+-    }
+-
+-    if (Strings.isNullOrEmpty(configKey.getAuthority())) {
+-      return new URI(getPhysicalScheme(), getDefaultAuthority(), "", "", "");
+-    }
+-    String uriPhysicalScheme = configKeyScheme.substring(getSchemePrefix().length(), configKeyScheme.length());
+-    return new URI(uriPhysicalScheme, configKey.getAuthority(), "", "", "");
+-  }
+-
+-  /**
+-   * This method determines the physical location of the {@link SimpleHDFSConfigStore} root directory on HDFS. It does
+-   * this by taking the {@link URI} given by the user and back-tracing the path. It checks if each parent directory
+-   * contains the folder {@link SimpleHDFSConfigStore#CONFIG_STORE_NAME}. It the assumes this {@link Path} is the root
+-   * directory.
+-   *
+-   * <p>
+-   *   If the given configKey does not have an authority, then this method assumes the given {@link URI#getPath()} does
+-   *   not contain the dataset root. In which case it uses the {@link #getDefaultRootDir()} as the root directory. If
+-   *   the default root dir does not contain the {@link SimpleHDFSConfigStore#CONFIG_STORE_NAME} then a
+-   *   {@link ConfigStoreCreationException} is thrown.
+-   * </p>
+-   */
+-  private URI getStoreRoot(FileSystem fs, URI configKey) throws ConfigStoreCreationException {
+-    if (Strings.isNullOrEmpty(configKey.getAuthority())) {
+-      if (hasDefaultStoreURI()) {
+-        return this.defaultStoreURI.get();
+-      } else if (isAuthorityRequired()) {
+-        throw new ConfigStoreCreationException(configKey, "No default store has been configured.");
+-      }
+-    }
+-
+-    Path path = new Path(configKey.getPath());
+-
+-    while (path != null) {
+-      try {
+-        // the abs URI may point to an unexist path for
+-        // 1. phantom node
+-        // 2. as URI did not specify the version
+-        if (fs.exists(path)) {
+-          for (FileStatus fileStatus : fs.listStatus(path)) {
+-            if (fileStatus.isDirectory()
+-                && fileStatus.getPath().getName().equals(SimpleHDFSConfigStore.CONFIG_STORE_NAME)) {
+-              return fs.getUri().resolve(fileStatus.getPath().getParent().toUri());
+-            }
+-          }
+-        }
+-      } catch (IOException e) {
+-        throw new ConfigStoreCreationException(configKey, e);
+-      }
+-
+-      path = path.getParent();
+-    }
+-    throw new ConfigStoreCreationException(configKey, "Cannot find the store root!");
+-  }
+-
+-  protected boolean isAuthorityRequired() {
+-    return true;
+-  }
+-
+-  @VisibleForTesting
+-  boolean hasDefaultStoreURI() {
+-    return this.defaultStoreURI.isPresent();
+-  }
+-
+-  @VisibleForTesting
+-  URI getDefaultStoreURI() {
+-    return this.defaultStoreURI.get();
++    return HDFS_SCHEME_NAME;
+   }
+ }
+diff --git a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSStoreMetadata.java b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSStoreMetadata.java
+index 5671630543..735d43267c 100644
+--- a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSStoreMetadata.java
++++ b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSStoreMetadata.java
+@@ -53,7 +53,7 @@ public class SimpleHDFSStoreMetadata {
+    * Create a new {@link SimpleHDFSStoreMetadata} to read and write store metadata
+    *
+    * @param fs where metadata is stored
+-   * @param configStoreDir path to {@link SimpleHDFSConfigStore#CONFIG_STORE_NAME}
++   * @param configStoreDir path to {@link SimpleHadoopFilesystemConfigStore#CONFIG_STORE_NAME}
+    */
+   SimpleHDFSStoreMetadata(final FileSystem fs, final Path configStoreDir) {
+     this.storeMetadataFilePath = new Path(configStoreDir, CONFIG_STORE_METADATA_FILENAME);
+diff --git a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSConfigStore.java b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHadoopFilesystemConfigStore.java
+similarity index 97%
+rename from gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSConfigStore.java
+rename to gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHadoopFilesystemConfigStore.java
+index 06e2302e18..77303d5024 100644
+--- a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHDFSConfigStore.java
++++ b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHadoopFilesystemConfigStore.java
+@@ -119,7 +119,7 @@
+  */
+ @Slf4j
+ @ConfigStoreWithStableVersioning
+-public class SimpleHDFSConfigStore implements ConfigStore, Deployable<FsDeploymentConfig> {
++public class SimpleHadoopFilesystemConfigStore implements ConfigStore, Deployable<FsDeploymentConfig> {
+ 
+   protected static final String CONFIG_STORE_NAME = "_CONFIG_STORE";
+ 
+@@ -134,7 +134,7 @@ public class SimpleHDFSConfigStore implements ConfigStore, Deployable<FsDeployme
+   private final SimpleHDFSStoreMetadata storeMetadata;
+ 
+   /**
+-   * Constructs a {@link SimpleHDFSConfigStore} using a given {@link FileSystem} and a {@link URI} that points to the
++   * Constructs a {@link SimpleHadoopFilesystemConfigStore} using a given {@link FileSystem} and a {@link URI} that points to the
+    * physical location of the store root.
+    *
+    * @param fs the {@link FileSystem} the {@link ConfigStore} is stored on.
+@@ -142,7 +142,7 @@ public class SimpleHDFSConfigStore implements ConfigStore, Deployable<FsDeployme
+    *                          {@link URI} should match the {@link FileSystem#getScheme()} of the given {@link FileSystem}.
+    * @param logicalStoreRoot the fully qualfied {@link URI} of the logical store root
+    */
+-  protected SimpleHDFSConfigStore(FileSystem fs, URI physicalStoreRoot, URI logicalStoreRoot) {
++  protected SimpleHadoopFilesystemConfigStore(FileSystem fs, URI physicalStoreRoot, URI logicalStoreRoot) {
+     Preconditions.checkNotNull(fs, "fs cannot be null!");
+     Preconditions.checkNotNull(physicalStoreRoot, "physicalStoreRoot cannot be null!");
+     Preconditions.checkNotNull(logicalStoreRoot, "logicalStoreRoot cannot be null!");
+@@ -390,9 +390,9 @@ private class VersionRootLoader implements Callable<Path> {
+ 
+     @Override
+     public Path call() throws IOException {
+-      Path versionRootPath = PathUtils.combinePaths(SimpleHDFSConfigStore.this.physicalStoreRoot.toString(),
++      Path versionRootPath = PathUtils.combinePaths(SimpleHadoopFilesystemConfigStore.this.physicalStoreRoot.toString(),
+           CONFIG_STORE_NAME, this.version);
+-      if (SimpleHDFSConfigStore.this.fs.isDirectory(versionRootPath)) {
++      if (SimpleHadoopFilesystemConfigStore.this.fs.isDirectory(versionRootPath)) {
+         return versionRootPath;
+       }
+       throw new VersionDoesNotExistException(getStoreURI(), this.version,
+diff --git a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHadoopFilesystemConfigStoreFactory.java b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHadoopFilesystemConfigStoreFactory.java
+new file mode 100644
+index 0000000000..6482bf42c1
+--- /dev/null
++++ b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleHadoopFilesystemConfigStoreFactory.java
+@@ -0,0 +1,277 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package gobblin.config.store.hdfs;
++
++import java.io.IOException;
++import java.net.URI;
++import java.net.URISyntaxException;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Optional;
++import com.google.common.base.Strings;
++import com.typesafe.config.Config;
++import com.typesafe.config.ConfigFactory;
++
++import gobblin.config.store.api.ConfigStoreCreationException;
++import gobblin.config.store.api.ConfigStoreFactory;
++
++
++/**
++ * An abstract base class for {@link ConfigStoreFactory}s based on {@link FileSystem}.
++ * Subclasses should implement {@link #getPhysicalScheme()}, {@link #getDefaultStoreFs(Config, Optional)} and
++ * {@link #getDefaultRootDir(Config, FileSystem, Optional)}.
++ */
++public abstract class SimpleHadoopFilesystemConfigStoreFactory implements ConfigStoreFactory<SimpleHadoopFilesystemConfigStore> {
++
++  protected static final String SIMPLE_HDFS_SCHEME_PREFIX = "simple-";
++
++  /** Global namespace for properties if no scope is used */
++  public static final String DEFAULT_CONFIG_NAMESPACE = SimpleHDFSConfigStoreFactory.class.getName();
++  /** Scoped configuration properties */
++  public static final String DEFAULT_STORE_URI_KEY = "default_store_uri";
++
++  private final String physicalScheme;
++  private final Config factoryConfig;
++  private final URI defaultURI;
++
++  private Optional<FileSystem> defaultFileSystem;
++  private Optional<URI> defaultRootDir;
++
++  /** Instantiates a new instance using standard typesafe config defaults:
++   * {@link ConfigFactory#load()} */
++  public SimpleHadoopFilesystemConfigStoreFactory() {
++    this(ConfigFactory.load().getConfig(DEFAULT_CONFIG_NAMESPACE));
++  }
++
++  /**
++   * Instantiates a new instance of the factory with the specified config. The configuration is
++   * expected to be scoped, i.e. the properties should not be prefixed.
++   */
++  public SimpleHadoopFilesystemConfigStoreFactory(Config factoryConfig) {
++    this.physicalScheme = getPhysicalScheme();
++    this.factoryConfig = factoryConfig;
++    this.defaultURI = computeDefaultURI(this.factoryConfig);
++  }
++
++  private URI computeDefaultURI(Config factoryConfig) {
++    if (factoryConfig.hasPath(DEFAULT_STORE_URI_KEY)) {
++      String uriString = factoryConfig.getString(DEFAULT_STORE_URI_KEY);
++      if (Strings.isNullOrEmpty(uriString)) {
++        throw new IllegalArgumentException("Default store URI should be non-empty");
++      }
++      try {
++        URI uri = new URI(uriString);
++        if (uri.getScheme() == null || this.physicalScheme.equals(uri.getScheme())) {
++          return uri;
++        }
++      } catch (URISyntaxException use) {
++        throw new IllegalArgumentException("Could not use default uri " + uriString);
++      }
++    }
++    return null;
++  }
++
++  /**
++   * Returns the physical scheme this {@link ConfigStoreFactory} is responsible for. To support new HDFS
++   * {@link FileSystem} implementations, subclasses should override this method.
++   */
++  protected abstract String getPhysicalScheme();
++
++  /**
++   * Returns the default {@link FileSystem} used for {@link gobblin.config.store.api.ConfigStore}s generated by this
++   * factory.
++   * @param factoryConfig the user supplied factory configuration.
++   * @param configDefinedDefaultURI if the user specified a default uri, that uri.
++   */
++  protected abstract FileSystem getDefaultStoreFs(Config factoryConfig, Optional<URI> configDefinedDefaultURI);
++
++  /**
++   * Returns the {@link URI} for the default store created by this factory.
++   * @param factoryConfig the user supplied factory configuration.
++   * @param configDefinedDefaultURI if the user specified a default uri, that uri.
++   * @param defaultFileSystem the default {@link FileSystem} obtained from {@link #getDefaultStoreFs(Config, Optional)}.
++   */
++  protected abstract URI getDefaultRootDir(Config factoryConfig, FileSystem defaultFileSystem, Optional<URI> configDefinedDefaultURI);
++
++  private synchronized FileSystem getDefaultStoreFsLazy() {
++    if (this.defaultFileSystem == null) {
++      this.defaultFileSystem = Optional.fromNullable(getDefaultStoreFs(this.factoryConfig, Optional.fromNullable(this.defaultURI)));
++    }
++    return this.defaultFileSystem.orNull();
++  }
++
++  private synchronized URI getDefaultStoreURILazy() {
++    if (this.defaultRootDir == null) {
++      this.defaultRootDir = Optional.fromNullable(computeDefaultStoreURI());
++    }
++    return this.defaultRootDir.orNull();
++  }
++
++  private URI computeDefaultStoreURI() {
++    try {
++      if (getDefaultStoreFsLazy() == null) {
++        return null;
++      }
++
++      URI defaultRoot = getDefaultRootDir(this.factoryConfig, getDefaultStoreFsLazy(), Optional.fromNullable(this.defaultURI));
++      if (defaultRoot == null) {
++        return null;
++      }
++
++      Path path = getDefaultStoreFsLazy().makeQualified(new Path(defaultRoot));
++      if (!isValidStoreRootPath(getDefaultStoreFsLazy(), path)) {
++        throw new IllegalArgumentException(path + " is not a config store.");
++      }
++      return path.toUri();
++    } catch (IOException ioe) {
++      throw new RuntimeException("Could not create a default uri for scheme " + getScheme(), ioe);
++    }
++  }
++
++  private static boolean isValidStoreRootPath(FileSystem fs, Path storeRootPath) throws IOException {
++    Path storeRoot = new Path(storeRootPath, SimpleHadoopFilesystemConfigStore.CONFIG_STORE_NAME);
++    return fs.exists(storeRoot);
++  }
++
++  @Override
++  public String getScheme() {
++    return getSchemePrefix() + getPhysicalScheme();
++  }
++
++  /**
++   * Creates a {@link SimpleHadoopFilesystemConfigStore} for the given {@link URI}. The {@link URI} specified should be the fully
++   * qualified path to the dataset in question. For example,
++   * {@code simple-hdfs://[authority]:[port][path-to-config-store][path-to-dataset]}. It is important to note that the
++   * path to the config store on HDFS must also be specified. The combination
++   * {@code [path-to-config-store][path-to-dataset]} need not specify an actual {@link Path} on HDFS.
++   *
++   * <p>
++   *   If the {@link URI} does not contain an authority, a default authority and root directory are provided. The
++   *   default authority is taken from the NameNode {@link URI} the current process is co-located with. The default path
++   *   is "/user/[current-user]/".
++   * </p>
++   *
++   * @param  configKey       The URI of the config key that needs to be accessed.
++   *
++   * @return a {@link SimpleHadoopFilesystemConfigStore} configured with the the given {@link URI}.
++   *
++   * @throws ConfigStoreCreationException if the {@link SimpleHadoopFilesystemConfigStore} could not be created.
++   */
++  @Override
++  public SimpleHadoopFilesystemConfigStore createConfigStore(URI configKey) throws ConfigStoreCreationException {
++    FileSystem fs = createFileSystem(configKey);
++    URI physicalStoreRoot = getStoreRoot(fs, configKey);
++    URI logicalStoreRoot = URI.create(getSchemePrefix() + physicalStoreRoot);
++    return new SimpleHadoopFilesystemConfigStore(fs, physicalStoreRoot, logicalStoreRoot);
++  }
++
++  protected String getSchemePrefix() {
++    return SIMPLE_HDFS_SCHEME_PREFIX;
++  }
++
++  /**
++   * Creates a {@link FileSystem} given a user specified configKey.
++   */
++  private FileSystem createFileSystem(URI configKey) throws ConfigStoreCreationException {
++    try {
++      return FileSystem.get(createFileSystemURI(configKey), new Configuration());
++    } catch (IOException | URISyntaxException e) {
++      throw new ConfigStoreCreationException(configKey, e);
++    }
++  }
++
++  /**
++   * Creates a Hadoop FS {@link URI} given a user-specified configKey. If the given configKey does not have an authority,
++   * a default one is used instead, provided by the default root path.
++   */
++  private URI createFileSystemURI(URI configKey) throws URISyntaxException, IOException {
++    // Validate the scheme
++    String configKeyScheme = configKey.getScheme();
++    if (!configKeyScheme.startsWith(getSchemePrefix())) {
++      throw new IllegalArgumentException(
++          String.format("Scheme for configKey \"%s\" must begin with \"%s\"!", configKey, getSchemePrefix()));
++    }
++
++    if (Strings.isNullOrEmpty(configKey.getAuthority())) {
++      return new URI(getPhysicalScheme(), getDefaultStoreFsLazy().getUri().getAuthority(), "", "", "");
++    }
++    String uriPhysicalScheme = configKeyScheme.substring(getSchemePrefix().length(), configKeyScheme.length());
++    return new URI(uriPhysicalScheme, configKey.getAuthority(), "", "", "");
++  }
++
++  /**
++   * This method determines the physical location of the {@link SimpleHadoopFilesystemConfigStore} root directory on HDFS. It does
++   * this by taking the {@link URI} given by the user and back-tracing the path. It checks if each parent directory
++   * contains the folder {@link SimpleHadoopFilesystemConfigStore#CONFIG_STORE_NAME}. It the assumes this {@link Path} is the root
++   * directory.
++   *
++   * <p>
++   *   If the given configKey does not have an authority, then this method assumes the given {@link URI#getPath()} does
++   *   not contain the dataset root. In which case it uses the {@link #getDefaultRootDir()} as the root directory. If
++   *   the default root dir does not contain the {@link SimpleHadoopFilesystemConfigStore#CONFIG_STORE_NAME} then a
++   *   {@link ConfigStoreCreationException} is thrown.
++   * </p>
++   */
++  private URI getStoreRoot(FileSystem fs, URI configKey) throws ConfigStoreCreationException {
++    if (Strings.isNullOrEmpty(configKey.getAuthority())) {
++      if (getDefaultStoreURILazy() != null) {
++        return getDefaultStoreURILazy();
++      } else if (isAuthorityRequired()) {
++        throw new ConfigStoreCreationException(configKey, "No default store has been configured.");
++      }
++    }
++
++    Path path = new Path(configKey.getPath());
++
++    while (path != null) {
++      try {
++        // the abs URI may point to an unexist path for
++        // 1. phantom node
++        // 2. as URI did not specify the version
++        if (fs.exists(path)) {
++          for (FileStatus fileStatus : fs.listStatus(path)) {
++            if (fileStatus.isDirectory()
++                && fileStatus.getPath().getName().equals(SimpleHadoopFilesystemConfigStore.CONFIG_STORE_NAME)) {
++              return fs.getUri().resolve(fileStatus.getPath().getParent().toUri());
++            }
++          }
++        }
++      } catch (IOException e) {
++        throw new ConfigStoreCreationException(configKey, e);
++      }
++
++      path = path.getParent();
++    }
++    throw new ConfigStoreCreationException(configKey, "Cannot find the store root!");
++  }
++
++  protected boolean isAuthorityRequired() {
++    return true;
++  }
++
++  @VisibleForTesting
++  URI getDefaultStoreURI() {
++    return getDefaultStoreURILazy() == null ? null : getDefaultStoreURILazy();
++  }
++}
++
+diff --git a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleLocalHDFSConfigStoreFactory.java b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleLocalHDFSConfigStoreFactory.java
+index e3663ec135..ceb4edac5c 100644
+--- a/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleLocalHDFSConfigStoreFactory.java
++++ b/gobblin-config-management/gobblin-config-core/src/main/java/gobblin/config/store/hdfs/SimpleLocalHDFSConfigStoreFactory.java
+@@ -17,27 +17,50 @@
+ 
+ package gobblin.config.store.hdfs;
+ 
++import java.io.IOException;
++import java.net.URI;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ 
++import com.google.common.base.Optional;
++import com.typesafe.config.Config;
++
+ 
+ /**
+- * Extension of {@link SimpleHDFSConfigStoreFactory} that creates a {@link SimpleHDFSConfigStore} which works for the
++ * Extension of {@link SimpleHDFSConfigStoreFactory} that creates a {@link SimpleHadoopFilesystemConfigStore} which works for the
+  * local file system.
+  */
+-public class SimpleLocalHDFSConfigStoreFactory extends SimpleHDFSConfigStoreFactory {
++public class SimpleLocalHDFSConfigStoreFactory extends SimpleHadoopFilesystemConfigStoreFactory {
+ 
+   private static final String LOCAL_HDFS_SCHEME_NAME = "file";
+ 
++  public SimpleLocalHDFSConfigStoreFactory() {
++  }
++
++  public SimpleLocalHDFSConfigStoreFactory(Config factoryConfig) {
++    super(factoryConfig);
++  }
++
+   @Override
+   protected String getPhysicalScheme() {
+     return LOCAL_HDFS_SCHEME_NAME;
+   }
+ 
+-  /**
+-   * Do not use default store as file uris never have an authority.
+-   */
+   @Override
+-  protected Path getDefaultRootDir() {
++  protected FileSystem getDefaultStoreFs(Config factoryConfig, Optional<URI> configDefinedDefaultURI) {
++    try {
++      return FileSystem.getLocal(new Configuration());
++    } catch (IOException ioe) {
++      throw new RuntimeException(ioe);
++    }
++  }
++
++  @Override
++  protected URI getDefaultRootDir(Config factoryConfig, FileSystem defaultFileSystem,
++      Optional<URI> configDefinedDefaultURI) {
++    // Return null because lack of authority does not indicate that a default root directory should be used
+     return null;
+   }
+ 
+diff --git a/gobblin-config-management/gobblin-config-client/src/main/resources/META-INF/services/gobblin.config.store.api.ConfigStoreFactory b/gobblin-config-management/gobblin-config-core/src/main/resources/META-INF/services/gobblin.config.store.api.ConfigStoreFactory
+similarity index 93%
+rename from gobblin-config-management/gobblin-config-client/src/main/resources/META-INF/services/gobblin.config.store.api.ConfigStoreFactory
+rename to gobblin-config-management/gobblin-config-core/src/main/resources/META-INF/services/gobblin.config.store.api.ConfigStoreFactory
+index a1c36770d3..94dbd73681 100644
+--- a/gobblin-config-management/gobblin-config-client/src/main/resources/META-INF/services/gobblin.config.store.api.ConfigStoreFactory
++++ b/gobblin-config-management/gobblin-config-core/src/main/resources/META-INF/services/gobblin.config.store.api.ConfigStoreFactory
+@@ -17,3 +17,4 @@
+ 
+ gobblin.config.store.hdfs.SimpleHDFSConfigStoreFactory
+ gobblin.config.store.hdfs.SimpleLocalHDFSConfigStoreFactory
++gobblin.config.store.hdfs.DefaultCapableLocalConfigStoreFactory
+diff --git a/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigStoreTest.java b/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigStoreTest.java
+index 3c0d33f5d0..ee77ae0887 100644
+--- a/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigStoreTest.java
++++ b/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigStoreTest.java
+@@ -48,7 +48,7 @@
+ 
+ 
+ /**
+- * Unit tests for {@link SimpleHDFSConfigStore} and {@link SimpleHDFSConfigStoreFactory}.
++ * Unit tests for {@link SimpleHadoopFilesystemConfigStore} and {@link SimpleHDFSConfigStoreFactory}.
+  */
+ @Test(groups = "gobblin.config.store.hdfs")
+ public class SimpleHdfsConfigStoreTest {
+@@ -56,14 +56,14 @@ public class SimpleHdfsConfigStoreTest {
+   private static final String CONFIG_DIR_NAME = "configDir";
+   private static final String VERSION = "v1.0";
+   private static final Path CONFIG_DIR_PATH =
+-      PathUtils.combinePaths(CONFIG_DIR_NAME, SimpleHDFSConfigStore.CONFIG_STORE_NAME, VERSION);
++      PathUtils.combinePaths(CONFIG_DIR_NAME, SimpleHadoopFilesystemConfigStore.CONFIG_STORE_NAME, VERSION);
+ 
+   /**Set by {@link TestEnvironment#setup()}**/
+   public static final String TAG_NAME_SYS_PROP_KEY = "sysProp.tagName1";
+   public static final String TAG_NAME_SYS_PROP_VALUE = "tag1";
+ 
+   private FileSystem fs;
+-  private SimpleHDFSConfigStore simpleHDFSConfigStore;
++  private SimpleHadoopFilesystemConfigStore _simpleHadoopFilesystemConfigStore;
+ 
+   @BeforeClass
+   public void setUp() throws URISyntaxException, ConfigStoreCreationException, IOException {
+@@ -73,27 +73,27 @@ public void setUp() throws URISyntaxException, ConfigStoreCreationException, IOE
+     SimpleLocalHDFSConfigStoreFactory simpleHDFSConfigStoreConfigFactory = new SimpleLocalHDFSConfigStoreFactory();
+ 
+     URI storeURI = getStoreURI(System.getProperty("user.dir") + File.separator + CONFIG_DIR_NAME);
+-    this.simpleHDFSConfigStore = simpleHDFSConfigStoreConfigFactory.createConfigStore(storeURI);
+-    this.simpleHDFSConfigStore.deploy(new FsDeploymentConfig(new ClasspathConfigSource(new Properties()), VERSION));
++    this._simpleHadoopFilesystemConfigStore = simpleHDFSConfigStoreConfigFactory.createConfigStore(storeURI);
++    this._simpleHadoopFilesystemConfigStore.deploy(new FsDeploymentConfig(new ClasspathConfigSource(new Properties()), VERSION));
+ 
+   }
+ 
+   @Test
+   public void testGetCurrentVersion() throws IOException {
+ 
+-    Assert.assertEquals(this.simpleHDFSConfigStore.getCurrentVersion(), VERSION);
++    Assert.assertEquals(this._simpleHadoopFilesystemConfigStore.getCurrentVersion(), VERSION);
+ 
+     String newVersion = "v1.1";
+ 
+-    this.simpleHDFSConfigStore.deploy(new FsDeploymentConfig(new ClasspathConfigSource(new Properties()), newVersion));
++    this._simpleHadoopFilesystemConfigStore.deploy(new FsDeploymentConfig(new ClasspathConfigSource(new Properties()), newVersion));
+ 
+-    Assert.assertEquals(this.simpleHDFSConfigStore.getCurrentVersion(), newVersion);
++    Assert.assertEquals(this._simpleHadoopFilesystemConfigStore.getCurrentVersion(), newVersion);
+ 
+   }
+ 
+   @Test
+   public void getStoreURI() {
+-    URI storeURI = this.simpleHDFSConfigStore.getStoreURI();
++    URI storeURI = this._simpleHadoopFilesystemConfigStore.getStoreURI();
+ 
+     Assert.assertEquals(storeURI.getScheme(), SimpleHDFSConfigStoreFactory.SIMPLE_HDFS_SCHEME_PREFIX + "file");
+     Assert.assertNull(storeURI.getAuthority());
+@@ -110,7 +110,7 @@ public void testGetChildren() throws IOException, URISyntaxException, ConfigStor
+       this.fs.mkdirs(new Path(datasetPath, childDatasetName));
+ 
+       ConfigKeyPath datasetConfigKey = SingleLinkedListConfigKeyPath.ROOT.createChild(datasetName);
+-      Collection<ConfigKeyPath> children = this.simpleHDFSConfigStore.getChildren(datasetConfigKey, VERSION);
++      Collection<ConfigKeyPath> children = this._simpleHadoopFilesystemConfigStore.getChildren(datasetConfigKey, VERSION);
+ 
+       Assert.assertEquals(children.size(), 1);
+       Assert.assertEquals(children.iterator().next().getOwnPathName(), childDatasetName);
+@@ -141,7 +141,7 @@ public void testGetOwnImports() throws IOException, URISyntaxException, ConfigSt
+       writer.close();
+ 
+       ConfigKeyPath datasetConfigKey = SingleLinkedListConfigKeyPath.ROOT.createChild(datasetName);
+-      List<ConfigKeyPath> imports = this.simpleHDFSConfigStore.getOwnImports(datasetConfigKey, VERSION);
++      List<ConfigKeyPath> imports = this._simpleHadoopFilesystemConfigStore.getOwnImports(datasetConfigKey, VERSION);
+ 
+       Assert.assertEquals(imports.size(), 2);
+       Assert.assertEquals(imports.get(0).getAbsolutePathString(), tagKey2);
+@@ -170,7 +170,7 @@ public void testGetOwnImportsWithResolution() throws IOException, URISyntaxExcep
+       writer.close();
+ 
+       ConfigKeyPath datasetConfigKey = SingleLinkedListConfigKeyPath.ROOT.createChild(datasetName);
+-      List<ConfigKeyPath> imports = this.simpleHDFSConfigStore.getOwnImports(datasetConfigKey, VERSION);
++      List<ConfigKeyPath> imports = this._simpleHadoopFilesystemConfigStore.getOwnImports(datasetConfigKey, VERSION);
+ 
+       Assert.assertEquals(imports.size(), 1);
+       Assert.assertEquals(imports.get(0).getAbsolutePathString(), "/path/to/" + TAG_NAME_SYS_PROP_VALUE);
+@@ -191,7 +191,7 @@ public void testGetOwnConfig() throws ConfigStoreCreationException, URISyntaxExc
+       this.fs.create(new Path(datasetPath, "main.conf")).close();
+ 
+       ConfigKeyPath datasetConfigKey = SingleLinkedListConfigKeyPath.ROOT.createChild(datasetName);
+-      Config config = this.simpleHDFSConfigStore.getOwnConfig(datasetConfigKey, VERSION);
++      Config config = this._simpleHadoopFilesystemConfigStore.getOwnConfig(datasetConfigKey, VERSION);
+ 
+       Assert.assertTrue(config.isEmpty());
+     } finally {
+@@ -208,9 +208,9 @@ public void testDeploy() throws Exception {
+ 
+     props.setProperty(ClasspathConfigSource.CONFIG_STORE_CLASSPATH_RESOURCE_NAME_KEY, "_testDeploy");
+ 
+-    this.simpleHDFSConfigStore.deploy(new FsDeploymentConfig(new ClasspathConfigSource(props), "2.0"));
++    this._simpleHadoopFilesystemConfigStore.deploy(new FsDeploymentConfig(new ClasspathConfigSource(props), "2.0"));
+ 
+-    Path versionPath = PathUtils.combinePaths(CONFIG_DIR_NAME, SimpleHDFSConfigStore.CONFIG_STORE_NAME, "2.0");
++    Path versionPath = PathUtils.combinePaths(CONFIG_DIR_NAME, SimpleHadoopFilesystemConfigStore.CONFIG_STORE_NAME, "2.0");
+ 
+     Assert.assertTrue(fs.exists(new Path(versionPath, "dir1")));
+     Assert.assertTrue(fs.exists(new Path(versionPath, "dir1/f1.conf")));
+@@ -223,7 +223,7 @@ public void testResolveImports() throws Exception {
+         ImmutableList.of("/path/to/tag0", "/path/to/${?" + TAG_NAME_SYS_PROP_KEY + "}", "${?" + TAG_NAME_SYS_PROP_KEY
+             + "}/${?" + TAG_NAME_SYS_PROP_KEY + "}");
+ 
+-    List<String> resolved = SimpleHDFSConfigStore.resolveIncludesList(unresolved);
++    List<String> resolved = SimpleHadoopFilesystemConfigStore.resolveIncludesList(unresolved);
+ 
+     List<String> expected = ImmutableList.of("/path/to/tag0", "/path/to/tag1", "tag1/tag1");
+     Assert.assertEquals(resolved, expected);
+diff --git a/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigureStoreFactoryTest.java b/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigureStoreFactoryTest.java
+index f33978fd2a..24164ed2ab 100644
+--- a/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigureStoreFactoryTest.java
++++ b/gobblin-config-management/gobblin-config-core/src/test/java/gobblin/config/store/hdfs/SimpleHdfsConfigureStoreFactoryTest.java
+@@ -42,22 +42,22 @@ public class SimpleHdfsConfigureStoreFactoryTest {
+ 
+   @Test
+   public void testGetDefaults() throws URISyntaxException, ConfigStoreCreationException, IOException {
+-    Path configStoreDir = new Path(SimpleHDFSConfigStore.CONFIG_STORE_NAME);
++    Path configStoreDir = new Path(SimpleHadoopFilesystemConfigStore.CONFIG_STORE_NAME);
+     FileSystem localFS = FileSystem.getLocal(new Configuration());
+ 
+     try {
+       Assert.assertTrue(localFS.mkdirs(configStoreDir));
+ 
+-      UserDirectoryHDFSConfigStoreFactory simpleLocalHDFSConfigStoreFactory =
+-          new UserDirectoryHDFSConfigStoreFactory();
++      DefaultCapableLocalConfigStoreFactory simpleLocalHDFSConfigStoreFactory =
++          new DefaultCapableLocalConfigStoreFactory();
+ 
+       URI configKey = new URI(simpleLocalHDFSConfigStoreFactory.getScheme(), "", "", "", "");
+-      SimpleHDFSConfigStore simpleHDFSConfigStore = simpleLocalHDFSConfigStoreFactory.createConfigStore(configKey);
++      SimpleHadoopFilesystemConfigStore simpleHadoopFilesystemConfigStore = simpleLocalHDFSConfigStoreFactory.createConfigStore(configKey);
+ 
+       Assert
+-          .assertEquals(simpleHDFSConfigStore.getStoreURI().getScheme(), simpleLocalHDFSConfigStoreFactory.getScheme());
+-      Assert.assertNull(simpleHDFSConfigStore.getStoreURI().getAuthority());
+-      Assert.assertEquals(simpleHDFSConfigStore.getStoreURI().getPath(), System.getProperty("user.dir"));
++          .assertEquals(simpleHadoopFilesystemConfigStore.getStoreURI().getScheme(), simpleLocalHDFSConfigStoreFactory.getScheme());
++      Assert.assertNull(simpleHadoopFilesystemConfigStore.getStoreURI().getAuthority());
++      Assert.assertEquals(simpleHadoopFilesystemConfigStore.getStoreURI().getPath(), System.getProperty("user.dir"));
+     } finally {
+       localFS.delete(configStoreDir, true);
+     }
+@@ -70,21 +70,19 @@ public void testConfiguration() throws Exception {
+     Path testRoot = localFS.makeQualified(new Path("testConfiguration"));
+     Path configRoot = localFS.makeQualified(new Path(testRoot, "dir2"));
+     Path configStoreRoot = new Path(configRoot,
+-                                    SimpleHDFSConfigStore.CONFIG_STORE_NAME);
++                                    SimpleHadoopFilesystemConfigStore.CONFIG_STORE_NAME);
+     Assert.assertTrue(localFS.mkdirs(configStoreRoot));
+     try {
+       Config confConf1 =
+           ConfigFactory.empty().withValue(SimpleHDFSConfigStoreFactory.DEFAULT_STORE_URI_KEY,
+                                           ConfigValueFactory.fromAnyRef(configRoot.toString()));
+-      SimpleHDFSConfigStoreFactory confFactory = new SimpleHDFSConfigStoreFactory(confConf1);
+-      Assert.assertTrue(confFactory.hasDefaultStoreURI());
++      DefaultCapableLocalConfigStoreFactory confFactory = new DefaultCapableLocalConfigStoreFactory(confConf1);
++      Assert.assertNotNull(confFactory.getDefaultStoreURI());
+       Assert.assertEquals(confFactory.getDefaultStoreURI(), configRoot.toUri());
+       Assert.assertEquals(confFactory.getPhysicalScheme(), "file");
+-      Assert.assertEquals(confFactory.getDefaultRootDir().toString(),
+-                          "file:" + System.getProperty("user.home"));
+ 
+       // Valid path
+-      SimpleHDFSConfigStore store1 = confFactory.createConfigStore(new URI("simple-file:/d"));
++      SimpleHadoopFilesystemConfigStore store1 = confFactory.createConfigStore(new URI("default-file:/d"));
+       Assert.assertEquals(store1.getStoreURI().getScheme(), confFactory.getScheme());
+       Assert.assertEquals(store1.getStoreURI().getAuthority(),
+                           confFactory.getDefaultStoreURI().getAuthority());
+@@ -96,11 +94,11 @@ public void testConfiguration() throws Exception {
+           ConfigFactory.empty().withValue(SimpleHDFSConfigStoreFactory.DEFAULT_STORE_URI_KEY,
+                                           ConfigValueFactory.fromAnyRef(testRoot.toString()));
+       try {
+-        new SimpleHDFSConfigStoreFactory(confConf2);
++        new DefaultCapableLocalConfigStoreFactory(confConf2).getDefaultStoreURI();
+         Assert.fail("Exception expected");
+       }
+       catch (IllegalArgumentException e) {
+-        Assert.assertTrue(e.getMessage().contains("Path does not appear to be a config store root"));
++        Assert.assertTrue(e.getMessage().contains("is not a config store."));
+       }
+ 
+       // Empty path
+@@ -108,7 +106,7 @@ public void testConfiguration() throws Exception {
+           ConfigFactory.empty().withValue(SimpleHDFSConfigStoreFactory.DEFAULT_STORE_URI_KEY,
+                                           ConfigValueFactory.fromAnyRef(""));
+       try {
+-        new SimpleHDFSConfigStoreFactory(confConf3);
++        new DefaultCapableLocalConfigStoreFactory(confConf3).getDefaultStoreURI();
+         Assert.fail("Exception expected");
+       }
+       catch (IllegalArgumentException e) {
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-api/src/main/pegasus/gobblin/restli/throttling/Policy.pdsc b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-api/src/main/pegasus/gobblin/restli/throttling/Policy.pdsc
+new file mode 100644
+index 0000000000..cd0bc0fc88
+--- /dev/null
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-api/src/main/pegasus/gobblin/restli/throttling/Policy.pdsc
+@@ -0,0 +1,13 @@
++{
++  "name": "Policy",
++  "type": "record",
++  "namespace": "gobblin.restli.throttling",
++  "doc": "A throttling policy for Gobblin throttling service.",
++  "fields": [
++    {"name": "resource", "type": "string", "doc": "Resource for which this policy applied."},
++    {"name": "policyName", "type": "string", "doc": "The name of the policy."},
++    {"name": "parameters", "type": {"type": "map", "values": "string"}, "doc": "Parameters for this policy."},
++    {"name": "metrics", "type": {"type": "map", "values": "string"}, "doc": "Metrics for this policy."},
++    {"name": "policyDetails", "type": "string", "doc": "Human readable policy details."}
++  ]
++}
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ConfigClientBasedPolicyFactory.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ConfigClientBasedPolicyFactory.java
+index 5c82eed380..562d559f36 100644
+--- a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ConfigClientBasedPolicyFactory.java
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ConfigClientBasedPolicyFactory.java
+@@ -22,6 +22,7 @@
+ 
+ import com.typesafe.config.Config;
+ 
++import gobblin.broker.TTLResourceEntry;
+ import gobblin.broker.iface.SharedResourcesBroker;
+ import gobblin.config.client.ConfigClient;
+ import gobblin.config.client.api.ConfigStoreFactoryDoesNotExistsException;
+@@ -41,7 +42,8 @@
+  */
+ public class ConfigClientBasedPolicyFactory implements ThrottlingPolicyFactory.SpecificPolicyFactory {
+ 
+-  private static final ConfigClient CONFIG_CLIENT = ConfigClient.createConfigClient(VersionStabilityPolicy.READ_FRESHEST);
++  private static final long CONFIG_CLIENT_TTL_IN_MILLIS = 60000;
++  private static TTLResourceEntry<ConfigClient> CONFIG_CLIENT;
+ 
+   public static final String CONFIG_KEY_URI_PREFIX_KEY = "configKeyUriPrefix";
+ 
+@@ -53,7 +55,7 @@ public ThrottlingPolicy createPolicy(SharedLimiterKey key, SharedResourcesBroker
+ 
+     try {
+       Config resourceConfig =
+-          CONFIG_CLIENT.getConfig(new URI(config.getString(CONFIG_KEY_URI_PREFIX_KEY) + key.getResourceLimitedPath()));
++          getConfigClient().getConfig(new URI(config.getString(CONFIG_KEY_URI_PREFIX_KEY) + key.getResourceLimitedPath()));
+ 
+       ThrottlingPolicyFactory.SpecificPolicyFactory factory =
+           ThrottlingPolicyFactory.POLICY_CLASS_RESOLVER.resolveClass(resourceConfig.getString(POLICY_KEY)).newInstance();
+@@ -63,4 +65,12 @@ public ThrottlingPolicy createPolicy(SharedLimiterKey key, SharedResourcesBroker
+       throw new RuntimeException(exc);
+     }
+   }
++
++  private synchronized static ConfigClient getConfigClient() {
++    if (CONFIG_CLIENT == null || !CONFIG_CLIENT.isValid()) {
++      CONFIG_CLIENT = new TTLResourceEntry<>(ConfigClient.createConfigClient(VersionStabilityPolicy.READ_FRESHEST),
++          CONFIG_CLIENT_TTL_IN_MILLIS, false);
++    }
++    return CONFIG_CLIENT.getResource();
++  }
+ }
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/CountBasedPolicy.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/CountBasedPolicy.java
+index c972b5a4ce..6146f07458 100644
+--- a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/CountBasedPolicy.java
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/CountBasedPolicy.java
+@@ -17,7 +17,10 @@
+ 
+ package gobblin.restli.throttling;
+ 
++import java.util.Map;
++
+ import com.google.common.base.Preconditions;
++import com.google.common.collect.ImmutableMap;
+ import com.linkedin.restli.common.HttpStatus;
+ import com.linkedin.restli.server.RestLiServiceException;
+ import com.typesafe.config.Config;
+@@ -79,4 +82,14 @@ public PermitAllocation computePermitAllocation(PermitRequest request) {
+     }
+     return allocation;
+   }
++
++  @Override
++  public Map<String, String> getParameters() {
++    return ImmutableMap.of("maxPermits", Long.toString(this.count));
++  }
++
++  @Override
++  public String getDescription() {
++    return "Count based policy. Max permits: " + this.count;
++  }
+ }
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/NoopPolicy.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/NoopPolicy.java
+index 4dff087fa2..012323af28 100644
+--- a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/NoopPolicy.java
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/NoopPolicy.java
+@@ -17,6 +17,9 @@
+ 
+ package gobblin.restli.throttling;
+ 
++import java.util.Map;
++
++import com.google.common.collect.ImmutableMap;
+ import com.typesafe.config.Config;
+ 
+ import gobblin.annotation.Alias;
+@@ -52,4 +55,14 @@ public PermitAllocation computePermitAllocation(PermitRequest request) {
+ 
+     return allocation;
+   }
++
++  @Override
++  public Map<String, String> getParameters() {
++    return ImmutableMap.of();
++  }
++
++  @Override
++  public String getDescription() {
++    return "Noop policy. Infinite permits available.";
++  }
+ }
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/PoliciesResource.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/PoliciesResource.java
+new file mode 100644
+index 0000000000..ea02fd9dbe
+--- /dev/null
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/PoliciesResource.java
+@@ -0,0 +1,78 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package gobblin.restli.throttling;
++
++import java.util.Map;
++
++import com.codahale.metrics.Meter;
++import com.google.common.collect.ImmutableMap;
++import com.linkedin.data.template.StringMap;
++import com.linkedin.restli.common.HttpStatus;
++import com.linkedin.restli.server.RestLiServiceException;
++import com.linkedin.restli.server.annotations.RestLiCollection;
++import com.linkedin.restli.server.resources.CollectionResourceTemplate;
++
++import gobblin.broker.iface.NotConfiguredException;
++import gobblin.broker.iface.SharedResourcesBroker;
++import gobblin.metrics.MetricContext;
++import gobblin.metrics.broker.MetricContextFactory;
++import gobblin.metrics.broker.SubTaggedMetricContextKey;
++import gobblin.util.limiter.broker.SharedLimiterKey;
++
++import javax.inject.Inject;
++import javax.inject.Named;
++
++import static gobblin.restli.throttling.LimiterServerResource.*;
++
++
++/**
++ * A Rest.li endpoint for getting the {@link ThrottlingPolicy} associated with a resource id.
++ */
++@RestLiCollection(name = "policies", namespace = "gobblin.restli.throttling")
++public class PoliciesResource extends CollectionResourceTemplate<String, Policy> {
++
++  @Inject
++  @Named(BROKER_INJECT_NAME)
++  SharedResourcesBroker broker;
++
++  @Override
++  public Policy get(String resourceId) {
++    try {
++      ThrottlingPolicy throttlingPolicy =
++          (ThrottlingPolicy) this.broker.getSharedResource(new ThrottlingPolicyFactory(), new SharedLimiterKey(resourceId));
++
++      Policy restliPolicy = new Policy();
++      restliPolicy.setPolicyName(throttlingPolicy.getClass().getSimpleName());
++      restliPolicy.setResource(resourceId);
++      restliPolicy.setParameters(new StringMap(throttlingPolicy.getParameters()));
++      restliPolicy.setPolicyDetails(throttlingPolicy.getDescription());
++
++      MetricContext resourceContext = (MetricContext) broker.getSharedResource(new MetricContextFactory(),
++          new SubTaggedMetricContextKey(resourceId, ImmutableMap.of(RESOURCE_ID_TAG, resourceId)));
++      StringMap metrics = new StringMap();
++      for (Map.Entry<String, Meter> meter : resourceContext.getMeters().entrySet()) {
++        metrics.put(meter.getKey(), Double.toString(meter.getValue().getOneMinuteRate()));
++      }
++      restliPolicy.setMetrics(metrics);
++
++      return restliPolicy;
++    } catch (NotConfiguredException nce) {
++      throw new RestLiServiceException(HttpStatus.S_404_NOT_FOUND, "Policy not found for resource " + resourceId);
++    }
++  }
++}
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/QPSPolicy.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/QPSPolicy.java
+index 53feac2db5..56ecd7ffd9 100644
+--- a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/QPSPolicy.java
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/QPSPolicy.java
+@@ -17,8 +17,11 @@
+ 
+ package gobblin.restli.throttling;
+ 
++import java.util.Map;
++
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Preconditions;
++import com.google.common.collect.ImmutableMap;
+ import com.linkedin.data.template.GetMode;
+ import com.typesafe.config.Config;
+ 
+@@ -98,4 +101,14 @@ public PermitAllocation computePermitAllocation(PermitRequest request) {
+     }
+     return allocation;
+   }
++
++  @Override
++  public Map<String, String> getParameters() {
++    return ImmutableMap.of("qps", Long.toString(this.qps));
++  }
++
++  @Override
++  public String getDescription() {
++    return "QPS based policy. QPS: " + this.qps;
++  }
+ }
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicy.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicy.java
+index a0b313937b..6e2bd2bcee 100644
+--- a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicy.java
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicy.java
+@@ -17,6 +17,9 @@
+ 
+ package gobblin.restli.throttling;
+ 
++import java.util.Map;
++
++
+ /**
+  * A throttling policy.
+  */
+@@ -25,4 +28,14 @@ public interface ThrottlingPolicy {
+    * Comput the {@link PermitAllocation} for the given {@link PermitRequest}.
+    */
+   PermitAllocation computePermitAllocation(PermitRequest request);
++
++  /**
++   * @return The parameters this policy is using. Used for description of the policy.
++   */
++  Map<String, String> getParameters();
++
++  /**
++   * @return  A human readable description of the policy.
++   */
++  String getDescription();
+ }
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicyFactory.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicyFactory.java
+index edadfde902..667f00d8e8 100644
+--- a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicyFactory.java
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/main/java/gobblin/restli/throttling/ThrottlingPolicyFactory.java
+@@ -20,6 +20,7 @@
+ import com.typesafe.config.Config;
+ 
+ import gobblin.broker.ResourceInstance;
++import gobblin.broker.TTLResourceEntry;
+ import gobblin.broker.iface.ConfigView;
+ import gobblin.broker.iface.NotConfiguredException;
+ import gobblin.broker.iface.ScopedConfigView;
+@@ -27,6 +28,7 @@
+ import gobblin.broker.iface.SharedResourceFactoryResponse;
+ import gobblin.broker.iface.SharedResourcesBroker;
+ import gobblin.util.ClassAliasResolver;
++import gobblin.util.ConfigUtils;
+ import gobblin.util.limiter.broker.SharedLimiterKey;
+ 
+ 
+@@ -39,6 +41,9 @@ public class ThrottlingPolicyFactory implements SharedResourceFactory<Throttling
+ 
+   public static final String POLICY_KEY = "policy";
+   public static final String FAIL_ON_UNKNOWN_RESOURCE_ID = "faiOnUnknownResourceId";
++  public static final String RELOAD_FREQUENCY_KEY = "reloadFrequencyMillis";
++  public static final long DEFAULT_RELOAD_FREQUENCY = 5 * 60 * 1000L; // 5 minutes
++
+   public static final ClassAliasResolver<SpecificPolicyFactory> POLICY_CLASS_RESOLVER = new
+       ClassAliasResolver<>(SpecificPolicyFactory.class);
+ 
+@@ -57,13 +62,15 @@ public SharedResourceFactoryResponse<ThrottlingPolicy> createResource(SharedReso
+       if (config.hasPath(FAIL_ON_UNKNOWN_RESOURCE_ID) && config.getBoolean(FAIL_ON_UNKNOWN_RESOURCE_ID)) {
+         throw new NotConfiguredException("Missing key " + POLICY_KEY);
+       } else {
+-        return new ResourceInstance<ThrottlingPolicy>(new NoopPolicy());
++        return new TTLResourceEntry<ThrottlingPolicy>(new NoopPolicy(),
++            ConfigUtils.getLong(config, RELOAD_FREQUENCY_KEY, DEFAULT_RELOAD_FREQUENCY), false);
+       }
+     }
+ 
+     try {
+       SpecificPolicyFactory factory = POLICY_CLASS_RESOLVER.resolveClass(config.getString(POLICY_KEY)).newInstance();
+-      return new ResourceInstance<>(factory.createPolicy(configView.getKey(), broker, config));
++      return new TTLResourceEntry<>(factory.createPolicy(configView.getKey(), broker, config),
++          ConfigUtils.getLong(config, RELOAD_FREQUENCY_KEY, DEFAULT_RELOAD_FREQUENCY), false);
+     } catch (ReflectiveOperationException roe) {
+       throw new RuntimeException(roe);
+     }
+@@ -76,6 +83,12 @@ public ThrottlingServerScopes getAutoScope(SharedResourcesBroker<ThrottlingServe
+   }
+ 
+   public interface SpecificPolicyFactory {
++    /**
++     * @param sharedLimiterKey The {@link SharedLimiterKey} for the resource limited.
++     * @param broker The {@link SharedResourcesBroker} used by the throttling server. Can be used to acquire resources
++     *               shared among different threads / policies in the server.
++     * @param config The resource configuration.
++     */
+     ThrottlingPolicy createPolicy(SharedLimiterKey sharedLimiterKey, SharedResourcesBroker<ThrottlingServerScopes> broker, Config config);
+   }
+ 
+diff --git a/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/test/java/gobblin/restli/throttling/PoliciesResourceTest.java b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/test/java/gobblin/restli/throttling/PoliciesResourceTest.java
+new file mode 100644
+index 0000000000..3d8c0b2a04
+--- /dev/null
++++ b/gobblin-restli/gobblin-throttling-service/gobblin-throttling-service-server/src/test/java/gobblin/restli/throttling/PoliciesResourceTest.java
+@@ -0,0 +1,61 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package gobblin.restli.throttling;
++
++import java.util.Map;
++
++import org.testng.Assert;
++import org.testng.annotations.Test;
++
++import com.google.inject.Injector;
++import com.typesafe.config.ConfigFactory;
++
++import gobblin.broker.BrokerConfigurationKeyGenerator;
++import gobblin.util.limiter.broker.SharedLimiterKey;
++
++
++public class PoliciesResourceTest {
++
++  @Test
++  public void test() {
++    ThrottlingGuiceServletConfig guiceServletConfig = new ThrottlingGuiceServletConfig();
++
++    ThrottlingPolicyFactory factory = new ThrottlingPolicyFactory();
++    SharedLimiterKey res1key = new SharedLimiterKey("res1");
++
++    Map<String, String> configMap = avro.shaded.com.google.common.collect.ImmutableMap.<String, String>builder()
++        .put(BrokerConfigurationKeyGenerator.generateKey(factory, res1key, null, ThrottlingPolicyFactory.POLICY_KEY),
++            CountBasedPolicy.FACTORY_ALIAS)
++        .put(BrokerConfigurationKeyGenerator.generateKey(factory, res1key, null, CountBasedPolicy.COUNT_KEY), "100")
++        .build();
++
++    guiceServletConfig.initialize(ConfigFactory.parseMap(configMap));
++    Injector injector = guiceServletConfig.getInjector();
++
++    PoliciesResource policiesResource = injector.getInstance(PoliciesResource.class);
++
++    Policy policy = policiesResource.get("res1");
++
++    Assert.assertEquals(policy.getPolicyName(), CountBasedPolicy.class.getSimpleName());
++    Assert.assertEquals(policy.getResource(), "res1");
++    Assert.assertEquals(policy.getParameters().get("maxPermits"), "100");
++
++    guiceServletConfig.close();
++  }
++
++}
+diff --git a/gobblin-utility/src/main/java/gobblin/broker/DefaultBrokerCache.java b/gobblin-utility/src/main/java/gobblin/broker/DefaultBrokerCache.java
+index 3db62d99d3..c9cacd44ed 100644
+--- a/gobblin-utility/src/main/java/gobblin/broker/DefaultBrokerCache.java
++++ b/gobblin-utility/src/main/java/gobblin/broker/DefaultBrokerCache.java
+@@ -25,6 +25,7 @@
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
++import java.util.concurrent.locks.Lock;
+ 
+ import com.google.common.base.Predicate;
+ import com.google.common.cache.Cache;
+@@ -32,6 +33,7 @@
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Maps;
+ import com.google.common.util.concurrent.Service;
++import com.google.common.util.concurrent.Striped;
+ 
+ import gobblin.broker.iface.ScopeType;
+ import gobblin.broker.iface.SharedResourceFactory;
+@@ -54,10 +56,12 @@
+ 
+   private final Cache<RawJobBrokerKey, Object> sharedResourceCache;
+   private final Cache<RawJobBrokerKey, ScopeWrapper<S>> autoScopeCache;
++  private final Striped<Lock> invalidationLock;
+ 
+   public DefaultBrokerCache() {
+     this.sharedResourceCache = CacheBuilder.newBuilder().build();
+     this.autoScopeCache = CacheBuilder.newBuilder().build();
++    this.invalidationLock = Striped.lazyWeakLock(20);
+   }
+ 
+   /**
+@@ -122,8 +126,12 @@ public Object call() throws Exception {
+         throw new RuntimeException(String.format("%s returned an invalid coordinate: scope %s is not available.",
+             factory.getName(), resourceCoordinate.getScope().name()), nsse);
+       }
+-    } else if (obj instanceof ResourceInstance) {
+-      return ((ResourceInstance<T>) obj).getResource();
++    } else if (obj instanceof ResourceEntry) {
++      if (!((ResourceEntry) obj).isValid()) {
++        safeInvalidate(fullKey);
++        return getScoped(factory, key, scope, broker);
++      }
++      return ((ResourceEntry<T>) obj).getResource();
+     } else {
+       throw new RuntimeException(String.format("Invalid response from %s: %s.", factory.getName(), obj.getClass()));
+     }
+@@ -132,7 +140,22 @@ public Object call() throws Exception {
+   <T, K extends SharedResourceKey> void put(final SharedResourceFactory<T, K, S> factory, @Nonnull final K key,
+       @Nonnull final ScopeWrapper<S> scope, T instance) {
+     RawJobBrokerKey fullKey = new RawJobBrokerKey(scope, factory.getName(), key);
+-    this.sharedResourceCache.put(fullKey, instance);
++    this.sharedResourceCache.put(fullKey, new ResourceInstance<>(instance));
++  }
++
++  private void safeInvalidate(RawJobBrokerKey key) {
++    Lock lock = this.invalidationLock.get(key);
++    lock.lock();
++    try {
++      Object obj = this.sharedResourceCache.getIfPresent(key);
++
++      if (obj != null && obj instanceof ResourceEntry && !((ResourceEntry) obj).isValid()) {
++        this.sharedResourceCache.invalidate(key);
++        ((ResourceEntry) obj).onInvalidate();
++      }
++    } finally {
++      lock.unlock();
++    }
+   }
+ 
+   /**
+@@ -152,15 +175,9 @@ public void close(ScopeWrapper<S> scope)
+       if (entry.getValue() instanceof ResourceInstance) {
+         Object obj = ((ResourceInstance) entry.getValue()).getResource();
+ 
++        SharedResourcesBrokerUtils.shutdownObject(obj, log);
+         if (obj instanceof Service) {
+-          ((Service) obj).stopAsync();
+           awaitShutdown.add((Service) obj);
+-        } else if (obj instanceof Closeable) {
+-          try {
+-            ((Closeable) obj).close();
+-          } catch (IOException ioe) {
+-            log.error("Failed to close {}.", obj);
+-          }
+         }
+       }
+     }
+diff --git a/gobblin-utility/src/main/java/gobblin/broker/EmptyKey.java b/gobblin-utility/src/main/java/gobblin/broker/EmptyKey.java
+index 1348e1f5c6..61c785c2ee 100644
+--- a/gobblin-utility/src/main/java/gobblin/broker/EmptyKey.java
++++ b/gobblin-utility/src/main/java/gobblin/broker/EmptyKey.java
+@@ -19,10 +19,13 @@
+ 
+ import gobblin.broker.iface.SharedResourceKey;
+ 
++import lombok.EqualsAndHashCode;
++
+ 
+ /**
+  * A dummy {@link SharedResourceKey}.
+  */
++@EqualsAndHashCode
+ public final class EmptyKey implements SharedResourceKey {
+   @Override
+   public String toConfigurationKey() {
+diff --git a/gobblin-api/src/main/java/gobblin/broker/ResourceInstance.java b/gobblin-utility/src/main/java/gobblin/broker/ResourceInstance.java
+similarity index 81%
+rename from gobblin-api/src/main/java/gobblin/broker/ResourceInstance.java
+rename to gobblin-utility/src/main/java/gobblin/broker/ResourceInstance.java
+index 1356720567..5df9da058f 100644
+--- a/gobblin-api/src/main/java/gobblin/broker/ResourceInstance.java
++++ b/gobblin-utility/src/main/java/gobblin/broker/ResourceInstance.java
+@@ -25,6 +25,17 @@
+  * A {@link SharedResourceFactoryResponse} that returns a newly created resource instance.
+  */
+ @Data
+-public class ResourceInstance<T> implements SharedResourceFactoryResponse<T> {
++public class ResourceInstance<T> implements ResourceEntry<T> {
+   private final T resource;
++
++  @Override
++  public boolean isValid() {
++    return true;
++  }
++
++  @Override
++  public void onInvalidate() {
++    // this should never happen
++    throw new RuntimeException();
++  }
+ }
+diff --git a/gobblin-utility/src/main/java/gobblin/broker/SharedResourcesBrokerUtils.java b/gobblin-utility/src/main/java/gobblin/broker/SharedResourcesBrokerUtils.java
+index 6f7dcc33be..304c5194d8 100644
+--- a/gobblin-utility/src/main/java/gobblin/broker/SharedResourcesBrokerUtils.java
++++ b/gobblin-utility/src/main/java/gobblin/broker/SharedResourcesBrokerUtils.java
+@@ -17,10 +17,16 @@
+ 
+ package gobblin.broker;
+ 
++import java.io.Closeable;
++import java.io.IOException;
+ import java.util.Collection;
+ import java.util.LinkedList;
+ import java.util.Queue;
+ 
++import org.slf4j.Logger;
++
++import com.google.common.util.concurrent.Service;
++
+ import gobblin.broker.iface.ScopeType;
+ 
+ 
+@@ -65,4 +71,19 @@ static <S extends ScopeType<S>> boolean isScopeAncestor(ScopeWrapper<S> scope, S
+       ancestors.addAll(ancestors.poll().getParentScopes());
+     }
+   }
++
++  /**
++   * Close {@link Closeable}s and shutdown {@link Service}s.
++   */
++  public static void shutdownObject(Object obj, Logger log) {
++    if (obj instanceof Service) {
++      ((Service) obj).stopAsync();
++    } else if (obj instanceof Closeable) {
++      try {
++        ((Closeable) obj).close();
++      } catch (IOException ioe) {
++        log.error("Failed to close {}.", obj);
++      }
++    }
++  }
+ }
+diff --git a/gobblin-utility/src/main/java/gobblin/broker/TTLResourceEntry.java b/gobblin-utility/src/main/java/gobblin/broker/TTLResourceEntry.java
+new file mode 100644
+index 0000000000..0830947ce1
+--- /dev/null
++++ b/gobblin-utility/src/main/java/gobblin/broker/TTLResourceEntry.java
+@@ -0,0 +1,48 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package gobblin.broker;
++
++import lombok.extern.slf4j.Slf4j;
++
++
++/**
++ * A {@link ResourceEntry} that automatically expires after a given number of milliseconds.
++ */
++@Slf4j
++public class TTLResourceEntry<T> extends ResourceInstance<T> {
++  private final long expireAt;
++  private final boolean closeOnInvalidation;
++
++  public TTLResourceEntry(T resource, long millisToLive, boolean closeOnInvalidation) {
++    super(resource);
++    this.expireAt = System.currentTimeMillis() + millisToLive;
++    this.closeOnInvalidation = closeOnInvalidation;
++  }
++
++  @Override
++  public boolean isValid() {
++    return System.currentTimeMillis() < this.expireAt;
++  }
++
++  @Override
++  public void onInvalidate() {
++    if (this.closeOnInvalidation) {
++      SharedResourcesBrokerUtils.shutdownObject(getResource(), log);
++    }
++  }
++}
+diff --git a/gobblin-utility/src/main/java/gobblin/util/ConfigUtils.java b/gobblin-utility/src/main/java/gobblin/util/ConfigUtils.java
+index 98dc5c4419..aedcf0733e 100644
+--- a/gobblin-utility/src/main/java/gobblin/util/ConfigUtils.java
++++ b/gobblin-utility/src/main/java/gobblin/util/ConfigUtils.java
+@@ -114,9 +114,14 @@ public static Properties configToProperties(Config config, String prefix) {
+    * @return the subconfig under key "key" if it exists, otherwise returns an empty config.
+    */
+   public static Config getConfigOrEmpty(Config config, String key) {
+-    if (config.hasPath(key)) {
+-      return config.getConfig(key);
+-    } else {
++    try {
++      if (config.hasPath(key)) {
++        return config.getConfig(key);
++      } else {
++        return ConfigFactory.empty();
++      }
++    } catch (ConfigException.WrongType wrongType) {
++      // path exists, but it is not a subconfig
+       return ConfigFactory.empty();
+     }
+   }
+diff --git a/gobblin-utility/src/test/java/gobblin/broker/DefaultGobblinBrokerTest.java b/gobblin-utility/src/test/java/gobblin/broker/DefaultGobblinBrokerTest.java
+index 095eb3cca8..043cd79c7d 100644
+--- a/gobblin-utility/src/test/java/gobblin/broker/DefaultGobblinBrokerTest.java
++++ b/gobblin-utility/src/test/java/gobblin/broker/DefaultGobblinBrokerTest.java
+@@ -17,6 +17,8 @@
+ 
+ package gobblin.broker;
+ 
++import java.util.Random;
++
+ import org.testng.Assert;
+ import org.testng.annotations.Test;
+ 
+@@ -29,7 +31,16 @@
+ import gobblin.broker.gobblin_scopes.GobblinScopeTypes;
+ import gobblin.broker.gobblin_scopes.JobScopeInstance;
+ import gobblin.broker.gobblin_scopes.TaskScopeInstance;
++import gobblin.broker.iface.ConfigView;
+ import gobblin.broker.iface.NoSuchScopeException;
++import gobblin.broker.iface.NotConfiguredException;
++import gobblin.broker.iface.ScopedConfigView;
++import gobblin.broker.iface.SharedResourceFactory;
++import gobblin.broker.iface.SharedResourceFactoryResponse;
++import gobblin.broker.iface.SharedResourcesBroker;
++
++import lombok.Data;
++import lombok.Getter;
+ 
+ 
+ public class DefaultGobblinBrokerTest {
+@@ -214,4 +225,91 @@ public void testScopedView() throws Exception {
+     }
+ 
+   }
++
++  @Test
++  public void testExplicitBinding() throws Exception {
++    Config config = ConfigFactory.empty();
++
++    SharedResourcesBrokerImpl<SimpleScopeType> topBroker = SharedResourcesBrokerFactory.createDefaultTopLevelBroker(config,
++        SimpleScopeType.GLOBAL.defaultScopeInstance());
++
++    SharedResourceFactory<Long, EmptyKey, SimpleScopeType> factory = new SharedResourceFactory<Long, EmptyKey, SimpleScopeType>() {
++      @Override
++      public String getName() {
++        return "myTestFactory";
++      }
++
++      @Override
++      public SharedResourceFactoryResponse<Long> createResource(SharedResourcesBroker<SimpleScopeType> broker,
++          ScopedConfigView<SimpleScopeType, EmptyKey> config) throws NotConfiguredException {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public SimpleScopeType getAutoScope(SharedResourcesBroker<SimpleScopeType> broker,
++          ConfigView<SimpleScopeType, EmptyKey> config) {
++        return broker.selfScope().getType();
++      }
++    };
++
++    topBroker.bindSharedResourceAtScope(factory, new EmptyKey(), SimpleScopeType.GLOBAL, 10l);
++
++    Assert.assertEquals(topBroker.getSharedResource(factory, new EmptyKey()), new Long(10));
++  }
++
++  @Test
++  public void testExpiringResource() throws Exception {
++    Config config = ConfigFactory.empty();
++
++    SharedResourcesBrokerImpl<SimpleScopeType> topBroker = SharedResourcesBrokerFactory.createDefaultTopLevelBroker(config,
++        SimpleScopeType.GLOBAL.defaultScopeInstance());
++
++
++    InvalidatableResourceFactory factory = new InvalidatableResourceFactory();
++
++    long value = topBroker.getSharedResource(factory, new EmptyKey());
++    Assert.assertEquals(topBroker.getSharedResource(factory, new EmptyKey()), new Long(value));
++
++    factory.getLastResourceEntry().setValid(false);
++
++    Assert.assertNotEquals(topBroker.getSharedResource(factory, new EmptyKey()), value);
++    value = topBroker.getSharedResource(factory, new EmptyKey());
++    Assert.assertEquals(topBroker.getSharedResource(factory, new EmptyKey()), new Long(value));
++  }
++
++  @Data
++  private static class MyResourceEntry<T> implements ResourceEntry<T> {
++    private final T resource;
++    boolean valid = true;
++
++    @Override
++    public void onInvalidate() {
++
++    }
++  }
++
++  private static class InvalidatableResourceFactory implements SharedResourceFactory<Long, EmptyKey, SimpleScopeType> {
++
++    @Getter
++    MyResourceEntry<Long> lastResourceEntry;
++
++    @Override
++    public String getName() {
++      return "myTestFactory";
++    }
++
++    @Override
++    public SharedResourceFactoryResponse<Long> createResource(SharedResourcesBroker<SimpleScopeType> broker,
++        ScopedConfigView<SimpleScopeType, EmptyKey> config) throws NotConfiguredException {
++      MyResourceEntry<Long> resourceEntry = new MyResourceEntry<>(new Random().nextLong());
++      lastResourceEntry = resourceEntry;
++      return resourceEntry;
++    }
++
++    @Override
++    public SimpleScopeType getAutoScope(SharedResourcesBroker<SimpleScopeType> broker,
++        ConfigView<SimpleScopeType, EmptyKey> config) {
++      return broker.selfScope().getType();
++    }
++  }
+ }

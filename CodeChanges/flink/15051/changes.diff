@@ -1,0 +1,1090 @@
+diff --git a/flink-connectors/flink-connector-files/src/test/java/org/apache/flink/connector/file/src/FileSourceHeavyThroughputTest.java b/flink-connectors/flink-connector-files/src/test/java/org/apache/flink/connector/file/src/FileSourceHeavyThroughputTest.java
+index 42cd3ebeefa8c..eb83dca85a922 100644
+--- a/flink-connectors/flink-connector-files/src/test/java/org/apache/flink/connector/file/src/FileSourceHeavyThroughputTest.java
++++ b/flink-connectors/flink-connector-files/src/test/java/org/apache/flink/connector/file/src/FileSourceHeavyThroughputTest.java
+@@ -35,6 +35,8 @@
+ import org.apache.flink.core.io.InputStatus;
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
++import org.apache.flink.util.SimpleUserCodeClassLoader;
++import org.apache.flink.util.UserCodeClassLoader;
+ 
+ import org.junit.After;
+ import org.junit.Test;
+@@ -217,6 +219,11 @@ public void sendSplitRequest() {}
+ 
+         @Override
+         public void sendSourceEventToCoordinator(SourceEvent sourceEvent) {}
++
++        @Override
++        public UserCodeClassLoader getUserCodeClassLoader() {
++            return SimpleUserCodeClassLoader.create(getClass().getClassLoader());
++        }
+     }
+ 
+     private static final class NoOpReaderOutput<E> implements ReaderOutput<E> {
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSource.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSource.java
+index e1c4ec7347f9b..b7dd7185f8983 100644
+--- a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSource.java
++++ b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSource.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.flink.connector.kafka.source;
+ 
++import org.apache.flink.api.common.serialization.DeserializationSchema;
+ import org.apache.flink.api.common.typeinfo.TypeInformation;
+ import org.apache.flink.api.connector.source.Boundedness;
+ import org.apache.flink.api.connector.source.Source;
+@@ -38,10 +39,12 @@
+ import org.apache.flink.connector.kafka.source.reader.KafkaPartitionSplitReader;
+ import org.apache.flink.connector.kafka.source.reader.KafkaRecordEmitter;
+ import org.apache.flink.connector.kafka.source.reader.KafkaSourceReader;
+-import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializer;
++import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
+ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplitSerializer;
+ import org.apache.flink.core.io.SimpleVersionedSerializer;
++import org.apache.flink.metrics.MetricGroup;
++import org.apache.flink.util.UserCodeClassLoader;
+ 
+ import javax.annotation.Nullable;
+ 
+@@ -60,7 +63,7 @@
+  *     .setBootstrapServers(KafkaSourceTestEnv.brokerConnectionStrings)
+  *     .setGroupId("MyGroup")
+  *     .setTopics(Arrays.asList(TOPIC1, TOPIC2))
+- *     .setDeserializer(new TestingKafkaRecordDeserializer())
++ *     .setDeserializer(new TestingKafkaRecordDeserializationSchema())
+  *     .setStartingOffsets(OffsetsInitializer.earliest())
+  *     .build();
+  * }</pre>
+@@ -80,7 +83,7 @@
+     private final OffsetsInitializer stoppingOffsetsInitializer;
+     // Boundedness
+     private final Boundedness boundedness;
+-    private final KafkaRecordDeserializer<OUT> deserializationSchema;
++    private final KafkaRecordDeserializationSchema<OUT> deserializationSchema;
+     // The configurations.
+     private final Properties props;
+ 
+@@ -89,7 +92,7 @@
+             OffsetsInitializer startingOffsetsInitializer,
+             @Nullable OffsetsInitializer stoppingOffsetsInitializer,
+             Boundedness boundedness,
+-            KafkaRecordDeserializer<OUT> deserializationSchema,
++            KafkaRecordDeserializationSchema<OUT> deserializationSchema,
+             Properties props) {
+         this.subscriber = subscriber;
+         this.startingOffsetsInitializer = startingOffsetsInitializer;
+@@ -114,9 +117,23 @@ public Boundedness getBoundedness() {
+     }
+ 
+     @Override
+-    public SourceReader<OUT, KafkaPartitionSplit> createReader(SourceReaderContext readerContext) {
++    public SourceReader<OUT, KafkaPartitionSplit> createReader(SourceReaderContext readerContext)
++            throws Exception {
+         FutureCompletingBlockingQueue<RecordsWithSplitIds<Tuple3<OUT, Long, Long>>> elementsQueue =
+                 new FutureCompletingBlockingQueue<>();
++        deserializationSchema.open(
++                new DeserializationSchema.InitializationContext() {
++                    @Override
++                    public MetricGroup getMetricGroup() {
++                        return readerContext.metricGroup().addGroup("deserializer");
++                    }
++
++                    @Override
++                    public UserCodeClassLoader getUserCodeClassLoader() {
++                        return readerContext.getUserCodeClassLoader();
++                    }
++                });
++
+         Supplier<KafkaPartitionSplitReader<OUT>> splitReaderSupplier =
+                 () ->
+                         new KafkaPartitionSplitReader<>(
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSourceBuilder.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSourceBuilder.java
+index e652c0fc5bf34..73ba67595dc6e 100644
+--- a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSourceBuilder.java
++++ b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/KafkaSourceBuilder.java
+@@ -18,11 +18,12 @@
+ 
+ package org.apache.flink.connector.kafka.source;
+ 
++import org.apache.flink.api.common.serialization.DeserializationSchema;
+ import org.apache.flink.api.connector.source.Boundedness;
+ import org.apache.flink.connector.kafka.source.enumerator.initializer.NoStoppingOffsetsInitializer;
+ import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+ import org.apache.flink.connector.kafka.source.enumerator.subscriber.KafkaSubscriber;
+-import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializer;
++import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+ 
+ import org.apache.kafka.clients.consumer.ConsumerConfig;
+ import org.apache.kafka.common.TopicPartition;
+@@ -54,7 +55,7 @@
+  *     .setBootstrapServers(MY_BOOTSTRAP_SERVERS)
+  *     .setGroupId("myGroup")
+  *     .setTopics(Arrays.asList(TOPIC1, TOPIC2))
+- *     .setDeserializer(KafkaRecordDeserializer.valueOnly(StringDeserializer.class))
++ *     .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(StringDeserializer.class))
+  *     .build();
+  * }</pre>
+  *
+@@ -76,7 +77,7 @@
+  *     .setBootstrapServers(MY_BOOTSTRAP_SERVERS)
+  *     .setGroupId("myGroup")
+  *     .setTopics(Arrays.asList(TOPIC1, TOPIC2))
+- *     .setDeserializer(KafkaRecordDeserializer.valueOnly(StringDeserializer.class))
++ *     .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(StringDeserializer.class))
+  *     .setUnbounded(OffsetsInitializer.latest())
+  *     .build();
+  * }</pre>
+@@ -96,7 +97,7 @@
+     private OffsetsInitializer stoppingOffsetsInitializer;
+     // Boundedness
+     private Boundedness boundedness;
+-    private KafkaRecordDeserializer<OUT> deserializationSchema;
++    private KafkaRecordDeserializationSchema<OUT> deserializationSchema;
+     // The configurations.
+     protected Properties props;
+ 
+@@ -303,7 +304,7 @@ public KafkaSourceBuilder<OUT> setBounded(OffsetsInitializer stoppingOffsetsInit
+     }
+ 
+     /**
+-     * Sets the {@link KafkaRecordDeserializer deserializer} of the {@link
++     * Sets the {@link KafkaRecordDeserializationSchema deserializer} of the {@link
+      * org.apache.kafka.clients.consumer.ConsumerRecord ConsumerRecord} for KafkaSource.
+      *
+      * @param recordDeserializer the deserializer for Kafka {@link
+@@ -311,11 +312,27 @@ public KafkaSourceBuilder<OUT> setBounded(OffsetsInitializer stoppingOffsetsInit
+      * @return this KafkaSourceBuilder.
+      */
+     public KafkaSourceBuilder<OUT> setDeserializer(
+-            KafkaRecordDeserializer<OUT> recordDeserializer) {
++            KafkaRecordDeserializationSchema<OUT> recordDeserializer) {
+         this.deserializationSchema = recordDeserializer;
+         return this;
+     }
+ 
++    /**
++     * Sets the {@link KafkaRecordDeserializationSchema deserializer} of the {@link
++     * org.apache.kafka.clients.consumer.ConsumerRecord ConsumerRecord} for KafkaSource. The given
++     * {@link DeserializationSchema} will be used to deserialize the value of ConsumerRecord. The
++     * other information (e.g. key) in a ConsumerRecord will be ignored.
++     *
++     * @param deserializationSchema the {@link DeserializationSchema} to use for deserialization.
++     * @return this KafkaSourceBuilder.
++     */
++    public KafkaSourceBuilder<OUT> setValueOnlyDeserializer(
++            DeserializationSchema<OUT> deserializationSchema) {
++        this.deserializationSchema =
++                KafkaRecordDeserializationSchema.valueOnly(deserializationSchema);
++        return this;
++    }
++
+     /**
+      * Sets the client id prefix of this KafkaSource.
+      *
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReader.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReader.java
+index c1a827ca1f63c..ee88629effff3 100644
+--- a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReader.java
++++ b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReader.java
+@@ -24,7 +24,7 @@
+ import org.apache.flink.connector.base.source.reader.splitreader.SplitsAddition;
+ import org.apache.flink.connector.base.source.reader.splitreader.SplitsChange;
+ import org.apache.flink.connector.kafka.source.KafkaSourceOptions;
+-import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializer;
++import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
+ import org.apache.flink.util.Collector;
+ import org.apache.flink.util.FlinkRuntimeException;
+@@ -69,14 +69,16 @@
+     private static final long POLL_TIMEOUT = 10000L;
+ 
+     private final KafkaConsumer<byte[], byte[]> consumer;
+-    private final KafkaRecordDeserializer<T> deserializationSchema;
++    private final KafkaRecordDeserializationSchema<T> deserializationSchema;
+     private final Map<TopicPartition, Long> stoppingOffsets;
+     private final SimpleCollector<T> collector;
+     private final String groupId;
+     private final int subtaskId;
+ 
+     public KafkaPartitionSplitReader(
+-            Properties props, KafkaRecordDeserializer<T> deserializationSchema, int subtaskId) {
++            Properties props,
++            KafkaRecordDeserializationSchema<T> deserializationSchema,
++            int subtaskId) {
+         this.subtaskId = subtaskId;
+         Properties consumerProps = new Properties();
+         consumerProps.putAll(props);
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaDeserializationSchemaWrapper.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaDeserializationSchemaWrapper.java
+new file mode 100644
+index 0000000000000..94197e34714af
+--- /dev/null
++++ b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaDeserializationSchemaWrapper.java
+@@ -0,0 +1,65 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.connector.kafka.source.reader.deserializer;
++
++import org.apache.flink.api.common.serialization.DeserializationSchema;
++import org.apache.flink.api.common.typeinfo.TypeInformation;
++import org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema;
++import org.apache.flink.util.Collector;
++
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++
++import java.io.IOException;
++
++/**
++ * A wrapper class that wraps a {@link
++ * org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema} to deserialize {@link
++ * ConsumerRecord ConsumerRecords}.
++ *
++ * @param <T> the type of the deserialized records.
++ */
++class KafkaDeserializationSchemaWrapper<T> implements KafkaRecordDeserializationSchema<T> {
++    private static final long serialVersionUID = 1L;
++    private final KafkaDeserializationSchema<T> kafkaDeserializationSchema;
++
++    KafkaDeserializationSchemaWrapper(KafkaDeserializationSchema<T> kafkaDeserializationSchema) {
++        this.kafkaDeserializationSchema = kafkaDeserializationSchema;
++    }
++
++    @Override
++    public void open(DeserializationSchema.InitializationContext context) throws Exception {
++        kafkaDeserializationSchema.open(context);
++    }
++
++    @Override
++    public void deserialize(ConsumerRecord<byte[], byte[]> message, Collector<T> out)
++            throws IOException {
++        try {
++            kafkaDeserializationSchema.deserialize(message, out);
++        } catch (Exception exception) {
++            throw new IOException(
++                    String.format("Failed to deserialize consumer record %s.", message), exception);
++        }
++    }
++
++    @Override
++    public TypeInformation<T> getProducedType() {
++        return kafkaDeserializationSchema.getProducedType();
++    }
++}
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializationSchema.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializationSchema.java
+new file mode 100644
+index 0000000000000..24410797044c2
+--- /dev/null
++++ b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializationSchema.java
+@@ -0,0 +1,131 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.connector.kafka.source.reader.deserializer;
++
++import org.apache.flink.annotation.PublicEvolving;
++import org.apache.flink.api.common.serialization.DeserializationSchema;
++import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
++import org.apache.flink.streaming.connectors.kafka.KafkaDeserializationSchema;
++import org.apache.flink.util.Collector;
++
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.apache.kafka.common.Configurable;
++import org.apache.kafka.common.serialization.Deserializer;
++
++import java.io.IOException;
++import java.io.Serializable;
++import java.util.Collections;
++import java.util.Map;
++
++/** An interface for the deserialization of Kafka records. */
++public interface KafkaRecordDeserializationSchema<T> extends Serializable, ResultTypeQueryable<T> {
++
++    /**
++     * Initialization method for the schema. It is called before the actual working methods {@link
++     * #deserialize} and thus suitable for one time setup work.
++     *
++     * <p>The provided {@link DeserializationSchema.InitializationContext} can be used to access
++     * additional features such as e.g. registering user metrics.
++     *
++     * @param context Contextual information that can be used during initialization.
++     */
++    @PublicEvolving
++    default void open(DeserializationSchema.InitializationContext context) throws Exception {}
++
++    /**
++     * Deserializes the byte message.
++     *
++     * <p>Can output multiple records through the {@link Collector}. Note that number and size of
++     * the produced records should be relatively small. Depending on the source implementation
++     * records can be buffered in memory or collecting records might delay emitting checkpoint
++     * barrier.
++     *
++     * @param record The ConsumerRecord to deserialize.
++     * @param out The collector to put the resulting messages.
++     */
++    @PublicEvolving
++    void deserialize(ConsumerRecord<byte[], byte[]> record, Collector<T> out) throws IOException;
++
++    /**
++     * Wraps a legacy {@link KafkaDeserializationSchema} as the deserializer of the {@link
++     * ConsumerRecord ConsumerRecords}.
++     *
++     * <p>Note that the {@link KafkaDeserializationSchema#isEndOfStream(Object)} method will no
++     * longer be used to determin the end of the stream.
++     *
++     * @param kafkaDeserializationSchema the legacy {@link KafkaDeserializationSchema} to use.
++     * @param <V> the return type of the deserialized record.
++     * @return A {@link KafkaRecordDeserializationSchema} that uses the given {@link
++     *     KafkaDeserializationSchema} to deserialize the {@link ConsumerRecord ConsumerRecords}.
++     */
++    static <V> KafkaRecordDeserializationSchema<V> of(
++            KafkaDeserializationSchema<V> kafkaDeserializationSchema) {
++        return new KafkaDeserializationSchemaWrapper<>(kafkaDeserializationSchema);
++    }
++
++    /**
++     * Wraps a {@link DeserializationSchema} as the value deserialization schema of the {@link
++     * ConsumerRecord ConsumerRecords}. The other fields such as key, headers, timestamp are
++     * ignored.
++     *
++     * <p>Note that the {@link DeserializationSchema#isEndOfStream(Object)} method will no longer be
++     * used to determine the end of the stream.
++     *
++     * @param valueDeserializationSchema the {@link DeserializationSchema} used to deserialized the
++     *     value of a {@link ConsumerRecord}.
++     * @param <V> the type of the deserialized record.
++     * @return A {@link KafkaRecordDeserializationSchema} that uses the given {@link
++     *     DeserializationSchema} to deserialize a {@link ConsumerRecord} from its value.
++     */
++    static <V> KafkaRecordDeserializationSchema<V> valueOnly(
++            DeserializationSchema<V> valueDeserializationSchema) {
++        return new KafkaValueOnlyDeserializationSchemaWrapper<>(valueDeserializationSchema);
++    }
++
++    /**
++     * Wraps a Kafka {@link Deserializer} to a {@link KafkaRecordDeserializationSchema}.
++     *
++     * @param valueDeserializerClass the deserializer class used to deserialize the value.
++     * @param <V> the value type.
++     * @return A {@link KafkaRecordDeserializationSchema} that deserialize the value with the given
++     *     deserializer.
++     */
++    static <V> KafkaRecordDeserializationSchema<V> valueOnly(
++            Class<? extends Deserializer<V>> valueDeserializerClass) {
++        return new KafkaValueOnlyDeserializerWrapper<>(
++                valueDeserializerClass, Collections.emptyMap());
++    }
++
++    /**
++     * Wraps a Kafka {@link Deserializer} to a {@link KafkaRecordDeserializationSchema}.
++     *
++     * @param valueDeserializerClass the deserializer class used to deserialize the value.
++     * @param config the configuration of the value deserializer, only valid when the deserializer
++     *     is an implementation of {@code Configurable}.
++     * @param <V> the value type.
++     * @param <D> the type of the deserializer.
++     * @return A {@link KafkaRecordDeserializationSchema} that deserialize the value with the given
++     *     deserializer.
++     */
++    static <V, D extends Configurable & Deserializer<V>>
++            KafkaRecordDeserializationSchema<V> valueOnly(
++                    Class<D> valueDeserializerClass, Map<String, String> config) {
++        return new KafkaValueOnlyDeserializerWrapper<>(valueDeserializerClass, config);
++    }
++}
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializer.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializer.java
+deleted file mode 100644
+index 4e9edeb7328d9..0000000000000
+--- a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializer.java
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.flink.connector.kafka.source.reader.deserializer;
+-
+-import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
+-import org.apache.flink.util.Collector;
+-
+-import org.apache.kafka.clients.consumer.ConsumerRecord;
+-import org.apache.kafka.common.Configurable;
+-import org.apache.kafka.common.serialization.Deserializer;
+-
+-import java.io.Serializable;
+-import java.util.Collections;
+-import java.util.Map;
+-
+-/** An interface for the deserialization of Kafka records. */
+-public interface KafkaRecordDeserializer<T> extends Serializable, ResultTypeQueryable<T> {
+-
+-    /**
+-     * Deserialize a consumer record into the given collector.
+-     *
+-     * @param record the {@code ConsumerRecord} to deserialize.
+-     * @throws Exception if the deserialization failed.
+-     */
+-    void deserialize(ConsumerRecord<byte[], byte[]> record, Collector<T> collector)
+-            throws Exception;
+-
+-    /**
+-     * Wraps a Kafka {@link Deserializer} to a {@link KafkaRecordDeserializer}.
+-     *
+-     * @param valueDeserializerClass the deserializer class used to deserialize the value.
+-     * @param <V> the value type.
+-     * @return A {@link KafkaRecordDeserializer} that deserialize the value with the given
+-     *     deserializer.
+-     */
+-    static <V> KafkaRecordDeserializer<V> valueOnly(
+-            Class<? extends Deserializer<V>> valueDeserializerClass) {
+-        return new ValueDeserializerWrapper<>(valueDeserializerClass, Collections.emptyMap());
+-    }
+-
+-    /**
+-     * Wraps a Kafka {@link Deserializer} to a {@link KafkaRecordDeserializer}.
+-     *
+-     * @param valueDeserializerClass the deserializer class used to deserialize the value.
+-     * @param config the configuration of the value deserializer, only valid when the deserializer
+-     *     is an implementation of {@code Configurable}.
+-     * @param <V> the value type.
+-     * @param <D> the type of the deserializer.
+-     * @return A {@link KafkaRecordDeserializer} that deserialize the value with the given
+-     *     deserializer.
+-     */
+-    static <V, D extends Configurable & Deserializer<V>> KafkaRecordDeserializer<V> valueOnly(
+-            Class<D> valueDeserializerClass, Map<String, String> config) {
+-        return new ValueDeserializerWrapper<>(valueDeserializerClass, config);
+-    }
+-}
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaValueOnlyDeserializationSchemaWrapper.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaValueOnlyDeserializationSchemaWrapper.java
+new file mode 100644
+index 0000000000000..209f5e15c2c1f
+--- /dev/null
++++ b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaValueOnlyDeserializationSchemaWrapper.java
+@@ -0,0 +1,58 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.connector.kafka.source.reader.deserializer;
++
++import org.apache.flink.api.common.serialization.DeserializationSchema;
++import org.apache.flink.api.common.typeinfo.TypeInformation;
++import org.apache.flink.util.Collector;
++
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++
++import java.io.IOException;
++
++/**
++ * A class that wraps a {@link DeserializationSchema} as the value deserializer for a {@link
++ * ConsumerRecord}.
++ *
++ * @param <T> the return type of the deserialization.
++ */
++class KafkaValueOnlyDeserializationSchemaWrapper<T> implements KafkaRecordDeserializationSchema<T> {
++    private static final long serialVersionUID = 1L;
++    private final DeserializationSchema<T> deserializationSchema;
++
++    KafkaValueOnlyDeserializationSchemaWrapper(DeserializationSchema<T> deserializationSchema) {
++        this.deserializationSchema = deserializationSchema;
++    }
++
++    @Override
++    public void open(DeserializationSchema.InitializationContext context) throws Exception {
++        deserializationSchema.open(context);
++    }
++
++    @Override
++    public void deserialize(ConsumerRecord<byte[], byte[]> message, Collector<T> out)
++            throws IOException {
++        deserializationSchema.deserialize(message.value(), out);
++    }
++
++    @Override
++    public TypeInformation<T> getProducedType() {
++        return deserializationSchema.getProducedType();
++    }
++}
+diff --git a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/ValueDeserializerWrapper.java b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaValueOnlyDeserializerWrapper.java
+similarity index 72%
+rename from flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/ValueDeserializerWrapper.java
+rename to flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaValueOnlyDeserializerWrapper.java
+index 817cd90785148..0321c4bd68a1a 100644
+--- a/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/ValueDeserializerWrapper.java
++++ b/flink-connectors/flink-connector-kafka/src/main/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaValueOnlyDeserializerWrapper.java
+@@ -18,10 +18,12 @@
+ 
+ package org.apache.flink.connector.kafka.source.reader.deserializer;
+ 
++import org.apache.flink.api.common.serialization.DeserializationSchema;
+ import org.apache.flink.api.common.typeinfo.TypeInformation;
+ import org.apache.flink.api.java.typeutils.TypeExtractor;
+ import org.apache.flink.util.Collector;
+ import org.apache.flink.util.InstantiationUtil;
++import org.apache.flink.util.TemporaryClassLoaderContext;
+ 
+ import org.apache.kafka.clients.consumer.ConsumerRecord;
+ import org.apache.kafka.common.Configurable;
+@@ -29,18 +31,20 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import java.io.IOException;
+ import java.util.Map;
+ 
+ /** A package private class to wrap {@link Deserializer}. */
+-class ValueDeserializerWrapper<T> implements KafkaRecordDeserializer<T> {
++class KafkaValueOnlyDeserializerWrapper<T> implements KafkaRecordDeserializationSchema<T> {
+     private static final long serialVersionUID = 5409547407386004054L;
+-    private static final Logger LOG = LoggerFactory.getLogger(ValueDeserializerWrapper.class);
++    private static final Logger LOG =
++            LoggerFactory.getLogger(KafkaValueOnlyDeserializerWrapper.class);
+     private final String deserializerClass;
+     private final Map<String, String> config;
+ 
+     private transient Deserializer<T> deserializer;
+ 
+-    ValueDeserializerWrapper(
++    KafkaValueOnlyDeserializerWrapper(
+             Class<? extends Deserializer<T>> deserializerClass, Map<String, String> config) {
+         this.deserializerClass = deserializerClass.getName();
+         this.config = config;
+@@ -48,9 +52,10 @@
+ 
+     @Override
+     @SuppressWarnings("unchecked")
+-    public void deserialize(ConsumerRecord<byte[], byte[]> record, Collector<T> collector)
+-            throws Exception {
+-        if (deserializer == null) {
++    public void open(DeserializationSchema.InitializationContext context) throws Exception {
++        ClassLoader userCodeClassLoader = context.getUserCodeClassLoader().asClassLoader();
++        try (TemporaryClassLoaderContext ignored =
++                TemporaryClassLoaderContext.of(userCodeClassLoader)) {
+             deserializer =
+                     (Deserializer<T>)
+                             InstantiationUtil.instantiate(
+@@ -60,6 +65,19 @@ public void deserialize(ConsumerRecord<byte[], byte[]> record, Collector<T> coll
+             if (deserializer instanceof Configurable) {
+                 ((Configurable) deserializer).configure(config);
+             }
++        } catch (Exception e) {
++            throw new IOException(
++                    "Failed to instantiate the deserializer of class " + deserializerClass, e);
++        }
++    }
++
++    @Override
++    public void deserialize(ConsumerRecord<byte[], byte[]> record, Collector<T> collector)
++            throws IOException {
++        if (deserializer == null) {
++            throw new IllegalStateException(
++                    "The deserializer has not been created. Make sure the open() method has been "
++                            + "invoked.");
+         }
+ 
+         T value = deserializer.deserialize(record.topic(), record.value());
+diff --git a/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/KafkaSourceITCase.java b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/KafkaSourceITCase.java
+index 335d053c454d0..40fe4a8027d03 100644
+--- a/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/KafkaSourceITCase.java
++++ b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/KafkaSourceITCase.java
+@@ -23,7 +23,7 @@
+ import org.apache.flink.api.common.typeinfo.TypeInformation;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+-import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializer;
++import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+ import org.apache.flink.streaming.api.datastream.DataStream;
+ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+ import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
+@@ -37,6 +37,7 @@
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
++import java.io.IOException;
+ import java.io.Serializable;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -70,7 +71,7 @@ public void testBasicRead() throws Exception {
+                         .setBootstrapServers(KafkaSourceTestEnv.brokerConnectionStrings)
+                         .setGroupId("testBasicRead")
+                         .setTopics(Arrays.asList(TOPIC1, TOPIC2))
+-                        .setDeserializer(new TestingKafkaRecordDeserializer())
++                        .setDeserializer(new TestingKafkaRecordDeserializationSchema())
+                         .setStartingOffsets(OffsetsInitializer.earliest())
+                         .setBounded(OffsetsInitializer.latest())
+                         .build();
+@@ -95,15 +96,15 @@ private PartitionAndValue(TopicPartition tp, int value) {
+         }
+     }
+ 
+-    private static class TestingKafkaRecordDeserializer
+-            implements KafkaRecordDeserializer<PartitionAndValue> {
++    private static class TestingKafkaRecordDeserializationSchema
++            implements KafkaRecordDeserializationSchema<PartitionAndValue> {
+         private static final long serialVersionUID = -3765473065594331694L;
+         private transient Deserializer<Integer> deserializer;
+ 
+         @Override
+         public void deserialize(
+                 ConsumerRecord<byte[], byte[]> record, Collector<PartitionAndValue> collector)
+-                throws Exception {
++                throws IOException {
+             if (deserializer == null) {
+                 deserializer = new IntegerDeserializer();
+             }
+diff --git a/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReaderTest.java b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReaderTest.java
+index 56f6594982470..e0f011d06c052 100644
+--- a/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReaderTest.java
++++ b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReaderTest.java
+@@ -23,8 +23,9 @@
+ import org.apache.flink.connector.base.source.reader.splitreader.SplitsAddition;
+ import org.apache.flink.connector.base.source.reader.splitreader.SplitsChange;
+ import org.apache.flink.connector.kafka.source.KafkaSourceTestEnv;
+-import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializer;
++import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
++import org.apache.flink.connector.testutils.source.deserialization.TestingDeserializationContext;
+ 
+ import org.apache.kafka.clients.consumer.ConsumerConfig;
+ import org.apache.kafka.common.TopicPartition;
+@@ -77,14 +78,14 @@ public static void tearDown() throws Exception {
+     }
+ 
+     @Test
+-    public void testHandleSplitChangesAndFetch() throws IOException {
++    public void testHandleSplitChangesAndFetch() throws Exception {
+         KafkaPartitionSplitReader<Integer> reader = createReader();
+         assignSplitsAndFetchUntilFinish(reader, 0);
+         assignSplitsAndFetchUntilFinish(reader, 1);
+     }
+ 
+     @Test
+-    public void testWakeUp() throws InterruptedException {
++    public void testWakeUp() throws Exception {
+         KafkaPartitionSplitReader<Integer> reader = createReader();
+         TopicPartition nonExistingTopicPartition = new TopicPartition("NotExist", 0);
+         assignSplits(
+@@ -170,12 +171,14 @@ private void assignSplitsAndFetchUntilFinish(
+ 
+     // ------------------
+ 
+-    private KafkaPartitionSplitReader<Integer> createReader() {
++    private KafkaPartitionSplitReader<Integer> createReader() throws Exception {
+         Properties props = new Properties();
+         props.putAll(KafkaSourceTestEnv.getConsumerProperties(ByteArrayDeserializer.class));
+         props.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
+-        return new KafkaPartitionSplitReader<>(
+-                props, KafkaRecordDeserializer.valueOnly(IntegerDeserializer.class), 0);
++        KafkaRecordDeserializationSchema<Integer> deserializationSchema =
++                KafkaRecordDeserializationSchema.valueOnly(IntegerDeserializer.class);
++        deserializationSchema.open(new TestingDeserializationContext());
++        return new KafkaPartitionSplitReader<>(props, deserializationSchema, 0);
+     }
+ 
+     private Map<String, KafkaPartitionSplit> assignSplits(
+diff --git a/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaSourceReaderTest.java b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaSourceReaderTest.java
+index 8b5447d508d8e..6366d40de769c 100644
+--- a/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaSourceReaderTest.java
++++ b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/KafkaSourceReaderTest.java
+@@ -25,7 +25,7 @@
+ import org.apache.flink.connector.kafka.source.KafkaSourceBuilder;
+ import org.apache.flink.connector.kafka.source.KafkaSourceTestEnv;
+ import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+-import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializer;
++import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
+ import org.apache.flink.connector.testutils.source.reader.SourceReaderTestBase;
+ import org.apache.flink.connector.testutils.source.reader.TestingReaderContext;
+@@ -210,7 +210,7 @@ public void testOffsetCommitOnCheckpointComplete() throws Exception {
+     // ------------------------------------------
+ 
+     @Override
+-    protected SourceReader<Integer, KafkaPartitionSplit> createReader() {
++    protected SourceReader<Integer, KafkaPartitionSplit> createReader() throws Exception {
+         return createReader(Boundedness.BOUNDED, "KafkaSourceReaderTestGroup");
+     }
+ 
+@@ -218,7 +218,7 @@ protected SourceReader<Integer, KafkaPartitionSplit> createReader() {
+     protected List<KafkaPartitionSplit> getSplits(
+             int numSplits, int numRecordsPerSplit, Boundedness boundedness) {
+         List<KafkaPartitionSplit> splits = new ArrayList<>();
+-        for (int i = 0; i < numRecordsPerSplit; i++) {
++        for (int i = 0; i < numSplits; i++) {
+             splits.add(getSplit(i, numRecordsPerSplit, boundedness));
+         }
+         return splits;
+@@ -241,12 +241,13 @@ protected long getNextRecordIndex(KafkaPartitionSplit split) {
+     // ---------------------
+ 
+     private SourceReader<Integer, KafkaPartitionSplit> createReader(
+-            Boundedness boundedness, String groupId) {
++            Boundedness boundedness, String groupId) throws Exception {
+         KafkaSourceBuilder<Integer> builder =
+                 KafkaSource.<Integer>builder()
+                         .setClientIdPrefix("KafkaSourceReaderTest")
+                         .setDeserializer(
+-                                KafkaRecordDeserializer.valueOnly(IntegerDeserializer.class))
++                                KafkaRecordDeserializationSchema.valueOnly(
++                                        IntegerDeserializer.class))
+                         .setPartitions(Collections.singleton(new TopicPartition("AnyTopic", 0)))
+                         .setProperty(
+                                 ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
+diff --git a/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializationSchemaTest.java b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializationSchemaTest.java
+new file mode 100644
+index 0000000000000..adbe33496018d
+--- /dev/null
++++ b/flink-connectors/flink-connector-kafka/src/test/java/org/apache/flink/connector/kafka/source/reader/deserializer/KafkaRecordDeserializationSchemaTest.java
+@@ -0,0 +1,123 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.connector.kafka.source.reader.deserializer;
++
++import org.apache.flink.connector.testutils.source.deserialization.TestingDeserializationContext;
++import org.apache.flink.formats.json.JsonNodeDeserializationSchema;
++import org.apache.flink.streaming.util.serialization.JSONKeyValueDeserializationSchema;
++import org.apache.flink.util.Collector;
++
++import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
++import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
++import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.node.ObjectNode;
++
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.apache.kafka.common.serialization.StringDeserializer;
++import org.apache.kafka.common.serialization.StringSerializer;
++import org.junit.Test;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++
++/** Unit tests for KafkaRecordDeserializationSchema. */
++public class KafkaRecordDeserializationSchemaTest {
++
++    @Test
++    public void testKafkaDeserializationSchemaWrapper() throws IOException {
++        final ConsumerRecord<byte[], byte[]> consumerRecord = getConsumerRecord();
++        KafkaRecordDeserializationSchema<ObjectNode> schema =
++                KafkaRecordDeserializationSchema.of(new JSONKeyValueDeserializationSchema(true));
++        SimpleCollector<ObjectNode> collector = new SimpleCollector<>();
++        schema.deserialize(consumerRecord, collector);
++
++        assertEquals(1, collector.list.size());
++        ObjectNode deserializedValue = collector.list.get(0);
++
++        assertEquals(4, deserializedValue.get("key").get("index").asInt());
++        assertEquals("world", deserializedValue.get("value").get("word").asText());
++        assertEquals("topic#1", deserializedValue.get("metadata").get("topic").asText());
++        assertEquals(4, deserializedValue.get("metadata").get("offset").asInt());
++        assertEquals(3, deserializedValue.get("metadata").get("partition").asInt());
++    }
++
++    @Test
++    public void testKafkaValueDeserializationSchemaWrapper() throws IOException {
++        final ConsumerRecord<byte[], byte[]> consumerRecord = getConsumerRecord();
++        KafkaRecordDeserializationSchema<ObjectNode> schema =
++                KafkaRecordDeserializationSchema.valueOnly(new JsonNodeDeserializationSchema());
++        SimpleCollector<ObjectNode> collector = new SimpleCollector<>();
++        schema.deserialize(consumerRecord, collector);
++
++        assertEquals(1, collector.list.size());
++        ObjectNode deserializedValue = collector.list.get(0);
++
++        assertEquals("world", deserializedValue.get("word").asText());
++        assertNull(deserializedValue.get("key"));
++        assertNull(deserializedValue.get("metadata"));
++    }
++
++    @Test
++    public void testKafkaValueDeserializerWrapper() throws Exception {
++        final String topic = "Topic";
++        byte[] value = new StringSerializer().serialize(topic, "world");
++        final ConsumerRecord<byte[], byte[]> consumerRecord =
++                new ConsumerRecord<>(topic, 0, 0L, null, value);
++        KafkaRecordDeserializationSchema<String> schema =
++                KafkaRecordDeserializationSchema.valueOnly(StringDeserializer.class);
++        schema.open(new TestingDeserializationContext());
++
++        SimpleCollector<String> collector = new SimpleCollector<>();
++        schema.deserialize(consumerRecord, collector);
++
++        assertEquals(1, collector.list.size());
++        assertEquals("world", collector.list.get(0));
++    }
++
++    private ConsumerRecord<byte[], byte[]> getConsumerRecord() throws JsonProcessingException {
++        ObjectMapper mapper = new ObjectMapper();
++        ObjectNode initialKey = mapper.createObjectNode();
++        initialKey.put("index", 4);
++        byte[] serializedKey = mapper.writeValueAsBytes(initialKey);
++
++        ObjectNode initialValue = mapper.createObjectNode();
++        initialValue.put("word", "world");
++        byte[] serializedValue = mapper.writeValueAsBytes(initialValue);
++
++        return new ConsumerRecord<>("topic#1", 3, 4L, serializedKey, serializedValue);
++    }
++
++    private static class SimpleCollector<T> implements Collector<T> {
++
++        private final List<T> list = new ArrayList<>();
++
++        @Override
++        public void collect(T record) {
++            list.add(record);
++        }
++
++        @Override
++        public void close() {
++            // do nothing
++        }
++    }
++}
+diff --git a/flink-core/src/main/java/org/apache/flink/api/connector/source/SourceReaderContext.java b/flink-core/src/main/java/org/apache/flink/api/connector/source/SourceReaderContext.java
+index 210ec9670a0af..3afb70571d63e 100644
+--- a/flink-core/src/main/java/org/apache/flink/api/connector/source/SourceReaderContext.java
++++ b/flink-core/src/main/java/org/apache/flink/api/connector/source/SourceReaderContext.java
+@@ -21,6 +21,7 @@
+ import org.apache.flink.annotation.PublicEvolving;
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.metrics.MetricGroup;
++import org.apache.flink.util.UserCodeClassLoader;
+ 
+ /** The class that expose some context from runtime to the {@link SourceReader}. */
+ @PublicEvolving
+@@ -54,4 +55,12 @@ public interface SourceReaderContext {
+      * @param sourceEvent the source event to coordinator.
+      */
+     void sendSourceEventToCoordinator(SourceEvent sourceEvent);
++
++    /**
++     * Gets the {@link UserCodeClassLoader} to load classes that are not in system's classpath, but
++     * are part of the jar file of a user job.
++     *
++     * @see UserCodeClassLoader
++     */
++    UserCodeClassLoader getUserCodeClassLoader();
+ }
+diff --git a/flink-core/src/test/java/org/apache/flink/api/connector/source/lib/NumberSequenceSourceTest.java b/flink-core/src/test/java/org/apache/flink/api/connector/source/lib/NumberSequenceSourceTest.java
+index c14dcbc8d5af5..f497150aa3e93 100644
+--- a/flink-core/src/test/java/org/apache/flink/api/connector/source/lib/NumberSequenceSourceTest.java
++++ b/flink-core/src/test/java/org/apache/flink/api/connector/source/lib/NumberSequenceSourceTest.java
+@@ -28,6 +28,8 @@
+ import org.apache.flink.core.io.InputStatus;
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
++import org.apache.flink.util.SimpleUserCodeClassLoader;
++import org.apache.flink.util.UserCodeClassLoader;
+ 
+ import org.junit.Test;
+ 
+@@ -132,6 +134,11 @@ public void sendSplitRequest() {}
+ 
+         @Override
+         public void sendSourceEventToCoordinator(SourceEvent sourceEvent) {}
++
++        @Override
++        public UserCodeClassLoader getUserCodeClassLoader() {
++            return SimpleUserCodeClassLoader.create(getClass().getClassLoader());
++        }
+     }
+ 
+     private static final class TestingReaderOutput<E> implements ReaderOutput<E> {
+diff --git a/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/operators/SourceOperator.java b/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/operators/SourceOperator.java
+index e0ea3889309d6..835ad5a764339 100644
+--- a/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/operators/SourceOperator.java
++++ b/flink-streaming-java/src/main/java/org/apache/flink/streaming/api/operators/SourceOperator.java
+@@ -48,6 +48,7 @@
+ import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
+ import org.apache.flink.util.CollectionUtil;
+ import org.apache.flink.util.FlinkRuntimeException;
++import org.apache.flink.util.UserCodeClassLoader;
+ import org.apache.flink.util.function.FunctionWithException;
+ 
+ import java.io.IOException;
+@@ -204,6 +205,24 @@ public void sendSplitRequest() {
+                     public void sendSourceEventToCoordinator(SourceEvent event) {
+                         operatorEventGateway.sendEventToCoordinator(new SourceEventWrapper(event));
+                     }
++
++                    @Override
++                    public UserCodeClassLoader getUserCodeClassLoader() {
++                        return new UserCodeClassLoader() {
++                            @Override
++                            public ClassLoader asClassLoader() {
++                                return getRuntimeContext().getUserCodeClassLoader();
++                            }
++
++                            @Override
++                            public void registerReleaseHookIfAbsent(
++                                    String releaseHookName, Runnable releaseHook) {
++                                getRuntimeContext()
++                                        .registerUserCodeClassLoaderReleaseHookIfAbsent(
++                                                releaseHookName, releaseHook);
++                            }
++                        };
++                    }
+                 };
+ 
+         sourceReader = readerFactory.apply(context);
+diff --git a/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/deserialization/TestingDeserializationContext.java b/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/deserialization/TestingDeserializationContext.java
+new file mode 100644
+index 0000000000000..7192759e03376
+--- /dev/null
++++ b/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/deserialization/TestingDeserializationContext.java
+@@ -0,0 +1,38 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.connector.testutils.source.deserialization;
++
++import org.apache.flink.api.common.serialization.DeserializationSchema;
++import org.apache.flink.metrics.MetricGroup;
++import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
++import org.apache.flink.util.SimpleUserCodeClassLoader;
++import org.apache.flink.util.UserCodeClassLoader;
++
++/** An implementation of {@link DeserializationSchema.InitializationContext} for test. */
++public class TestingDeserializationContext implements DeserializationSchema.InitializationContext {
++    @Override
++    public MetricGroup getMetricGroup() {
++        return new UnregisteredMetricsGroup();
++    }
++
++    @Override
++    public UserCodeClassLoader getUserCodeClassLoader() {
++        return SimpleUserCodeClassLoader.create(getClass().getClassLoader());
++    }
++}
+diff --git a/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/SourceReaderTestBase.java b/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/SourceReaderTestBase.java
+index 6f3aecb370b99..0e6751cb20f81 100644
+--- a/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/SourceReaderTestBase.java
++++ b/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/SourceReaderTestBase.java
+@@ -152,7 +152,7 @@ public void testSnapshot() throws Exception {
+ 
+     // ---------------- helper methods -----------------
+ 
+-    protected abstract SourceReader<Integer, SplitT> createReader();
++    protected abstract SourceReader<Integer, SplitT> createReader() throws Exception;
+ 
+     protected abstract List<SplitT> getSplits(
+             int numSplits, int numRecordsPerSplit, Boundedness boundedness);
+diff --git a/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/TestingReaderContext.java b/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/TestingReaderContext.java
+index 85ac568c0ac64..50b48b2ebda49 100644
+--- a/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/TestingReaderContext.java
++++ b/flink-test-utils-parent/flink-connector-test-utils/src/main/java/org/apache/flink/connector/testutils/source/reader/TestingReaderContext.java
+@@ -23,6 +23,8 @@
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.metrics.MetricGroup;
+ import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
++import org.apache.flink.util.SimpleUserCodeClassLoader;
++import org.apache.flink.util.UserCodeClassLoader;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -78,6 +80,11 @@ public void sendSourceEventToCoordinator(SourceEvent sourceEvent) {
+         sentEvents.add(sourceEvent);
+     }
+ 
++    @Override
++    public UserCodeClassLoader getUserCodeClassLoader() {
++        return SimpleUserCodeClassLoader.create(getClass().getClassLoader());
++    }
++
+     // ------------------------------------------------------------------------
+ 
+     public int getNumSplitRequests() {

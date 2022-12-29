@@ -1,0 +1,1565 @@
+diff --git a/flink-table/flink-sql-parser/src/main/java/org/apache/flink/sql/parser/ddl/SqlAlterFunction.java b/flink-table/flink-sql-parser/src/main/java/org/apache/flink/sql/parser/ddl/SqlAlterFunction.java
+index d823659e060f4..c51054186b57a 100644
+--- a/flink-table/flink-sql-parser/src/main/java/org/apache/flink/sql/parser/ddl/SqlAlterFunction.java
++++ b/flink-table/flink-sql-parser/src/main/java/org/apache/flink/sql/parser/ddl/SqlAlterFunction.java
+@@ -40,7 +40,7 @@
+  */
+ public class SqlAlterFunction extends SqlCall {
+ 
+-	public static final SqlSpecialOperator OPERATOR = new SqlSpecialOperator("ALTER FUNCTION", SqlKind.OTHER);
++	public static final SqlSpecialOperator OPERATOR = new SqlSpecialOperator("ALTER FUNCTION", SqlKind.OTHER_DDL);
+ 
+ 	private final SqlIdentifier functionIdentifier;
+ 
+@@ -106,10 +106,18 @@ public List<SqlNode> getOperandList() {
+ 		return ImmutableNullableList.of(functionIdentifier, functionClassName);
+ 	}
+ 
+-	public String getLanguage() {
++	public String getFunctionLanguage() {
+ 		return functionLanguage;
+ 	}
+ 
++	public SqlCharStringLiteral getFunctionClassName() {
++		return this.functionClassName;
++	}
++
++	public boolean isIfExists() {
++		return this.ifExists;
++	}
++
+ 	public String[] getFunctionIdentifier() {
+ 		return functionIdentifier.names.toArray(new String[0]);
+ 	}
+diff --git a/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/api/internal/TableEnvironmentImpl.java b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/api/internal/TableEnvironmentImpl.java
+index 9ee27a3ff378e..2a48fb83fd8b6 100644
+--- a/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/api/internal/TableEnvironmentImpl.java
++++ b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/api/internal/TableEnvironmentImpl.java
+@@ -42,6 +42,8 @@
+ import org.apache.flink.table.catalog.exceptions.DatabaseAlreadyExistException;
+ import org.apache.flink.table.catalog.exceptions.DatabaseNotEmptyException;
+ import org.apache.flink.table.catalog.exceptions.DatabaseNotExistException;
++import org.apache.flink.table.catalog.exceptions.FunctionAlreadyExistException;
++import org.apache.flink.table.catalog.exceptions.FunctionNotExistException;
+ import org.apache.flink.table.delegation.Executor;
+ import org.apache.flink.table.delegation.ExecutorFactory;
+ import org.apache.flink.table.delegation.Parser;
+@@ -64,9 +66,12 @@
+ import org.apache.flink.table.operations.UseCatalogOperation;
+ import org.apache.flink.table.operations.UseDatabaseOperation;
+ import org.apache.flink.table.operations.ddl.AlterDatabaseOperation;
++import org.apache.flink.table.operations.ddl.AlterFunctionOperation;
+ import org.apache.flink.table.operations.ddl.CreateDatabaseOperation;
++import org.apache.flink.table.operations.ddl.CreateFunctionOperation;
+ import org.apache.flink.table.operations.ddl.CreateTableOperation;
+ import org.apache.flink.table.operations.ddl.DropDatabaseOperation;
++import org.apache.flink.table.operations.ddl.DropFunctionOperation;
+ import org.apache.flink.table.operations.ddl.DropTableOperation;
+ import org.apache.flink.table.operations.utils.OperationTreeBuilder;
+ import org.apache.flink.table.sinks.TableSink;
+@@ -104,7 +109,8 @@ public class TableEnvironmentImpl implements TableEnvironment {
+ 	private static final String UNSUPPORTED_QUERY_IN_SQL_UPDATE_MSG =
+ 			"Unsupported SQL query! sqlUpdate() only accepts a single SQL statement of type " +
+ 			"INSERT, CREATE TABLE, DROP TABLE, USE CATALOG, USE [CATALOG.]DATABASE, " +
+-			"CREATE DATABASE, DROP DATABASE, ALTER DATABASE";
++			"CREATE DATABASE, DROP DATABASE, ALTER DATABASE, CREATE FUNCTION, " +
++			"DROP FUNCTION, ALTER FUNCTION";
+ 
+ 	/**
+ 	 * Provides necessary methods for {@link ConnectTableDescriptor}.
+@@ -525,6 +531,15 @@ public void sqlUpdate(String stmt) {
+ 			} catch (Exception e) {
+ 				throw new TableException(exMsg, e);
+ 			}
++		} else if (operation instanceof CreateFunctionOperation) {
++			CreateFunctionOperation createFunctionOperation = (CreateFunctionOperation) operation;
++			createCatalogFunction(createFunctionOperation);
++		} else if (operation instanceof AlterFunctionOperation) {
++			AlterFunctionOperation alterFunctionOperation = (AlterFunctionOperation) operation;
++			alterCatalogFunction(alterFunctionOperation);
++		} else if (operation instanceof DropFunctionOperation) {
++			DropFunctionOperation dropFunctionOperation = (DropFunctionOperation) operation;
++			dropCatalogFunction(dropFunctionOperation);
+ 		} else if (operation instanceof UseCatalogOperation) {
+ 			UseCatalogOperation useCatalogOperation = (UseCatalogOperation) operation;
+ 			catalogManager.setCurrentCatalog(useCatalogOperation.getCatalogName());
+@@ -540,11 +555,11 @@ public void sqlUpdate(String stmt) {
+ 	/** Get catalog from catalogName or throw a ValidationException if the catalog not exists. */
+ 	private Catalog getCatalogOrThrowException(String catalogName) {
+ 		return getCatalog(catalogName)
+-				.orElseThrow(() -> new ValidationException(String.format("Catalog %s does not exist.", catalogName)));
++				.orElseThrow(() -> new ValidationException(String.format("Catalog %s does not exist", catalogName)));
+ 	}
+ 
+ 	private String getDDLOpExecuteErrorMsg(String action) {
+-		return String.format("Could not execute %s ", action);
++		return String.format("Could not execute %s", action);
+ 	}
+ 
+ 	@Override
+@@ -685,6 +700,50 @@ private Optional<CatalogBaseTable> getTemporaryTable(ObjectIdentifier identifier
+ 			.map(CatalogManager.TableLookupResult::getTable);
+ 	}
+ 
++	private void createCatalogFunction(CreateFunctionOperation createFunctionOperation) {
++		Catalog catalog = getCatalogOrThrowException(createFunctionOperation.getFunctionIdentifier().getCatalogName());
++		String exMsg = getDDLOpExecuteErrorMsg(createFunctionOperation.asSummaryString());
++		try {
++			catalog.createFunction(
++				createFunctionOperation.getFunctionIdentifier().toObjectPath(),
++				createFunctionOperation.getCatalogFunction(),
++				createFunctionOperation.isIgnoreIfExists());
++		} catch (FunctionAlreadyExistException e) {
++			throw new ValidationException(exMsg, e);
++		} catch (Exception e) {
++			throw new TableException(exMsg, e);
++		}
++	}
++
++	private void alterCatalogFunction(AlterFunctionOperation alterFunctionOperation) {
++		Catalog catalog = getCatalogOrThrowException(alterFunctionOperation.getFunctionIdentifier().getCatalogName());
++		String exMsg = getDDLOpExecuteErrorMsg(alterFunctionOperation.asSummaryString());
++		try {
++			catalog.alterFunction(
++				alterFunctionOperation.getFunctionIdentifier().toObjectPath(),
++				alterFunctionOperation.getCatalogFunction(),
++				alterFunctionOperation.isIfExists());
++		} catch (FunctionNotExistException e) {
++			throw new ValidationException(exMsg, e);
++		} catch (Exception e) {
++			throw new TableException(exMsg, e);
++		}
++	}
++
++	private void dropCatalogFunction(DropFunctionOperation dropFunctionOperation) {
++		Catalog catalog = getCatalogOrThrowException(dropFunctionOperation.getFunctionIdentifier().getCatalogName());
++		String exMsg = getDDLOpExecuteErrorMsg(dropFunctionOperation.asSummaryString());
++		try {
++			catalog.dropFunction(
++				dropFunctionOperation.getFunctionIdentifier().toObjectPath(),
++				dropFunctionOperation.isIfExists());
++		} catch (FunctionNotExistException e) {
++			throw new ValidationException(exMsg, e);
++		} catch (Exception e) {
++			throw new TableException(exMsg, e);
++		}
++	}
++
+ 	protected TableImpl createTable(QueryOperation tableOperation) {
+ 		return TableImpl.createTable(
+ 			this,
+diff --git a/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/AlterFunctionOperation.java b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/AlterFunctionOperation.java
+new file mode 100644
+index 0000000000000..7d4925bc1909d
+--- /dev/null
++++ b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/AlterFunctionOperation.java
+@@ -0,0 +1,72 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.operations.ddl;
++
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.catalog.ObjectIdentifier;
++import org.apache.flink.table.operations.Operation;
++import org.apache.flink.table.operations.OperationUtils;
++
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * Operation to describe a ALTER FUNCTION statement.
++ */
++public class AlterFunctionOperation implements AlterOperation  {
++	private final ObjectIdentifier functionIdentifier;
++	private CatalogFunction catalogFunction;
++	private boolean ifExists;
++
++	public AlterFunctionOperation(
++			ObjectIdentifier functionIdentifier,
++			CatalogFunction catalogFunction,
++			boolean ifExists) {
++		this.functionIdentifier = functionIdentifier;
++		this.catalogFunction = catalogFunction;
++		this.ifExists = ifExists;
++	}
++
++	public CatalogFunction getCatalogFunction() {
++		return this.catalogFunction;
++	}
++
++	public ObjectIdentifier getFunctionIdentifier() {
++		return this.functionIdentifier;
++	}
++
++	public boolean isIfExists() {
++		return this.ifExists;
++	}
++
++	@Override
++	public String asSummaryString() {
++		Map<String, Object> params = new LinkedHashMap<>();
++		params.put("catalogFunction", catalogFunction.getDetailedDescription());
++		params.put("identifier", functionIdentifier);
++		params.put("ifExists", ifExists);
++
++		return OperationUtils.formatWithChildren(
++			"ALTER FUNCTION",
++			params,
++			Collections.emptyList(),
++			Operation::asSummaryString);
++	}
++}
+diff --git a/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/CreateFunctionOperation.java b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/CreateFunctionOperation.java
+new file mode 100644
+index 0000000000000..7d2c830341d28
+--- /dev/null
++++ b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/CreateFunctionOperation.java
+@@ -0,0 +1,72 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.operations.ddl;
++
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.catalog.ObjectIdentifier;
++import org.apache.flink.table.operations.Operation;
++import org.apache.flink.table.operations.OperationUtils;
++
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * Operation to describe a CREATE FUNCTION statement.
++ */
++public class CreateFunctionOperation implements CreateOperation {
++	private final ObjectIdentifier functionIdentifier;
++	private CatalogFunction catalogFunction;
++	private boolean ignoreIfExists;
++
++	public CreateFunctionOperation(
++			ObjectIdentifier functionIdentifier,
++			CatalogFunction catalogFunction,
++			boolean ignoreIfExists) {
++		this.functionIdentifier = functionIdentifier;
++		this.catalogFunction = catalogFunction;
++		this.ignoreIfExists = ignoreIfExists;
++	}
++
++	public CatalogFunction getCatalogFunction() {
++		return this.catalogFunction;
++	}
++
++	public ObjectIdentifier getFunctionIdentifier() {
++		return this.functionIdentifier;
++	}
++
++	public boolean isIgnoreIfExists() {
++		return this.ignoreIfExists;
++	}
++
++	@Override
++	public String asSummaryString() {
++		Map<String, Object> params = new LinkedHashMap<>();
++		params.put("catalogFunction", catalogFunction.getDetailedDescription());
++		params.put("identifier", functionIdentifier);
++		params.put("ignoreIfExists", ignoreIfExists);
++
++		return OperationUtils.formatWithChildren(
++			"CREATE FUNCTION",
++			params,
++			Collections.emptyList(),
++			Operation::asSummaryString);
++	}
++}
+diff --git a/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/DropFunctionOperation.java b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/DropFunctionOperation.java
+new file mode 100644
+index 0000000000000..9160682ddb6d2
+--- /dev/null
++++ b/flink-table/flink-table-api-java/src/main/java/org/apache/flink/table/operations/ddl/DropFunctionOperation.java
+@@ -0,0 +1,63 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.operations.ddl;
++
++import org.apache.flink.table.catalog.ObjectIdentifier;
++import org.apache.flink.table.operations.Operation;
++import org.apache.flink.table.operations.OperationUtils;
++
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ *  Operation to describe a DROP FUNCTION statement.
++ */
++public class DropFunctionOperation implements DropOperation {
++	private final ObjectIdentifier functionIdentifier;
++	private final boolean ifExists;
++
++	public DropFunctionOperation(
++			ObjectIdentifier functionIdentifier,
++			boolean ifExists) {
++		this.functionIdentifier = functionIdentifier;
++		this.ifExists = ifExists;
++	}
++
++	public ObjectIdentifier getFunctionIdentifier() {
++		return this.functionIdentifier;
++	}
++
++	public boolean isIfExists() {
++		return this.ifExists;
++	}
++
++	@Override
++	public String asSummaryString() {
++		Map<String, Object> params = new LinkedHashMap<>();
++		params.put("identifier", functionIdentifier);
++		params.put("IfExists", ifExists);
++
++		return OperationUtils.formatWithChildren(
++			"DROP FUNCTION",
++			params,
++			Collections.emptyList(),
++			Operation::asSummaryString);
++	}
++}
+diff --git a/flink-table/flink-table-planner-blink/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java b/flink-table/flink-table-planner-blink/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java
+index 5a002eea0d1c5..0cf42bd308747 100644
+--- a/flink-table/flink-table-planner-blink/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java
++++ b/flink-table/flink-table-planner-blink/src/main/java/org/apache/flink/table/planner/operations/SqlToOperationConverter.java
+@@ -19,9 +19,12 @@
+ package org.apache.flink.table.planner.operations;
+ 
+ import org.apache.flink.sql.parser.ddl.SqlAlterDatabase;
++import org.apache.flink.sql.parser.ddl.SqlAlterFunction;
+ import org.apache.flink.sql.parser.ddl.SqlCreateDatabase;
++import org.apache.flink.sql.parser.ddl.SqlCreateFunction;
+ import org.apache.flink.sql.parser.ddl.SqlCreateTable;
+ import org.apache.flink.sql.parser.ddl.SqlDropDatabase;
++import org.apache.flink.sql.parser.ddl.SqlDropFunction;
+ import org.apache.flink.sql.parser.ddl.SqlDropTable;
+ import org.apache.flink.sql.parser.ddl.SqlTableColumn;
+ import org.apache.flink.sql.parser.ddl.SqlTableOption;
+@@ -33,9 +36,12 @@
+ import org.apache.flink.table.catalog.Catalog;
+ import org.apache.flink.table.catalog.CatalogDatabase;
+ import org.apache.flink.table.catalog.CatalogDatabaseImpl;
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.catalog.CatalogFunctionImpl;
+ import org.apache.flink.table.catalog.CatalogManager;
+ import org.apache.flink.table.catalog.CatalogTable;
+ import org.apache.flink.table.catalog.CatalogTableImpl;
++import org.apache.flink.table.catalog.FunctionLanguage;
+ import org.apache.flink.table.catalog.ObjectIdentifier;
+ import org.apache.flink.table.catalog.UnresolvedIdentifier;
+ import org.apache.flink.table.catalog.exceptions.DatabaseNotExistException;
+@@ -44,14 +50,18 @@
+ import org.apache.flink.table.operations.UseCatalogOperation;
+ import org.apache.flink.table.operations.UseDatabaseOperation;
+ import org.apache.flink.table.operations.ddl.AlterDatabaseOperation;
++import org.apache.flink.table.operations.ddl.AlterFunctionOperation;
+ import org.apache.flink.table.operations.ddl.CreateDatabaseOperation;
++import org.apache.flink.table.operations.ddl.CreateFunctionOperation;
+ import org.apache.flink.table.operations.ddl.CreateTableOperation;
+ import org.apache.flink.table.operations.ddl.DropDatabaseOperation;
++import org.apache.flink.table.operations.ddl.DropFunctionOperation;
+ import org.apache.flink.table.operations.ddl.DropTableOperation;
+ import org.apache.flink.table.planner.calcite.FlinkPlannerImpl;
+ import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
+ import org.apache.flink.table.types.DataType;
+ import org.apache.flink.table.types.utils.TypeConversions;
++import org.apache.flink.util.StringUtils;
+ 
+ import org.apache.calcite.rel.RelRoot;
+ import org.apache.calcite.rel.type.RelDataType;
+@@ -112,6 +122,12 @@ public static Optional<Operation> convert(
+ 			return Optional.of(converter.convertCreateTable((SqlCreateTable) validated));
+ 		} else if (validated instanceof SqlDropTable) {
+ 			return Optional.of(converter.convertDropTable((SqlDropTable) validated));
++		} else if (validated instanceof SqlCreateFunction) {
++			return Optional.of(converter.convertCreateFunction((SqlCreateFunction) validated));
++		} else if (validated instanceof SqlAlterFunction) {
++			return Optional.of(converter.convertAlterFunction((SqlAlterFunction) validated));
++		} else if (validated instanceof SqlDropFunction) {
++			return Optional.of(converter.convertDropFunction((SqlDropFunction) validated));
+ 		} else if (validated instanceof RichSqlInsert) {
+ 			return Optional.of(converter.convertSqlInsert((RichSqlInsert) validated));
+ 		} else if (validated instanceof SqlUseCatalog) {
+@@ -131,6 +147,8 @@ public static Optional<Operation> convert(
+ 		}
+ 	}
+ 
++	//~ Tools ------------------------------------------------------------------
++
+ 	/**
+ 	 * Convert the {@link SqlCreateTable} node.
+ 	 */
+@@ -179,6 +197,74 @@ private Operation convertDropTable(SqlDropTable sqlDropTable) {
+ 		return new DropTableOperation(identifier, sqlDropTable.getIfExists());
+ 	}
+ 
++	/** Convert CREATE FUNCTION statement. */
++	private Operation convertCreateFunction(SqlCreateFunction sqlCreateFunction) {
++		FunctionLanguage language = parseLanguage(sqlCreateFunction.getFunctionLanguage());
++		CatalogFunction catalogFunction = new CatalogFunctionImpl(
++			sqlCreateFunction.getFunctionClassName().getValueAs(String.class), language);
++
++		UnresolvedIdentifier unresolvedIdentifier = UnresolvedIdentifier.of(sqlCreateFunction.getFunctionIdentifier());
++		ObjectIdentifier identifier = catalogManager.qualifyIdentifier(unresolvedIdentifier);
++
++		return new CreateFunctionOperation(
++			identifier,
++			catalogFunction,
++			sqlCreateFunction.isIfNotExists()
++		);
++	}
++
++	/** Convert ALTER FUNCTION statement. */
++	private Operation convertAlterFunction(SqlAlterFunction sqlAlterFunction) {
++		FunctionLanguage language = parseLanguage(sqlAlterFunction.getFunctionLanguage());
++		CatalogFunction catalogFunction = new CatalogFunctionImpl(
++			sqlAlterFunction.getFunctionClassName().getValueAs(String.class), language);
++
++		UnresolvedIdentifier unresolvedIdentifier = UnresolvedIdentifier.of(sqlAlterFunction.getFunctionIdentifier());
++		ObjectIdentifier identifier = catalogManager.qualifyIdentifier(unresolvedIdentifier);
++		return new AlterFunctionOperation(
++			identifier,
++			catalogFunction,
++			sqlAlterFunction.isIfExists()
++		);
++	}
++
++	/** Convert DROP FUNCTION statement. */
++	private Operation convertDropFunction(SqlDropFunction sqlDropFunction) {
++		UnresolvedIdentifier unresolvedIdentifier = UnresolvedIdentifier.of(sqlDropFunction.getFunctionIdentifier());
++		ObjectIdentifier identifier = catalogManager.qualifyIdentifier(unresolvedIdentifier);
++
++		return new DropFunctionOperation(
++			identifier,
++			sqlDropFunction.getIfExists());
++	}
++
++	/**
++	 * Converts language string to the FunctionLanguage.
++	 *
++	 * @param languageString  the language string from SQL parser
++	 * @return supported FunctionLanguage otherwise raise UnsupportedOperationException.
++	 * @throws UnsupportedOperationException if the languageString is not parsable or language is not supported
++	 */
++	private FunctionLanguage parseLanguage(String languageString) {
++		if (StringUtils.isNullOrWhitespaceOnly(languageString)) {
++			return FunctionLanguage.JAVA;
++		}
++
++		FunctionLanguage language;
++		try {
++			language = FunctionLanguage.valueOf(languageString);
++		} catch (IllegalArgumentException e) {
++			throw new UnsupportedOperationException(
++				String.format("Unrecognized function language string %s", languageString), e);
++		}
++
++		if (language.equals(FunctionLanguage.PYTHON)) {
++			throw new UnsupportedOperationException("Only function language JAVA and SCALA are supported for now.");
++		}
++
++		return language;
++	}
++
+ 	/** Convert insert into statement. */
+ 	private Operation convertSqlInsert(RichSqlInsert insert) {
+ 		// get name of sink table
+@@ -227,7 +313,7 @@ private Operation convertCreateDatabase(SqlCreateDatabase sqlCreateDatabase) {
+ 		String databaseName = (fullDatabaseName.length == 1) ? fullDatabaseName[0] : fullDatabaseName[1];
+ 		boolean ignoreIfExists = sqlCreateDatabase.isIfNotExists();
+ 		String databaseComment = sqlCreateDatabase.getComment()
+-								.map(comment -> comment.getNlsString().getValue()).orElse(null);
++			.map(comment -> comment.getNlsString().getValue()).orElse(null);
+ 		// set with properties
+ 		Map<String, String> properties = new HashMap<>();
+ 		sqlCreateDatabase.getPropertyList().getList().forEach(p ->
+@@ -246,10 +332,10 @@ private Operation convertDropDatabase(SqlDropDatabase sqlDropDatabase) {
+ 		String catalogName = (fullDatabaseName.length == 1) ? catalogManager.getCurrentCatalog() : fullDatabaseName[0];
+ 		String databaseName = (fullDatabaseName.length == 1) ? fullDatabaseName[0] : fullDatabaseName[1];
+ 		return new DropDatabaseOperation(
+-				catalogName,
+-				databaseName,
+-				sqlDropDatabase.getIfExists(),
+-				sqlDropDatabase.isCascade());
++			catalogName,
++			databaseName,
++			sqlDropDatabase.getIfExists(),
++			sqlDropDatabase.isCascade());
+ 	}
+ 
+ 	/** Convert ALTER DATABASE statement. */
+@@ -285,8 +371,6 @@ private Operation convertSqlQuery(SqlNode node) {
+ 		return toQueryOperation(flinkPlanner, node);
+ 	}
+ 
+-	//~ Tools ------------------------------------------------------------------
+-
+ 	/**
+ 	 * Create a table schema from {@link SqlCreateTable}. This schema may contains computed column
+ 	 * fields and watermark information, say, we have a create table DDL statement:
+diff --git a/flink-table/flink-table-planner-blink/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala b/flink-table/flink-table-planner-blink/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala
+index b768278668eb7..3beefe2531ee7 100644
+--- a/flink-table/flink-table-planner-blink/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala
++++ b/flink-table/flink-table-planner-blink/src/main/scala/org/apache/flink/table/planner/calcite/FlinkPlannerImpl.scala
+@@ -117,7 +117,10 @@ class FlinkPlannerImpl(
+       }
+       // no need to validate row type for DDL and insert nodes.
+       if (sqlNode.getKind.belongsTo(SqlKind.DDL)
+-        || sqlNode.getKind == SqlKind.INSERT) {
++        || sqlNode.getKind == SqlKind.INSERT
++        || sqlNode.getKind == SqlKind.CREATE_FUNCTION
++        || sqlNode.getKind == SqlKind.DROP_FUNCTION
++        || sqlNode.getKind == SqlKind.OTHER_DDL) {
+         return sqlNode
+       }
+       validator.validate(sqlNode)
+diff --git a/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/catalog/CatalogFunctionTestBase.java b/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/catalog/CatalogFunctionTestBase.java
+new file mode 100644
+index 0000000000000..8388721ca219c
+--- /dev/null
++++ b/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/catalog/CatalogFunctionTestBase.java
+@@ -0,0 +1,204 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.planner.catalog;
++
++import org.apache.flink.table.api.TableEnvironment;
++import org.apache.flink.table.catalog.Catalog;
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.catalog.ObjectPath;
++import org.apache.flink.table.functions.ScalarFunction;
++import org.apache.flink.types.Row;
++
++import org.junit.Test;
++
++import java.util.Arrays;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++/**
++ * Tests for {@link CatalogFunction}.
++ */
++public abstract class CatalogFunctionTestBase {
++	protected static TableEnvironment tableEnv;
++
++	@Test
++	public void testCreateCatalogFunctionInDefaultCatalog() {
++		String ddl1 = "create function f1 as 'org.apache.flink.function.TestFunction'";
++		tableEnv.sqlUpdate(ddl1);
++		assertTrue(Arrays.asList(tableEnv.listFunctions()).contains("f1"));
++
++		tableEnv.sqlUpdate("DROP FUNCTION IF EXISTS default_catalog.default_database.f1");
++		assertFalse(Arrays.asList(tableEnv.listFunctions()).contains("f1"));
++	}
++
++	@Test
++	public void testCreateFunctionWithFullPath() {
++		String ddl1 = "create function default_catalog.default_database.f2 as" +
++			" 'org.apache.flink.function.TestFunction'";
++		tableEnv.sqlUpdate(ddl1);
++		assertTrue(Arrays.asList(tableEnv.listFunctions()).contains("f2"));
++
++		tableEnv.sqlUpdate("DROP FUNCTION IF EXISTS default_catalog.default_database.f2");
++		assertFalse(Arrays.asList(tableEnv.listFunctions()).contains("f2"));
++	}
++
++	@Test
++	public void testCreateFunctionWithoutCatalogIdentifier() {
++		String ddl1 = "create function default_database.f3 as" +
++			" 'org.apache.flink.function.TestFunction'";
++		tableEnv.sqlUpdate(ddl1);
++		assertTrue(Arrays.asList(tableEnv.listFunctions()).contains("f3"));
++
++		tableEnv.sqlUpdate("DROP FUNCTION IF EXISTS default_catalog.default_database.f3");
++		assertFalse(Arrays.asList(tableEnv.listFunctions()).contains("f3"));
++	}
++
++	@Test
++	public void testCreateFunctionCatalogNotExists() {
++
++		String ddl1 = "create function catalog1.database1.f3 as 'org.apache.flink.function.TestFunction'";
++
++		try {
++			tableEnv.sqlUpdate(ddl1);
++		} catch (Exception e){
++			assertTrue(e.getMessage().equals("Catalog catalog1 does not exist"));
++		}
++	}
++
++	@Test
++	public void testCreateFunctionDBNotExists() {
++		String ddl1 = "create function default_catalog.database1.f3 as 'org.apache.flink.function.TestFunction'";
++
++		try {
++			tableEnv.sqlUpdate(ddl1);
++		} catch (Exception e){
++			assertEquals(e.getMessage(), "Could not execute CREATE FUNCTION:" +
++				" (catalogFunction: [Optional[This is a user-defined function]], identifier:" +
++				" [`default_catalog`.`database1`.`f3`], ignoreIfExists: [false])");
++		}
++	}
++
++	@Test
++	public void testAlterFunction() throws Exception {
++		String create = "create function f3 as 'org.apache.flink.function.TestFunction'";
++		String alter = "alter function f3 as 'org.apache.flink.function.TestFunction2'";
++
++		ObjectPath objectPath = new ObjectPath("default_database", "f3");
++		Catalog catalog = tableEnv.getCatalog("default_catalog").get();
++		tableEnv.sqlUpdate(create);
++		CatalogFunction beforeUpdate = catalog.getFunction(objectPath);
++		assertEquals("org.apache.flink.function.TestFunction", beforeUpdate.getClassName());
++
++		tableEnv.sqlUpdate(alter);
++		CatalogFunction afterUpdate = catalog.getFunction(objectPath);
++		assertEquals("org.apache.flink.function.TestFunction2", afterUpdate.getClassName());
++	}
++
++	@Test
++	public void testAlterFunctionNonExists() {
++		String alterUndefinedFunction = "ALTER FUNCTION default_catalog.default_database.f4" +
++			" as 'org.apache.flink.function.TestFunction'";
++
++		String alterFunctionInWrongCatalog = "ALTER FUNCTION catalog1.default_database.f4 " +
++			"as 'org.apache.flink.function.TestFunction'";
++
++		String alterFunctionInWrongDB = "ALTER FUNCTION default_catalog.db1.f4 " +
++			"as 'org.apache.flink.function.TestFunction'";
++
++		try {
++			tableEnv.sqlUpdate(alterUndefinedFunction);
++			fail();
++		} catch (Exception e){
++			assertEquals(e.getMessage(), "Could not execute ALTER FUNCTION: " +
++				"(catalogFunction: [Optional[This is a user-defined function]], " +
++				"identifier: [`default_catalog`.`default_database`.`f4`], ifExists: [false])");
++		}
++
++		try {
++			tableEnv.sqlUpdate(alterFunctionInWrongCatalog);
++			fail();
++		} catch (Exception e) {
++			assertTrue(e.getMessage().equals("Catalog catalog1 does not exist"));
++		}
++
++		try {
++			tableEnv.sqlUpdate(alterFunctionInWrongDB);
++			fail();
++		} catch (Exception e) {
++			assertEquals(e.getMessage(), "Could not execute ALTER FUNCTION: " +
++				"(catalogFunction: [Optional[This is a user-defined function]], " +
++				"identifier: [`default_catalog`.`db1`.`f4`], ifExists: [false])");
++		}
++	}
++
++	@Test
++	public void testDropFunctionNonExists() {
++		String dropUndefinedFunction = "DROP FUNCTION default_catalog.default_database.f4";
++
++		String dropFunctionInWrongCatalog = "DROP FUNCTION catalog1.default_database.f4";
++
++		String dropFunctionInWrongDB = "DROP FUNCTION default_catalog.db1.f4";
++
++		try {
++			tableEnv.sqlUpdate(dropUndefinedFunction);
++			fail();
++		} catch (Exception e){
++			assertEquals(e.getMessage(), "Could not execute DROP FUNCTION:" +
++				" (identifier: [`default_catalog`.`default_database`.`f4`], IfExists: [false])");
++		}
++
++		try {
++			tableEnv.sqlUpdate(dropFunctionInWrongCatalog);
++			fail();
++		} catch (Exception e) {
++			assertTrue(e.getMessage().equals("Catalog catalog1 does not exist"));
++		}
++
++		try {
++			tableEnv.sqlUpdate(dropFunctionInWrongDB);
++			fail();
++		} catch (Exception e) {
++			assertEquals(e.getMessage(), "Could not execute DROP FUNCTION:" +
++				" (identifier: [`default_catalog`.`db1`.`f4`], IfExists: [false])");
++		}
++	}
++
++	protected Row toRow(Object ... objects) {
++		Row row = new Row(objects.length);
++		for (int i = 0; i < objects.length; i++) {
++			row.setField(i, objects[i]);
++		}
++
++		return row;
++	}
++
++	/**
++	 * Test udf class.
++	 */
++	public static class TestUDF extends ScalarFunction {
++
++		public Integer eval(Integer a, Integer b) {
++			return a + b;
++		}
++	}
++}
++
+diff --git a/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/runtime/batch/sql/CatalogFunctionITCase.java b/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/runtime/batch/sql/CatalogFunctionITCase.java
+new file mode 100644
+index 0000000000000..63bab70133d5c
+--- /dev/null
++++ b/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/runtime/batch/sql/CatalogFunctionITCase.java
+@@ -0,0 +1,39 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.planner.runtime.batch.sql;
++
++import org.apache.flink.table.api.EnvironmentSettings;
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.planner.catalog.CatalogFunctionTestBase;
++import org.apache.flink.table.planner.utils.TestingTableEnvironment;
++
++import org.junit.BeforeClass;
++
++/**
++ * Tests for {@link CatalogFunction} in batch table environment.
++ */
++public class CatalogFunctionITCase extends CatalogFunctionTestBase {
++
++	@BeforeClass
++	public static void setup() {
++		EnvironmentSettings environmentSettings =
++			EnvironmentSettings.newInstance().useBlinkPlanner().inBatchMode().build();
++		tableEnv = TestingTableEnvironment.create(environmentSettings);
++	}
++}
+diff --git a/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/runtime/stream/sql/CatalogFunctionITCase.java b/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/runtime/stream/sql/CatalogFunctionITCase.java
+new file mode 100644
+index 0000000000000..65c89f178fe38
+--- /dev/null
++++ b/flink-table/flink-table-planner-blink/src/test/java/org/apache/flink/table/planner/runtime/stream/sql/CatalogFunctionITCase.java
+@@ -0,0 +1,83 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.planner.runtime.stream.sql;
++
++import org.apache.flink.table.api.EnvironmentSettings;
++import org.apache.flink.table.api.Table;
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.planner.catalog.CatalogFunctionTestBase;
++import org.apache.flink.table.planner.factories.utils.TestCollectionTableFactory;
++import org.apache.flink.table.planner.utils.TestingTableEnvironment;
++import org.apache.flink.types.Row;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.Assert.assertArrayEquals;
++
++/**
++ * Tests for {@link CatalogFunction} in stream table environment.
++ */
++public class CatalogFunctionITCase extends CatalogFunctionTestBase {
++
++	@BeforeClass
++	public static void setup() {
++		EnvironmentSettings environmentSettings =
++			EnvironmentSettings.newInstance().useBlinkPlanner().inStreamingMode().build();
++		tableEnv = TestingTableEnvironment.create(environmentSettings);
++	}
++
++	@Test
++	// This test case only works for stream mode
++	public void testUseDefinedCatalogFunction() throws Exception {
++		List<Row> sourceData = Arrays.asList(
++			toRow(1, "1000", 2),
++			toRow(2, "1", 3),
++			toRow(3, "2000", 4),
++			toRow(1, "2", 2),
++			toRow(2, "3000", 3)
++		);
++
++		TestCollectionTableFactory.reset();
++		TestCollectionTableFactory.initData(sourceData, new ArrayList<Row>(), -1);
++
++		String sourceDDL = "create table t1(a int, b varchar, c int) with ('connector' = 'COLLECTION')";
++		String sinkDDL = "create table t2(a int, b varchar, c int) with ('connector' = 'COLLECTION')";
++
++		String functionDDL = "create function addOne as " +
++			"'org.apache.flink.table.planner.catalog.CatalogFunctionTestBase$TestUDF'";
++
++		String query = "select t1.a, t1.b, addOne(t1.a, 1) as c from t1";
++
++		tableEnv.sqlUpdate(sourceDDL);
++		tableEnv.sqlUpdate(sinkDDL);
++		tableEnv.sqlUpdate(functionDDL);
++		Table t2 = tableEnv.sqlQuery(query);
++		tableEnv.insertInto("t2", t2);
++		tableEnv.execute("job1");
++
++		Row[] result = TestCollectionTableFactory.RESULT().toArray(new Row[0]);
++		Row[] expected = sourceData.toArray(new Row[0]);
++		assertArrayEquals(expected, result);
++	}
++}
+diff --git a/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/sqlexec/SqlToOperationConverter.java b/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/sqlexec/SqlToOperationConverter.java
+index 9801f38c65511..f44476a8ebf5d 100644
+--- a/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/sqlexec/SqlToOperationConverter.java
++++ b/flink-table/flink-table-planner/src/main/java/org/apache/flink/table/sqlexec/SqlToOperationConverter.java
+@@ -19,9 +19,12 @@
+ package org.apache.flink.table.sqlexec;
+ 
+ import org.apache.flink.sql.parser.ddl.SqlAlterDatabase;
++import org.apache.flink.sql.parser.ddl.SqlAlterFunction;
+ import org.apache.flink.sql.parser.ddl.SqlCreateDatabase;
++import org.apache.flink.sql.parser.ddl.SqlCreateFunction;
+ import org.apache.flink.sql.parser.ddl.SqlCreateTable;
+ import org.apache.flink.sql.parser.ddl.SqlDropDatabase;
++import org.apache.flink.sql.parser.ddl.SqlDropFunction;
+ import org.apache.flink.sql.parser.ddl.SqlDropTable;
+ import org.apache.flink.sql.parser.ddl.SqlTableColumn;
+ import org.apache.flink.sql.parser.ddl.SqlTableOption;
+@@ -36,9 +39,12 @@
+ import org.apache.flink.table.catalog.Catalog;
+ import org.apache.flink.table.catalog.CatalogDatabase;
+ import org.apache.flink.table.catalog.CatalogDatabaseImpl;
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.catalog.CatalogFunctionImpl;
+ import org.apache.flink.table.catalog.CatalogManager;
+ import org.apache.flink.table.catalog.CatalogTable;
+ import org.apache.flink.table.catalog.CatalogTableImpl;
++import org.apache.flink.table.catalog.FunctionLanguage;
+ import org.apache.flink.table.catalog.ObjectIdentifier;
+ import org.apache.flink.table.catalog.UnresolvedIdentifier;
+ import org.apache.flink.table.catalog.exceptions.DatabaseNotExistException;
+@@ -48,11 +54,15 @@
+ import org.apache.flink.table.operations.UseCatalogOperation;
+ import org.apache.flink.table.operations.UseDatabaseOperation;
+ import org.apache.flink.table.operations.ddl.AlterDatabaseOperation;
++import org.apache.flink.table.operations.ddl.AlterFunctionOperation;
+ import org.apache.flink.table.operations.ddl.CreateDatabaseOperation;
++import org.apache.flink.table.operations.ddl.CreateFunctionOperation;
+ import org.apache.flink.table.operations.ddl.CreateTableOperation;
+ import org.apache.flink.table.operations.ddl.DropDatabaseOperation;
++import org.apache.flink.table.operations.ddl.DropFunctionOperation;
+ import org.apache.flink.table.operations.ddl.DropTableOperation;
+ import org.apache.flink.table.types.utils.TypeConversions;
++import org.apache.flink.util.StringUtils;
+ 
+ import org.apache.calcite.rel.RelRoot;
+ import org.apache.calcite.rel.type.RelDataType;
+@@ -110,6 +120,12 @@ public static Optional<Operation> convert(
+ 			return Optional.of(converter.convertCreateTable((SqlCreateTable) validated));
+ 		} else if (validated instanceof SqlDropTable) {
+ 			return Optional.of(converter.convertDropTable((SqlDropTable) validated));
++		} else if (validated instanceof SqlCreateFunction) {
++			return Optional.of(converter.convertCreateFunction((SqlCreateFunction) validated));
++		} else if (validated instanceof SqlAlterFunction) {
++			return Optional.of(converter.convertAlterFunction((SqlAlterFunction) validated));
++		} else if (validated instanceof SqlDropFunction) {
++			return Optional.of(converter.convertDropFunction((SqlDropFunction) validated));
+ 		} else if (validated instanceof RichSqlInsert) {
+ 			SqlNodeList targetColumnList = ((RichSqlInsert) validated).getTargetColumnList();
+ 			if (targetColumnList != null && targetColumnList.size() != 0) {
+@@ -133,6 +149,8 @@ public static Optional<Operation> convert(
+ 		}
+ 	}
+ 
++	//~ Tools ------------------------------------------------------------------
++
+ 	/**
+ 	 * Convert the {@link SqlCreateTable} node.
+ 	 */
+@@ -186,6 +204,48 @@ private Operation convertDropTable(SqlDropTable sqlDropTable) {
+ 		return new DropTableOperation(identifier, sqlDropTable.getIfExists());
+ 	}
+ 
++
++	/** Convert CREATE FUNCTION statement. */
++	private Operation convertCreateFunction(SqlCreateFunction sqlCreateFunction) {
++		FunctionLanguage language = parseLanguage(sqlCreateFunction.getFunctionLanguage());
++		CatalogFunction catalogFunction = new CatalogFunctionImpl(
++			sqlCreateFunction.getFunctionClassName().getValueAs(String.class), language);
++
++		UnresolvedIdentifier unresolvedIdentifier = UnresolvedIdentifier.of(sqlCreateFunction.getFunctionIdentifier());
++		ObjectIdentifier identifier = catalogManager.qualifyIdentifier(unresolvedIdentifier);
++
++		return new CreateFunctionOperation(
++			identifier,
++			catalogFunction,
++			sqlCreateFunction.isIfNotExists()
++		);
++	}
++
++	/** Convert ALTER FUNCTION statement. */
++	private Operation convertAlterFunction(SqlAlterFunction sqlAlterFunction) {
++		FunctionLanguage language = parseLanguage(sqlAlterFunction.getFunctionLanguage());
++		CatalogFunction catalogFunction = new CatalogFunctionImpl(
++			sqlAlterFunction.getFunctionClassName().getValueAs(String.class), language);
++
++		UnresolvedIdentifier unresolvedIdentifier = UnresolvedIdentifier.of(sqlAlterFunction.getFunctionIdentifier());
++		ObjectIdentifier identifier = catalogManager.qualifyIdentifier(unresolvedIdentifier);
++		return new AlterFunctionOperation(
++			identifier,
++			catalogFunction,
++			sqlAlterFunction.isIfExists()
++		);
++	}
++
++	/** Convert DROP FUNCTION statement. */
++	private Operation convertDropFunction(SqlDropFunction sqlDropFunction) {
++		UnresolvedIdentifier unresolvedIdentifier = UnresolvedIdentifier.of(sqlDropFunction.getFunctionIdentifier());
++		ObjectIdentifier identifier = catalogManager.qualifyIdentifier(unresolvedIdentifier);
++
++		return new DropFunctionOperation(
++			identifier,
++			sqlDropFunction.getIfExists());
++	}
++
+ 	/** Fallback method for sql query. */
+ 	private Operation convertSqlQuery(SqlNode node) {
+ 		return toQueryOperation(flinkPlanner, node);
+@@ -239,7 +299,7 @@ private Operation convertCreateDatabase(SqlCreateDatabase sqlCreateDatabase) {
+ 		String databaseName = (fullDatabaseName.length == 1) ? fullDatabaseName[0] : fullDatabaseName[1];
+ 		boolean ignoreIfExists = sqlCreateDatabase.isIfNotExists();
+ 		String databaseComment = sqlCreateDatabase.getComment()
+-												.map(comment -> comment.getNlsString().getValue()).orElse(null);
++			.map(comment -> comment.getNlsString().getValue()).orElse(null);
+ 		// set with properties
+ 		Map<String, String> properties = new HashMap<>();
+ 		sqlCreateDatabase.getPropertyList().getList().forEach(p ->
+@@ -258,10 +318,10 @@ private Operation convertDropDatabase(SqlDropDatabase sqlDropDatabase) {
+ 		String catalogName = (fullDatabaseName.length == 1) ? catalogManager.getCurrentCatalog() : fullDatabaseName[0];
+ 		String databaseName = (fullDatabaseName.length == 1) ? fullDatabaseName[0] : fullDatabaseName[1];
+ 		return new DropDatabaseOperation(
+-				catalogName,
+-				databaseName,
+-				sqlDropDatabase.getIfExists(),
+-				sqlDropDatabase.isCascade());
++			catalogName,
++			databaseName,
++			sqlDropDatabase.getIfExists(),
++			sqlDropDatabase.isCascade());
+ 	}
+ 
+ 	/** Convert ALTER DATABASE statement. */
+@@ -287,14 +347,12 @@ private Operation convertAlterDatabase(SqlAlterDatabase sqlAlterDatabase) {
+ 		}
+ 		// set with properties
+ 		sqlAlterDatabase.getPropertyList().getList().forEach(p ->
+-							properties.put(((SqlTableOption) p).getKeyString().toLowerCase(),
+-							((SqlTableOption) p).getValueString()));
++			properties.put(((SqlTableOption) p).getKeyString().toLowerCase(),
++				((SqlTableOption) p).getValueString()));
+ 		CatalogDatabase catalogDatabase = new CatalogDatabaseImpl(properties, originCatalogDatabase.getComment());
+ 		return new AlterDatabaseOperation(catalogName, databaseName, catalogDatabase);
+ 	}
+ 
+-	//~ Tools ------------------------------------------------------------------
+-
+ 	/**
+ 	 * Create a table schema from {@link SqlCreateTable}. This schema contains computed column
+ 	 * fields, say, we have a create table DDL statement:
+@@ -338,6 +396,33 @@ private TableSchema createTableSchema(SqlCreateTable sqlCreateTable) {
+ 		return physicalSchema;
+ 	}
+ 
++	/**
++	 * Converts language string to the FunctionLanguage.
++	 *
++	 * @param languageString  the language string from SQL parser
++	 * @return supported FunctionLanguage otherwise raise UnsupportedOperationException.
++	 * @throws UnsupportedOperationException if the languageString is not parsable or language is not supported
++	 */
++	private FunctionLanguage parseLanguage(String languageString) {
++		if (StringUtils.isNullOrWhitespaceOnly(languageString)) {
++			return FunctionLanguage.JAVA;
++		}
++
++		FunctionLanguage language;
++		try {
++			language = FunctionLanguage.valueOf(languageString);
++		} catch (IllegalArgumentException e) {
++			throw new UnsupportedOperationException(
++				String.format("Unrecognized function language string %s", languageString), e);
++		}
++
++		if (language.equals(FunctionLanguage.PYTHON)) {
++			throw new UnsupportedOperationException("Only function language JAVA and SCALA are supported for now.");
++		}
++
++		return language;
++	}
++
+ 	private PlannerQueryOperation toQueryOperation(FlinkPlannerImpl planner, SqlNode validated) {
+ 		// transform to a relational tree
+ 		RelRoot relational = planner.rel(validated);
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/api/internal/TableEnvImpl.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/api/internal/TableEnvImpl.scala
+index 090806e9cbbe2..25a9ebbe4f8dd 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/api/internal/TableEnvImpl.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/api/internal/TableEnvImpl.scala
+@@ -23,13 +23,13 @@ import org.apache.flink.api.common.typeinfo.TypeInformation
+ import org.apache.flink.table.api._
+ import org.apache.flink.table.calcite.{CalciteParser, FlinkPlannerImpl, FlinkRelBuilder}
+ import org.apache.flink.table.catalog._
++import org.apache.flink.table.catalog.exceptions.{DatabaseAlreadyExistException, DatabaseNotEmptyException, DatabaseNotExistException, FunctionAlreadyExistException, FunctionNotExistException}
+ import org.apache.flink.table.delegation.Parser
+ import org.apache.flink.table.expressions._
+ import org.apache.flink.table.expressions.resolver.lookups.TableReferenceLookup
+ import org.apache.flink.table.factories.{TableFactoryService, TableFactoryUtil, TableSinkFactory}
+ import org.apache.flink.table.functions.{AggregateFunction, ScalarFunction, TableFunction, UserDefinedAggregateFunction, _}
+ import org.apache.flink.table.module.{Module, ModuleManager}
+-import org.apache.flink.table.operations.ddl.{CreateTableOperation, DropTableOperation}
+ import org.apache.flink.table.operations.ddl._
+ import org.apache.flink.table.operations.utils.OperationTreeBuilder
+ import org.apache.flink.table.operations.{CatalogQueryOperation, TableSourceQueryOperation, _}
+@@ -43,8 +43,6 @@ import org.apache.calcite.tools.FrameworkConfig
+ import _root_.java.util.function.{Supplier => JSupplier}
+ import _root_.java.util.{Optional, HashMap => JHashMap, Map => JMap}
+ 
+-import org.apache.flink.table.catalog.exceptions.{DatabaseAlreadyExistException, DatabaseNotEmptyException, DatabaseNotExistException}
+-
+ import _root_.scala.collection.JavaConverters._
+ import _root_.scala.collection.JavaConversions._
+ import _root_.scala.util.Try
+@@ -526,6 +524,12 @@ abstract class TableEnvImpl(
+           case ex: DatabaseNotExistException => throw new ValidationException(exMsg, ex)
+           case ex: Exception => throw new TableException(exMsg, ex)
+         }
++      case createFunctionOperation: CreateFunctionOperation =>
++        createCatalogFunction(createFunctionOperation)
++      case alterFunctionOperation: AlterFunctionOperation =>
++        alterCatalogFunction(alterFunctionOperation)
++      case dropFunctionOperation: DropFunctionOperation =>
++        dropCatalogFunction(dropFunctionOperation)
+       case useCatalogOperation: UseCatalogOperation =>
+         catalogManager.setCurrentCatalog(useCatalogOperation.getCatalogName)
+       case useDatabaseOperation: UseDatabaseOperation =>
+@@ -669,6 +673,52 @@ abstract class TableEnvImpl(
+       .map(_.getTable)
+   }
+ 
++  private def createCatalogFunction(createFunctionOperation: CreateFunctionOperation)= {
++    val catalog = getCatalogOrThrowException(
++      createFunctionOperation.getFunctionIdentifier.getCatalogName)
++    val exMsg = getDDLOpExecuteErrorMsg(createFunctionOperation.asSummaryString)
++    try {
++      catalog.createFunction(
++        createFunctionOperation.getFunctionIdentifier.toObjectPath,
++        createFunctionOperation.getCatalogFunction,
++        createFunctionOperation.isIgnoreIfExists)
++    } catch {
++      case ex: FunctionAlreadyExistException => throw new ValidationException(exMsg, ex)
++      case ex: Exception => throw new TableException(exMsg, ex)
++    }
++  }
++
++  private def alterCatalogFunction(alterFunctionOperation: AlterFunctionOperation) = {
++    val catalog = getCatalogOrThrowException(
++      alterFunctionOperation.getFunctionIdentifier.getCatalogName)
++    val exMsg = getDDLOpExecuteErrorMsg(alterFunctionOperation.asSummaryString)
++
++    try {
++      catalog.alterFunction(
++        alterFunctionOperation.getFunctionIdentifier.toObjectPath,
++        alterFunctionOperation.getCatalogFunction,
++        alterFunctionOperation.isIfExists)
++    } catch {
++      case ex: FunctionNotExistException => throw new ValidationException(exMsg, ex)
++      case ex: Exception => throw new TableException(exMsg, ex)
++    }
++  }
++
++  private def dropCatalogFunction(dropFunctionOperation: DropFunctionOperation) = {
++    val catalog = getCatalogOrThrowException(
++      dropFunctionOperation.getFunctionIdentifier.getCatalogName)
++    val exMsg = getDDLOpExecuteErrorMsg(dropFunctionOperation.asSummaryString)
++
++    try {
++      catalog.dropFunction(
++        dropFunctionOperation.getFunctionIdentifier.toObjectPath,
++        dropFunctionOperation.isIfExists)
++    } catch {
++      case ex: FunctionNotExistException => throw new ValidationException(exMsg, ex)
++      case ex: Exception => throw new TableException(exMsg, ex)
++    }
++  }
++
+   /** Returns the [[FlinkRelBuilder]] of this TableEnvironment. */
+   private[flink] def getRelBuilder: FlinkRelBuilder = {
+     val currentCatalogName = catalogManager.getCurrentCatalog
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/FlinkPlannerImpl.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/FlinkPlannerImpl.scala
+index 2763a2775386e..a256c23930134 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/FlinkPlannerImpl.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/calcite/FlinkPlannerImpl.scala
+@@ -117,7 +117,10 @@ class FlinkPlannerImpl(
+       }
+       // no need to validate row type for DDL and insert nodes.
+       if (sqlNode.getKind.belongsTo(SqlKind.DDL)
+-        || sqlNode.getKind == SqlKind.INSERT) {
++        || sqlNode.getKind == SqlKind.INSERT
++        || sqlNode.getKind == SqlKind.CREATE_FUNCTION
++        || sqlNode.getKind == SqlKind.DROP_FUNCTION
++        || sqlNode.getKind == SqlKind.OTHER_DDL) {
+         return sqlNode
+       }
+       validator.validate(sqlNode)
+diff --git a/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/catalog/CatalogFunctionTestBase.java b/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/catalog/CatalogFunctionTestBase.java
+new file mode 100644
+index 0000000000000..b06df844b86e2
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/catalog/CatalogFunctionTestBase.java
+@@ -0,0 +1,242 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.catalog;
++
++import org.apache.flink.table.api.TableEnvironment;
++import org.apache.flink.table.factories.utils.TestCollectionTableFactory;
++import org.apache.flink.table.functions.ScalarFunction;
++import org.apache.flink.types.Row;
++
++import org.junit.Test;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++/**
++ * Tests for {@link CatalogFunction}.
++ */
++public abstract class CatalogFunctionTestBase {
++	private static TableEnvironment tableEnv;
++
++	public static void setTableEnv(TableEnvironment e) {
++		tableEnv = e;
++	}
++
++	public abstract void execute() throws Exception;
++
++	@Test
++	public void testCreateCatalogFunctionInDefaultCatalog() {
++		String ddl1 = "create function f1 as 'org.apache.flink.function.TestFunction'";
++		tableEnv.sqlUpdate(ddl1);
++		assertTrue(Arrays.asList(tableEnv.listFunctions()).contains("f1"));
++
++		tableEnv.sqlUpdate("DROP FUNCTION IF EXISTS default_catalog.default_database.f1");
++		assertFalse(Arrays.asList(tableEnv.listFunctions()).contains("f1"));
++	}
++
++	@Test
++	public void testCreateFunctionWithFullPath() {
++		String ddl1 = "create function default_catalog.default_database.f2 as" +
++			" 'org.apache.flink.function.TestFunction'";
++		tableEnv.sqlUpdate(ddl1);
++		assertTrue(Arrays.asList(tableEnv.listFunctions()).contains("f2"));
++
++		tableEnv.sqlUpdate("DROP FUNCTION IF EXISTS default_catalog.default_database.f2");
++		assertFalse(Arrays.asList(tableEnv.listFunctions()).contains("f2"));
++	}
++
++	@Test
++	public void testCreateFunctionWithoutCatalogIdentifier() {
++		String ddl1 = "create function default_database.f3 as" +
++			" 'org.apache.flink.function.TestFunction'";
++		tableEnv.sqlUpdate(ddl1);
++		assertTrue(Arrays.asList(tableEnv.listFunctions()).contains("f3"));
++
++		tableEnv.sqlUpdate("DROP FUNCTION IF EXISTS default_catalog.default_database.f3");
++		assertFalse(Arrays.asList(tableEnv.listFunctions()).contains("f3"));
++	}
++
++	@Test
++	public void testCreateFunctionCatalogNotExists() {
++
++		String ddl1 = "create function catalog1.database1.f3 as 'org.apache.flink.function.TestFunction'";
++
++		try {
++			tableEnv.sqlUpdate(ddl1);
++		} catch (Exception e){
++			assertTrue(e.getMessage().equals("Catalog catalog1 does not exist"));
++		}
++	}
++
++	@Test
++	public void testCreateFunctionDBNotExists() {
++		String ddl1 = "create function default_catalog.database1.f3 as 'org.apache.flink.function.TestFunction'";
++
++		try {
++			tableEnv.sqlUpdate(ddl1);
++		} catch (Exception e){
++			assertEquals(e.getMessage(), "Could not execute CREATE FUNCTION:" +
++				" (catalogFunction: [Optional[This is a user-defined function]], identifier:" +
++				" [`default_catalog`.`database1`.`f3`], ignoreIfExists: [false])");
++		}
++	}
++
++	@Test
++	public void testAlterFunction() throws Exception {
++		String create = "create function f3 as 'org.apache.flink.function.TestFunction'";
++		String alter = "alter function f3 as 'org.apache.flink.function.TestFunction2'";
++
++		ObjectPath objectPath = new ObjectPath("default_database", "f3");
++		Catalog catalog = tableEnv.getCatalog("default_catalog").get();
++		tableEnv.sqlUpdate(create);
++		CatalogFunction beforeUpdate = catalog.getFunction(objectPath);
++		assertEquals("org.apache.flink.function.TestFunction", beforeUpdate.getClassName());
++
++		tableEnv.sqlUpdate(alter);
++		CatalogFunction afterUpdate = catalog.getFunction(objectPath);
++		assertEquals("org.apache.flink.function.TestFunction2", afterUpdate.getClassName());
++	}
++
++	@Test
++	public void testAlterFunctionNonExists() {
++		String alterUndefinedFunction = "ALTER FUNCTION default_catalog.default_database.f4" +
++			" as 'org.apache.flink.function.TestFunction'";
++
++		String alterFunctionInWrongCatalog = "ALTER FUNCTION catalog1.default_database.f4 " +
++			"as 'org.apache.flink.function.TestFunction'";
++
++		String alterFunctionInWrongDB = "ALTER FUNCTION default_catalog.db1.f4 " +
++			"as 'org.apache.flink.function.TestFunction'";
++
++		try {
++			tableEnv.sqlUpdate(alterUndefinedFunction);
++			fail();
++		} catch (Exception e){
++			assertEquals(e.getMessage(), "Could not execute ALTER FUNCTION: " +
++				"(catalogFunction: [Optional[This is a user-defined function]], " +
++				"identifier: [`default_catalog`.`default_database`.`f4`], ifExists: [false])");
++		}
++
++		try {
++			tableEnv.sqlUpdate(alterFunctionInWrongCatalog);
++			fail();
++		} catch (Exception e) {
++			assertTrue(e.getMessage().equals("Catalog catalog1 does not exist"));
++		}
++
++		try {
++			tableEnv.sqlUpdate(alterFunctionInWrongDB);
++			fail();
++		} catch (Exception e) {
++			assertEquals(e.getMessage(), "Could not execute ALTER FUNCTION: " +
++				"(catalogFunction: [Optional[This is a user-defined function]], " +
++				"identifier: [`default_catalog`.`db1`.`f4`], ifExists: [false])");
++		}
++	}
++
++	@Test
++	public void testDropFunctionNonExists() {
++		String dropUndefinedFunction = "DROP FUNCTION default_catalog.default_database.f4";
++
++		String dropFunctionInWrongCatalog = "DROP FUNCTION catalog1.default_database.f4";
++
++		String dropFunctionInWrongDB = "DROP FUNCTION default_catalog.db1.f4";
++
++		try {
++			tableEnv.sqlUpdate(dropUndefinedFunction);
++			fail();
++		} catch (Exception e){
++			assertEquals(e.getMessage(), "Could not execute DROP FUNCTION:" +
++				" (identifier: [`default_catalog`.`default_database`.`f4`], IfExists: [false])");
++		}
++
++		try {
++			tableEnv.sqlUpdate(dropFunctionInWrongCatalog);
++			fail();
++		} catch (Exception e) {
++			assertTrue(e.getMessage().equals("Catalog catalog1 does not exist"));
++		}
++
++		try {
++			tableEnv.sqlUpdate(dropFunctionInWrongDB);
++			fail();
++		} catch (Exception e) {
++			assertEquals(e.getMessage(), "Could not execute DROP FUNCTION:" +
++				" (identifier: [`default_catalog`.`db1`.`f4`], IfExists: [false])");
++		}
++	}
++
++	@Test
++	public void testUseDefinedCatalogFunction() throws Exception {
++		List<Row> sourceData = Arrays.asList(
++			toRow(1, "1000", 2),
++			toRow(2, "1", 3),
++			toRow(3, "2000", 4),
++			toRow(1, "2", 2),
++			toRow(2, "3000", 3)
++		);
++
++		TestCollectionTableFactory.reset();
++		TestCollectionTableFactory.initData(sourceData, new ArrayList<Row>(), -1);
++
++		String sourceDDL = "create table t1(a int, b varchar, c int) with ('connector' = 'COLLECTION')";
++		String sinkDDL = "create table t2(a int, b varchar, c int) with ('connector' = 'COLLECTION')";
++
++		String functionDDL = "create function addOne as " +
++			"'org.apache.flink.table.planner.catalog.CatalogFunctionTestBase$TestUDF'";
++
++		String query = " insert into t2 select t1.a, t1.b, addOne(t1.a, 1) as c from t1";
++
++		tableEnv.sqlUpdate(sourceDDL);
++		tableEnv.sqlUpdate(sinkDDL);
++		tableEnv.sqlUpdate(functionDDL);
++		tableEnv.sqlUpdate(query);
++		execute();
++
++		Row[] result = TestCollectionTableFactory.RESULT().toArray(new Row[0]);
++		Row[] expected = sourceData.toArray(new Row[0]);
++		assertArrayEquals(expected, result);
++	}
++
++	private Row toRow(Object ... objects) {
++		Row row = new Row(objects.length);
++		for (int i = 0; i < objects.length; i++) {
++			row.setField(i, objects[i]);
++		}
++
++		return row;
++	}
++
++	/**
++	 * Test udf class.
++	 */
++	public static class TestUDF extends ScalarFunction {
++
++		public Integer eval(Integer a, Integer b) {
++			return a + b;
++		}
++	}
++}
+diff --git a/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/runtime/batch/sql/CatalogFunctionITCase.java b/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/runtime/batch/sql/CatalogFunctionITCase.java
+new file mode 100644
+index 0000000000000..e32629bf321f5
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/runtime/batch/sql/CatalogFunctionITCase.java
+@@ -0,0 +1,44 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.runtime.batch.sql;
++
++import org.apache.flink.api.java.ExecutionEnvironment;
++import org.apache.flink.table.api.java.BatchTableEnvironment;
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.catalog.CatalogFunctionTestBase;
++
++import org.junit.BeforeClass;
++
++/**
++ * Tests for {@link CatalogFunction} in batch table environment.
++ */
++public class CatalogFunctionITCase extends CatalogFunctionTestBase {
++	private static ExecutionEnvironment executionEnvironment = ExecutionEnvironment.getExecutionEnvironment();
++
++	@BeforeClass
++	public static void setup() {
++		BatchTableEnvironment batchTableEnvironment = BatchTableEnvironment.create(executionEnvironment);
++		setTableEnv(batchTableEnvironment);
++	}
++
++	@Override
++	public void execute() throws Exception {
++		executionEnvironment.execute();
++	}
++}
+diff --git a/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/runtime/stream/sql/CatalogFunctionITCase.java b/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/runtime/stream/sql/CatalogFunctionITCase.java
+new file mode 100644
+index 0000000000000..1911154a8012a
+--- /dev/null
++++ b/flink-table/flink-table-planner/src/test/java/org/apache/flink/table/runtime/stream/sql/CatalogFunctionITCase.java
+@@ -0,0 +1,45 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.flink.table.runtime.stream.sql;
++
++import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
++import org.apache.flink.table.api.java.StreamTableEnvironment;
++import org.apache.flink.table.catalog.CatalogFunction;
++import org.apache.flink.table.catalog.CatalogFunctionTestBase;
++
++import org.junit.BeforeClass;
++
++/**
++ * Tests for {@link CatalogFunction} in stream table environment.
++ */
++public class CatalogFunctionITCase extends CatalogFunctionTestBase {
++	private static StreamExecutionEnvironment streamExecEnvironment;
++
++	@BeforeClass
++	public static void setup() {
++		streamExecEnvironment = StreamExecutionEnvironment.getExecutionEnvironment();
++		StreamTableEnvironment streamTableEnvironment = StreamTableEnvironment.create(streamExecEnvironment);
++		setTableEnv(streamTableEnvironment);
++	}
++
++	@Override
++	public void execute() throws Exception {
++		streamExecEnvironment.execute();
++	}
++}

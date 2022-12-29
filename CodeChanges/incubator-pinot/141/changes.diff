@@ -1,0 +1,1297 @@
+diff --git a/pinot-core/src/main/java/com/linkedin/pinot/core/operator/filter/StarTreeIndexOperator.java b/pinot-core/src/main/java/com/linkedin/pinot/core/operator/filter/StarTreeIndexOperator.java
+index 80dc89daa2f..a2e6657f762 100644
+--- a/pinot-core/src/main/java/com/linkedin/pinot/core/operator/filter/StarTreeIndexOperator.java
++++ b/pinot-core/src/main/java/com/linkedin/pinot/core/operator/filter/StarTreeIndexOperator.java
+@@ -25,6 +25,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Queue;
++import java.util.Set;
+ 
+ import org.roaringbitmap.buffer.MutableRoaringBitmap;
+ import org.slf4j.Logger;
+@@ -49,17 +50,17 @@
+ import com.linkedin.pinot.core.operator.docidsets.FilterBlockDocIdSet;
+ import com.linkedin.pinot.core.startree.StarTreeIndexNode;
+ 
+-
+ public class StarTreeIndexOperator extends BaseFilterOperator {
+   private static final Logger LOGGER = LoggerFactory.getLogger(StarTreeIndexOperator.class);
+-
+   private IndexSegment segment;
+-  //predicates that can be applied on the star tree
+-  Map<String, PredicateEntry> eligibleEqualityPredicatesMap;
+-  //predicates that cannot be applied on star tree index because it appears in group by clause
+-  Map<String, PredicateEntry> inEligiblePredicatesMap;
+-  //predicates that cannot be applied because they are not of type Equality
+-  Map<String, PredicateEntry> nonEqualityPredicatesMap;
++
++  // predicates map
++  Map<String, PredicateEntry> predicatesMap;
++
++  // group by columns
++  Set<String> groupByColumns;
++
++  Set<String> equalityPredicateColumns;
+ 
+   boolean emptyResult = false;
+   private BrokerRequest brokerRequest;
+@@ -67,19 +68,19 @@ public class StarTreeIndexOperator extends BaseFilterOperator {
+   public StarTreeIndexOperator(IndexSegment segment, BrokerRequest brokerRequest) {
+     this.segment = segment;
+     this.brokerRequest = brokerRequest;
+-    eligibleEqualityPredicatesMap = new HashMap<>();
+-    inEligiblePredicatesMap = new HashMap<>();
+-    nonEqualityPredicatesMap = new HashMap<>();
++    equalityPredicateColumns = new HashSet<>();
++    groupByColumns = new HashSet<>();
++    predicatesMap = new HashMap<>();
+     initPredicatesToEvaluate();
+   }
+ 
+   private void initPredicatesToEvaluate() {
+     FilterQueryTree filterTree = RequestUtils.generateFilterQueryTree(brokerRequest);
+-    //find all filter columns
++    // Find all filter columns
+     if (filterTree != null) {
+       if (filterTree.getChildren() != null && !filterTree.getChildren().isEmpty()) {
+         for (FilterQueryTree childFilter : filterTree.getChildren()) {
+-          //nested filters are not supported
++          // Nested filters are not supported
+           assert childFilter.getChildren() == null || childFilter.getChildren().isEmpty();
+           processFilterTree(childFilter);
+         }
+@@ -87,46 +88,42 @@ private void initPredicatesToEvaluate() {
+         processFilterTree(filterTree);
+       }
+     }
+-    //group by columns, we cannot lose group by columns during traversal
++    // Group by columns, we cannot lose group by columns during traversal
+     GroupBy groupBy = brokerRequest.getGroupBy();
+     if (groupBy != null) {
+-      for (String groupByCol : groupBy.getColumns()) {
+-        //remove if there was a filter predicate set on this column in the query
+-        if (eligibleEqualityPredicatesMap.containsKey(groupByCol)) {
+-          inEligiblePredicatesMap.put(groupByCol, eligibleEqualityPredicatesMap.get(groupByCol));
+-          eligibleEqualityPredicatesMap.remove(groupByCol);
+-        } else {
+-          //there is no predicate but we cannot lose this dimension while traversing
+-          inEligiblePredicatesMap.put(groupByCol, null);
+-        }
+-      }
++      groupByColumns.addAll(groupBy.getColumns());
+     }
+   }
+ 
+   private void processFilterTree(FilterQueryTree childFilter) {
+     String column = childFilter.getColumn();
+-    //only equality predicates are supported
++    // Only equality predicates are supported
+     Predicate predicate = Predicate.newPredicate(childFilter);
+     Dictionary dictionary = segment.getDataSource(column).getDictionary();
++    PredicateEntry predicateEntry = null;
+     if (childFilter.getOperator() == FilterOperator.EQUALITY) {
+       EqPredicate eqPredicate = (EqPredicate) predicate;
+-      //computing dictionaryId allows us early termination and avoids multiple looks up during tree traversal
++      // Computing dictionaryId allows us early termination and avoids multiple looks up during tree
++      // traversal
+       int dictId = dictionary.indexOf(eqPredicate.getEqualsValue());
+       if (dictId < 0) {
+-        //empty result
++        // Empty result
+         emptyResult = true;
+       }
+-      eligibleEqualityPredicatesMap.put(column, new PredicateEntry(predicate, dictId));
++      predicateEntry = new PredicateEntry(predicate, dictId);
++      equalityPredicateColumns.add(column);
+     } else {
+-      // If dictionary does not have any values that satisfy the predicate, set emptyResults to true.
++      // If dictionary does not have any values that satisfy the predicate, set emptyResults to
++      // true.
+       PredicateEvaluator predicateEvaluator =
+           PredicateEvaluatorProvider.getPredicateFunctionFor(predicate, dictionary);
+       if (predicateEvaluator.alwaysFalse()) {
+         emptyResult = true;
+       }
+-      //store this predicate, we will have to apply it later
+-      nonEqualityPredicatesMap.put(column, new PredicateEntry(predicate, -1));
++      // Store this predicate, we will have to apply it later
++      predicateEntry = new PredicateEntry(predicate, -1);
+     }
++    predicatesMap.put(column, predicateEntry);
+   }
+ 
+   @Override
+@@ -141,52 +138,95 @@ public boolean close() {
+ 
+   @Override
+   public BaseFilterBlock nextFilterBlock(BlockId blockId) {
+-    long start, end;
+     MutableRoaringBitmap finalResult = null;
+     if (emptyResult) {
+       finalResult = new MutableRoaringBitmap();
+-      final BitmapDocIdIterator bitmapDocIdIterator = new BitmapDocIdIterator(finalResult.getIntIterator());
++      final BitmapDocIdIterator bitmapDocIdIterator =
++          new BitmapDocIdIterator(finalResult.getIntIterator());
+       return createBaseFilterBlock(bitmapDocIdIterator);
+     }
+-    start = System.currentTimeMillis();
+-    Queue<SearchEntry> matchedEntries = findMatchingLeafNodes();
+-    //iterate over the matching nodes. For each column, generate the list of ranges.
+-    List<Operator> matchingLeafOperators = new ArrayList<>();
++
++    List<Operator> matchingLeafOperators = buildMatchingLeafOperators();
++    if (matchingLeafOperators.size() == 1) {
++      BaseFilterOperator baseFilterOperator = (BaseFilterOperator) matchingLeafOperators.get(0);
++      return baseFilterOperator.nextFilterBlock(blockId);
++    } else {
++      CompositeOperator compositeOperator = new CompositeOperator(matchingLeafOperators);
++      return compositeOperator.nextFilterBlock(blockId);
++    }
++  }
++
++  /**
++   * Helper method to build a list of operators for matching leaf nodes.
++   * - Finds all leaf nodes that match the predicates
++   * - Iterates over all the matching leaf nodes, and generate a list of matching ranges
++   * @return
++   */
++  private List<Operator> buildMatchingLeafOperators() {
+     int totalDocsToScan = 0;
+-    for (SearchEntry matchedEntry : matchedEntries) {
+-      Operator matchingLeafOperator;
+-      int startDocId = matchedEntry.starTreeIndexnode.getStartDocumentId();
+-      int endDocId = matchedEntry.starTreeIndexnode.getEndDocumentId();
++    int numExactlyMatched = 0;
++    long start = System.currentTimeMillis();
+ 
+-      List<Operator> filterOperators = createFilterOperatorsForRemainingPredicates(matchedEntry);
++    final MutableRoaringBitmap exactlyMatchedDocsBitmap = new MutableRoaringBitmap();
++    Queue<SearchEntry> matchedEntries = findMatchingLeafNodes();
+ 
+-      if (filterOperators.size() == 0) {
+-        matchingLeafOperator = createFilterOperator(startDocId, endDocId);
+-      } else if (filterOperators.size() == 1) {
+-        matchingLeafOperator = filterOperators.get(0);
++    // Iterate over the matching nodes. For each column, generate the list of ranges.
++    List<Operator> matchingLeafOperators = new ArrayList<>();
++    for (SearchEntry matchedEntry : matchedEntries) {
++      Operator matchingLeafOperator = null;
++      StarTreeIndexNode matchedLeafNode = matchedEntry.starTreeIndexnode;
++
++      int startDocId = matchedLeafNode.getStartDocumentId();
++      int endDocId = matchedLeafNode.getEndDocumentId();
++
++      if (matchedEntry.remainingPredicateColumns.isEmpty()) {
++        // No more filters to apply
++        // Use aggregated doc for this leaf node if possible
++        if (matchedLeafNode.getAggregatedDocumentId() != -1 && matchedEntry.remainingGroupByColumns.isEmpty()) {
++          exactlyMatchedDocsBitmap.add(matchedLeafNode.getAggregatedDocumentId());
++          numExactlyMatched = numExactlyMatched + 1;
++        } else {
++          // Have to scan all the documents under this leaf node
++          exactlyMatchedDocsBitmap.add(startDocId, endDocId);
++          numExactlyMatched += (endDocId - startDocId);
++        }
+       } else {
+-        matchingLeafOperator = new AndOperator(filterOperators);
++        Map<String, PredicateEntry> remainingPredicatesMap = computeRemainingPredicates(matchedEntry);
++        List<Operator> filterOperators =
++            createFilterOperatorsForRemainingPredicates(matchedEntry, remainingPredicatesMap);
++
++        if (filterOperators.size() == 0) {
++          // The predicates are applied, but we cannot use aggregated doc, as we might have lost
++          // the group by dimensions, in the aggregated doc.
++          exactlyMatchedDocsBitmap.add(startDocId, endDocId);
++          numExactlyMatched += (endDocId - startDocId);
++        } else if (filterOperators.size() == 1) {
++          matchingLeafOperator = filterOperators.get(0);
++        } else {
++          matchingLeafOperator = new AndOperator(filterOperators);
++        }
++        if (matchingLeafOperator != null) {
++          matchingLeafOperators.add(matchingLeafOperator);
++        }
+       }
+-      matchingLeafOperators.add(matchingLeafOperator);
++
+       totalDocsToScan += (endDocId - startDocId);
+-      LOGGER.debug("{}", matchedEntry.starTreeIndexnode);
++      LOGGER.debug("{}", matchedLeafNode);
+     }
+-    end = System.currentTimeMillis();
+-    LOGGER.debug("Found {} matching leaves, took {} ms to create remaining filter operators. Total docs to scan:{}",
+-        matchedEntries.size(), (end - start), totalDocsToScan);
+ 
+-    if (matchingLeafOperators.size() == 1) {
+-      BaseFilterOperator baseFilterOperator = (BaseFilterOperator) matchingLeafOperators.get(0);
+-      return baseFilterOperator.nextFilterBlock(blockId);
+-    } else {
+-      CompositeOperator compositeOperator = new CompositeOperator(matchingLeafOperators);
+-      return compositeOperator.nextFilterBlock(blockId);
++    // Add an operator for exactlyMatchedDocs
++    if (numExactlyMatched > 0) {
++      matchingLeafOperators.add(createFilterOperator(exactlyMatchedDocsBitmap));
++      totalDocsToScan += numExactlyMatched;
+     }
++
++    long end = System.currentTimeMillis();
++    LOGGER.debug("Found {} matching leaves, took {} ms to create remaining filter operators. Total docs to scan:{}",
++        matchedEntries.size(), (end - start), totalDocsToScan);
++    return matchingLeafOperators;
+   }
+ 
+-  private BaseFilterOperator createFilterOperator(int startDocId, int endDocId) {
+-    final MutableRoaringBitmap answer = new MutableRoaringBitmap();
+-    answer.add(startDocId, endDocId);
++  private BaseFilterOperator createFilterOperator(final MutableRoaringBitmap answer) {
+     return new BaseFilterOperator() {
+ 
+       @Override
+@@ -206,30 +246,48 @@ public BaseFilterBlock nextFilterBlock(BlockId blockId) {
+     };
+   }
+ 
+-  private List<Operator> createFilterOperatorsForRemainingPredicates(SearchEntry matchedEntry) {
++  /**
++   * Builds a list of filter operators for a given matched leaf node for the given
++   * set of predicates.
++   * @param matchedEntry
++   * @param remainingPredicatesMap
++   * @return
++   */
++  private List<Operator> createFilterOperatorsForRemainingPredicates(SearchEntry matchedEntry,
++      Map<String, PredicateEntry> remainingPredicatesMap) {
+     int startDocId = matchedEntry.starTreeIndexnode.getStartDocumentId();
+     int endDocId = matchedEntry.starTreeIndexnode.getEndDocumentId();
++
+     List<Operator> childOperators = new ArrayList<>();
+-    Map<String, PredicateEntry> remainingPredicatesMap = new HashMap<>();
+-    for (String column : matchedEntry.remainingPredicates) {
+-      PredicateEntry predicateEntry = eligibleEqualityPredicatesMap.get(column);
+-      remainingPredicatesMap.put(column, predicateEntry);
+-    }
+-    //apply predicate that were not applied because of group by
+-    //this should mostly empty unless query has a column in both filter and group by
+-    remainingPredicatesMap.putAll(inEligiblePredicatesMap);
+-    remainingPredicatesMap.putAll(nonEqualityPredicatesMap);
+     for (String column : remainingPredicatesMap.keySet()) {
+       PredicateEntry predicateEntry = remainingPredicatesMap.get(column);
+-      //predicateEntry could be null if column appeared  only in groupBy
++
++      // predicateEntry could be null if column appeared only in groupBy
+       if (predicateEntry != null) {
+-        BaseFilterOperator childOperator = createChildOperator(startDocId, endDocId - 1, column, predicateEntry);
++        BaseFilterOperator childOperator =
++            createChildOperator(startDocId, endDocId - 1, column, predicateEntry);
+         childOperators.add(childOperator);
+       }
+     }
+     return childOperators;
+   }
+ 
++  /**
++   * Helper method to compute remaining predicates from remainingPredicateColumns of
++   * the given search entry.
++   *
++   * @param entry Search entry for which to compute the remaining predicates.
++   * @return
++   */
++  private Map<String, PredicateEntry> computeRemainingPredicates(SearchEntry entry) {
++    Map<String, PredicateEntry> remainingPredicatesMap = new HashMap<>();
++    for (String column : entry.remainingPredicateColumns) {
++      PredicateEntry predicateEntry = predicatesMap.get(column);
++      remainingPredicatesMap.put(column, predicateEntry);
++    }
++    return remainingPredicatesMap;
++  }
++
+   private BaseFilterOperator createChildOperator(int startDocId, int endDocId, String column,
+       PredicateEntry predicateEntry) {
+     DataSource dataSource = segment.getDataSource(column);
+@@ -267,12 +325,12 @@ public <T> T getRaw() {
+ 
+           @Override
+           public void setStartDocId(int startDocId) {
+-            //no-op
++            // no-op
+           }
+ 
+           @Override
+           public void setEndDocId(int endDocId) {
+-            //no-op
++            // no-op
+           }
+ 
+           @Override
+@@ -297,65 +355,118 @@ public BlockId getId() {
+   private Queue<SearchEntry> findMatchingLeafNodes() {
+     Queue<SearchEntry> matchedEntries = new LinkedList<>();
+     Queue<SearchEntry> searchQueue = new LinkedList<>();
+-    HashBiMap<String, Integer> dimensionIndexToNameMapping = segment.getStarTree().getDimensionNameToIndexMap();
++    HashBiMap<String, Integer> dimensionIndexToNameMapping =
++        segment.getStarTree().getDimensionNameToIndexMap();
++
+     SearchEntry startEntry = new SearchEntry();
+     startEntry.starTreeIndexnode = segment.getStarTree().getRoot();
+-    startEntry.remainingPredicates = new HashSet<>(eligibleEqualityPredicatesMap.keySet());
++    startEntry.remainingPredicateColumns = new HashSet<>(predicatesMap.keySet());
++    startEntry.remainingGroupByColumns = new HashSet<>(groupByColumns);
+     searchQueue.add(startEntry);
++
+     while (!searchQueue.isEmpty()) {
+       SearchEntry searchEntry = searchQueue.remove();
+       StarTreeIndexNode current = searchEntry.starTreeIndexnode;
+-      HashSet<String> remainingColumnsToFilter = searchEntry.remainingPredicates;
+-      //check if its leaf
+-      if (current.isLeaf()) {
+-        //reached leaf
++      HashSet<String> remainingPredicateColumns = searchEntry.remainingPredicateColumns;
++      HashSet<String> remainingGroupByColumns = searchEntry.remainingGroupByColumns;
++      // Check if its leaf
++      if (current.isLeaf() || (remainingPredicateColumns.isEmpty() && remainingGroupByColumns.isEmpty())) {
++        // reached leaf
+         matchedEntries.add(searchEntry);
+         continue;
+       }
+-      //find next set of nodes to search
+-      String nextDimension = dimensionIndexToNameMapping.inverse().get(current.getChildDimensionName());
+-      HashSet<String> newRemainingPredicates = new HashSet<>();
+-      newRemainingPredicates.addAll(remainingColumnsToFilter);
+-      newRemainingPredicates.remove(nextDimension);
+-      if (!(inEligiblePredicatesMap.containsKey(nextDimension)
+-          || nonEqualityPredicatesMap.containsKey(nextDimension))) {
+-        //check if there is exact match filter on this column
+-        int nextValueId;
+-        if (eligibleEqualityPredicatesMap.containsKey(nextDimension)) {
+-          nextValueId = eligibleEqualityPredicatesMap.get(nextDimension).dictionaryId;
+-        } else {
+-          nextValueId = StarTreeIndexNode.all();
+-        }
+-        SearchEntry newEntry = new SearchEntry();
+-        newEntry.starTreeIndexnode = current.getChildren().get(nextValueId);
+-        if (newEntry.starTreeIndexnode != null) {
+-          newEntry.remainingPredicates = newRemainingPredicates;
+-          searchQueue.add(newEntry);
+-        }
+-      } else {
+-        //if there is a group by
+-        for (Map.Entry<Integer, StarTreeIndexNode> entry : current.getChildren().entrySet()) {
+-          if (entry.getKey() != StarTreeIndexNode.all()) {
+-            SearchEntry newEntry = new SearchEntry();
+-            newEntry.starTreeIndexnode = entry.getValue();
+-            newEntry.remainingPredicates = newRemainingPredicates;
+-            searchQueue.add(newEntry);
++      // Find next set of nodes to search
++      String nextDimension =
++          dimensionIndexToNameMapping.inverse().get(current.getChildDimensionName());
++
++      HashSet<String> newRemainingPredicateColumns = new HashSet<>();
++      newRemainingPredicateColumns.addAll(remainingPredicateColumns);
++      HashSet<String> newRemainingGroupByColumns = new HashSet<>();
++      newRemainingGroupByColumns.addAll(remainingGroupByColumns);
++
++      addMatchingChildrenToQueue(searchQueue, current, nextDimension, newRemainingPredicateColumns,
++          newRemainingGroupByColumns);
++    }
++    return matchedEntries;
++  }
++
++  /**
++   * Helper method to add matching children into the search queue.
++   * - If predicate can be applied (i.e. equality predicate that is eligible), add the child
++   * satisfying the predicate into the queue.
++   * - If predicate cannot be applied (either inEligible or nonEquality), add all children to the
++   * queue.
++   * - If no predicate on the column, add the star-child to the queue
++   * @param searchQueue
++   * @param node
++   * @param column
++   * @param remainingPredicateColumns
++   * @param remainingGroupByColumns
++   */
++  private void addMatchingChildrenToQueue(Queue<SearchEntry> searchQueue, StarTreeIndexNode node,
++      String column, HashSet<String> remainingPredicateColumns,
++      HashSet<String> remainingGroupByColumns) {
++    Map<Integer, StarTreeIndexNode> children = node.getChildren();
++
++    if (equalityPredicateColumns.contains(column)) {
++      // Check if there is exact match filter on this column
++      int nextValueId;
++      PredicateEntry predicateEntry = predicatesMap.get(column);
++      nextValueId = predicateEntry.dictionaryId;
++      remainingPredicateColumns.remove(column);
++      remainingGroupByColumns.remove(column);
++      if (children.containsKey(nextValueId)) {
++        addNodeToSearchQueue(searchQueue, children.get(nextValueId), remainingPredicateColumns,
++            remainingGroupByColumns);
++      }
++    } else {
++      int nextValueId;
++      if (groupByColumns.contains(column) || predicatesMap.containsKey(column)
++          || !children.containsKey(StarTreeIndexNode.all())) {
++        for (StarTreeIndexNode indexNode : children.values()) {
++          if (indexNode.getDimensionValue() != StarTreeIndexNode.all()) {
++            remainingPredicateColumns.remove(column);
++            remainingGroupByColumns.remove(column);
++            addNodeToSearchQueue(searchQueue, indexNode, remainingPredicateColumns,
++                remainingGroupByColumns);
+           }
+         }
++      } else {
++        // Since we have a star node and no group by on this column we can take lose this dimension
++        // by taking star node path
++        nextValueId = StarTreeIndexNode.all();
++        addNodeToSearchQueue(searchQueue, children.get(nextValueId), remainingPredicateColumns,
++            remainingGroupByColumns);
+       }
+     }
+-    return matchedEntries;
++  }
++
++  /**
++   * Helper method to add the given node the the provided queue.
++   * @param searchQueue
++   * @param node
++   * @param predicateColumns
++   * @param groupByColumns
++   */
++  private void addNodeToSearchQueue(Queue<SearchEntry> searchQueue, StarTreeIndexNode node,
++      HashSet<String> predicateColumns, HashSet<String> groupByColumns) {
++    SearchEntry newEntry = new SearchEntry();
++    newEntry.starTreeIndexnode = node;
++    newEntry.remainingPredicateColumns = predicateColumns;
++    newEntry.remainingGroupByColumns = groupByColumns;
++    searchQueue.add(newEntry);
+   }
+ 
+   class SearchEntry {
+     StarTreeIndexNode starTreeIndexnode;
+-    HashSet<String> remainingPredicates;
++    HashSet<String> remainingPredicateColumns;
++    HashSet<String> remainingGroupByColumns;
+ 
+     @Override
+     public String toString() {
+       StringBuilder sb = new StringBuilder();
+       sb.append(starTreeIndexnode);
+-      sb.append("\t").append(remainingPredicates);
++      sb.append("\t").append(remainingPredicateColumns);
+       return sb.toString();
+     }
+   }
+diff --git a/pinot-core/src/main/java/com/linkedin/pinot/core/segment/creator/impl/stats/SegmentPreIndexStatsCollectorImpl.java b/pinot-core/src/main/java/com/linkedin/pinot/core/segment/creator/impl/stats/SegmentPreIndexStatsCollectorImpl.java
+index 223ef2900ec..7acc6aa2271 100644
+--- a/pinot-core/src/main/java/com/linkedin/pinot/core/segment/creator/impl/stats/SegmentPreIndexStatsCollectorImpl.java
++++ b/pinot-core/src/main/java/com/linkedin/pinot/core/segment/creator/impl/stats/SegmentPreIndexStatsCollectorImpl.java
+@@ -91,7 +91,12 @@ public void collectRow(GenericRow row) throws Exception {
+   public void collectRow(GenericRow row, boolean isAggregated) throws Exception {
+     for (final String column : row.getFieldNames()) {
+       if (columnStatsCollectorMap.containsKey(column)) {
+-        columnStatsCollectorMap.get(column).collect(row.getValue(column), isAggregated);
++        try {
++          columnStatsCollectorMap.get(column).collect(row.getValue(column), isAggregated);
++        } catch (Exception e) {
++          LOGGER.error("Exception while collecting stats for column:{} in row:{}", column, row);
++          throw e;
++        }
+       }
+     }
+   }
+diff --git a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/MetricBuffer.java b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/MetricBuffer.java
+index 4f3d372d44d..82ed5b89c34 100644
+--- a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/MetricBuffer.java
++++ b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/MetricBuffer.java
+@@ -29,6 +29,10 @@ public MetricBuffer(Number[] numbers) {
+     this.numbers = numbers;
+   }
+ 
++  public MetricBuffer(MetricBuffer copy) {
++    this.numbers = Arrays.copyOf(copy.numbers, copy.numbers.length);
++  }
++
+   public static MetricBuffer fromBytes(byte[] bytes, List<DataType> metricTypes) {
+     ByteBuffer buffer = ByteBuffer.wrap(bytes);
+     Number[] numbers = new Number[metricTypes.size()];
+diff --git a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/OffHeapStarTreeBuilder.java b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/OffHeapStarTreeBuilder.java
+index 629fd1019b6..9834d8aff4d 100644
+--- a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/OffHeapStarTreeBuilder.java
++++ b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/OffHeapStarTreeBuilder.java
+@@ -15,6 +15,19 @@
+  */
+ package com.linkedin.pinot.core.startree;
+ 
++import com.google.common.base.Objects;
++import com.google.common.base.Preconditions;
++import com.google.common.collect.BiMap;
++import com.google.common.collect.HashBiMap;
++import com.linkedin.pinot.common.data.DimensionFieldSpec;
++import com.linkedin.pinot.common.data.FieldSpec;
++import com.linkedin.pinot.common.data.FieldSpec.DataType;
++import com.linkedin.pinot.common.data.MetricFieldSpec;
++import com.linkedin.pinot.common.data.Schema;
++import com.linkedin.pinot.common.data.TimeFieldSpec;
++import com.linkedin.pinot.common.utils.Pairs.IntPair;
++import com.linkedin.pinot.core.data.GenericRow;
++import com.linkedin.pinot.core.segment.creator.impl.V1Constants;
+ import java.io.BufferedOutputStream;
+ import java.io.DataOutputStream;
+ import java.io.File;
+@@ -26,9 +39,10 @@
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+-
++import java.util.Queue;
+ import java.util.Set;
+ import org.apache.commons.io.FileUtils;
+ import org.apache.commons.lang3.tuple.Pair;
+@@ -37,24 +51,13 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import com.google.common.base.Objects;
+-import com.google.common.collect.BiMap;
+-import com.google.common.collect.HashBiMap;
+-import com.linkedin.pinot.common.data.DimensionFieldSpec;
+-import com.linkedin.pinot.common.data.MetricFieldSpec;
+-import com.linkedin.pinot.common.data.FieldSpec.DataType;
+-import com.linkedin.pinot.common.data.Schema;
+-import com.linkedin.pinot.common.utils.Pairs.IntPair;
+-import com.linkedin.pinot.core.data.GenericRow;
+-import com.linkedin.pinot.core.segment.creator.impl.V1Constants;
+-
+-
+ /**
+- * Uses file to build the star tree. Each row is divided into dimension and metrics. Time is added to dimension list.
+- * We use the split order to build the tree. In most cases, split order will be ranked depending on the cardinality (descending order).
++ * Uses file to build the star tree. Each row is divided into dimension and metrics. Time is added
++ * to dimension list.
++ * We use the split order to build the tree. In most cases, split order will be ranked depending on
++ * the cardinality (descending order).
+  * Time column will be excluded or last entry in split order irrespective of its cardinality
+  * This is a recursive algorithm where we branch on one dimension at every level.
+- *
+  * <b>Psuedo algo</b>
+  * <code>
+  *
+@@ -140,7 +143,7 @@ public void init(StarTreeBuilderConfig builderConfig) throws Exception {
+     dimensionNameToStarValueMap = new HashMap<>();
+     dictionaryMap = new HashMap<>();
+ 
+-    //READ DIMENSIONS COLUMNS
++    // READ DIMENSIONS COLUMNS
+     List<DimensionFieldSpec> dimensionFieldSpecs = schema.getDimensionFieldSpecs();
+     for (int index = 0; index < dimensionFieldSpecs.size(); index++) {
+       DimensionFieldSpec spec = dimensionFieldSpecs.get(index);
+@@ -154,19 +157,24 @@ public void init(StarTreeBuilderConfig builderConfig) throws Exception {
+       HashBiMap<Object, Integer> dictionary = HashBiMap.create();
+       dictionaryMap.put(dimensionName, dictionary);
+     }
+-    //treat time column as just another dimension, only difference is that we will never split on this dimension unless explicitly specified in split order
++    // treat time column as just another dimension, only difference is that we will never split on
++    // this dimension unless explicitly specified in split order
+     if (timeColumnName != null) {
+       dimensionNames.add(timeColumnName);
+-      dimensionTypes.add(schema.getTimeFieldSpec().getDataType());
++      TimeFieldSpec timeFieldSpec = schema.getTimeFieldSpec();
++      dimensionTypes.add(timeFieldSpec.getDataType());
+       int index = dimensionNameToIndexMap.size();
+       dimensionNameToIndexMap.put(timeColumnName, index);
++      Object starValue;
++      starValue = getAllStarValue(timeFieldSpec);
++      dimensionNameToStarValueMap.put(timeColumnName, starValue);
+       HashBiMap<Object, Integer> dictionary = HashBiMap.create();
+       dictionaryMap.put(schema.getTimeColumnName(), dictionary);
+     }
+     dimensionSizeBytes = dimensionNames.size() * Integer.SIZE / 8;
+     this.numDimensions = dimensionNames.size();
+ 
+-    //READ METRIC COLUMNS
++    // READ METRIC COLUMNS
+     this.metricTypes = new ArrayList<>();
+     this.metricNames = new ArrayList<>();
+ 
+@@ -187,7 +195,7 @@ public void init(StarTreeBuilderConfig builderConfig) throws Exception {
+     dataFile = new File(outDir, "star-tree.buf");
+     dataBuffer = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(dataFile)));
+ 
+-    //INITIALIZE THE ROOT NODE
++    // INITIALIZE THE ROOT NODE
+     this.starTreeRootIndexNode = new StarTreeIndexNode();
+     this.starTreeRootIndexNode.setDimensionName(StarTreeIndexNode.all());
+     this.starTreeRootIndexNode.setDimensionValue(StarTreeIndexNode.all());
+@@ -197,7 +205,8 @@ public void init(StarTreeBuilderConfig builderConfig) throws Exception {
+   }
+ 
+   /**
+-   * Validate the split order by removing any dimensions that may be part of the skip materialization list.
++   * Validate the split order by removing any dimensions that may be part of the skip
++   * materialization list.
+    * @param dimensionsSplitOrder
+    * @param skipMaterializationForDimensions
+    * @return
+@@ -206,7 +215,8 @@ private List<String> sanitizeSplitOrder(List<String> dimensionsSplitOrder,
+       Set<String> skipMaterializationForDimensions) {
+     List<String> validatedSplitOrder = new ArrayList<String>();
+     for (String dimension : dimensionsSplitOrder) {
+-      if (skipMaterializationForDimensions == null || !skipMaterializationForDimensions.contains(dimension)) {
++      if (skipMaterializationForDimensions == null
++          || !skipMaterializationForDimensions.contains(dimension)) {
+         LOG.info("Adding dimension {} to split order", dimension);
+         validatedSplitOrder.add(dimension);
+       } else {
+@@ -218,30 +228,30 @@ private List<String> sanitizeSplitOrder(List<String> dimensionsSplitOrder,
+     return validatedSplitOrder;
+   }
+ 
+-  private Object getAllStarValue(DimensionFieldSpec spec) throws Exception {
++  private Object getAllStarValue(FieldSpec spec) throws Exception {
+     switch (spec.getDataType()) {
+-      case STRING:
+-        return "ALL";
+-      case BOOLEAN:
+-      case BYTE:
+-      case CHAR:
+-      case DOUBLE:
+-      case FLOAT:
+-      case INT:
+-      case LONG:
+-        return spec.getDefaultNullValue();
+-      case OBJECT:
+-      case SHORT:
+-      case DOUBLE_ARRAY:
+-      case CHAR_ARRAY:
+-      case FLOAT_ARRAY:
+-      case INT_ARRAY:
+-      case LONG_ARRAY:
+-      case SHORT_ARRAY:
+-      case STRING_ARRAY:
+-      case BYTE_ARRAY:
+-      default:
+-        throw new Exception("Unsupported dimension data type" + spec);
++    case STRING:
++      return "ALL";
++    case BOOLEAN:
++    case BYTE:
++    case CHAR:
++    case DOUBLE:
++    case FLOAT:
++    case INT:
++    case LONG:
++      return spec.getDefaultNullValue();
++    case OBJECT:
++    case SHORT:
++    case DOUBLE_ARRAY:
++    case CHAR_ARRAY:
++    case FLOAT_ARRAY:
++    case INT_ARRAY:
++    case LONG_ARRAY:
++    case SHORT_ARRAY:
++    case STRING_ARRAY:
++    case BYTE_ARRAY:
++    default:
++      throw new Exception("Unsupported dimension data type" + spec);
+     }
+   }
+ 
+@@ -272,8 +282,10 @@ public void append(GenericRow row) throws Exception {
+       Map<Object, Integer> dictionary = dictionaryMap.get(dimName);
+       Object dimValue = row.getValue(dimName);
+       if (dimValue == null) {
+-        //TODO: Have another default value to represent STAR. Using default value to represent STAR as of now.
+-        //It does not matter during query execution, since we know that values is STAR from the star tree
++        // TODO: Have another default value to represent STAR. Using default value to represent STAR
++        // as of now.
++        // It does not matter during query execution, since we know that values is STAR from the
++        // star tree
+         dimValue = dimensionNameToStarValueMap.get(dimName);
+       }
+       if (!dictionary.containsKey(dimValue)) {
+@@ -299,13 +311,14 @@ private void appendToRawBuffer(DimensionBuffer dimension, MetricBuffer metrics)
+     rawRecordCount++;
+   }
+ 
+-  private void appendToAggBuffer(DimensionBuffer dimension, MetricBuffer metrics) throws IOException {
++  private void appendToAggBuffer(DimensionBuffer dimension, MetricBuffer metrics)
++      throws IOException {
+     appendToBuffer(dataBuffer, dimension, metrics);
+     aggRecordCount++;
+   }
+ 
+-  private void appendToBuffer(DataOutputStream dos, DimensionBuffer dimensions, MetricBuffer metricHolder)
+-      throws IOException {
++  private void appendToBuffer(DataOutputStream dos, DimensionBuffer dimensions,
++      MetricBuffer metricHolder) throws IOException {
+     for (int i = 0; i < numDimensions; i++) {
+       dos.writeInt(dimensions.getDimension(i));
+     }
+@@ -327,11 +340,17 @@ public void build() throws Exception {
+     LOG.debug("Split order:{}", dimensionsSplitOrder);
+     long start = System.currentTimeMillis();
+     dataBuffer.flush();
++    // Sort the data based on default sort order (split order + remaining dimensions)
+     sort(dataFile, 0, rawRecordCount);
++    // Recursively construct the star tree, continuously sorting the data
+     constructStarTree(starTreeRootIndexNode, 0, rawRecordCount, 0, dataFile);
++    // Split the leaf nodes on time column
++    splitLeafNodesOnTimeColumn();
++    // Create aggregate rows for all nodes in the tree
++    createAggDocForAllNodes(starTreeRootIndexNode);
+     long end = System.currentTimeMillis();
+-    LOG.debug("Took {} ms to build star tree index. Original records:{} Materialized record:{}", (end - start),
+-        rawRecordCount, aggRecordCount);
++    LOG.debug("Took {} ms to build star tree index. Original records:{} Materialized record:{}",
++        (end - start), rawRecordCount, aggRecordCount);
+     starTree = new StarTree(starTreeRootIndexNode, dimensionNameToIndexMap);
+     File treeBinary = new File(outDir, "star-tree.bin");
+     LOG.debug("Saving tree binary at: {} ", treeBinary);
+@@ -341,6 +360,146 @@ public void build() throws Exception {
+     dataBuffer.close();
+   }
+ 
++  /**
++   * Create aggregated docs using BFS
++   * @param node
++   */
++  private MetricBuffer createAggDocForAllNodes(StarTreeIndexNode node) throws Exception {
++    MetricBuffer aggMetricBuffer = null;
++    if (node.isLeaf()) {
++      StarTreeDataTable leafDataTable =
++          new StarTreeDataTable(dataFile, dimensionSizeBytes, metricSizeBytes, null);
++      Iterator<Pair<byte[], byte[]>> iterator =
++          leafDataTable.iterator(node.getStartDocumentId(), node.getEndDocumentId());
++      Pair<byte[], byte[]> first = iterator.next();
++      aggMetricBuffer = MetricBuffer.fromBytes(first.getRight(), metricTypes);
++      while (iterator.hasNext()) {
++        Pair<byte[], byte[]> next = iterator.next();
++        MetricBuffer metricBuffer = MetricBuffer.fromBytes(next.getRight(), metricTypes);
++        aggMetricBuffer.aggregate(metricBuffer, metricTypes);
++      }
++    } else {
++
++      Map<Integer, StarTreeIndexNode> children = node.getChildren();
++      for (StarTreeIndexNode child : children.values()) {
++        MetricBuffer childMetricBuffer = createAggDocForAllNodes(child);
++        // don't use the star node value to compute aggregate for the parent
++        if (child.getDimensionValue() == StarTreeIndexNode.all()) {
++          continue;
++        }
++        if (aggMetricBuffer == null) {
++          aggMetricBuffer = new MetricBuffer(childMetricBuffer);
++        } else {
++          aggMetricBuffer.aggregate(childMetricBuffer, metricTypes);
++        }
++      }
++    }
++    //compute the dimension values for this node using the path, can be optimized by passing the path in the method call.
++    Map<Integer, Integer> pathValues = node.getPathValues();
++    DimensionBuffer dimensionBuffer = new DimensionBuffer(numDimensions);
++    for (int i = 0; i < numDimensions; i++) {
++      if (pathValues.containsKey(i)) {
++        dimensionBuffer.setDimension(i, pathValues.get(i));
++      } else {
++        dimensionBuffer.setDimension(i, StarTreeIndexNode.all());
++      }
++    }
++    node.setAggregatedDocumentId(rawRecordCount + aggRecordCount);
++    appendToAggBuffer(dimensionBuffer, aggMetricBuffer);
++    return aggMetricBuffer;
++
++  }
++
++  /**
++   * Helper method that visits each leaf node does the following:
++   * - Re-orders the doc-id's corresponding to leaf node wrt time column.
++   * - Create children nodes for each time value under this leaf node.
++   * - Adds a new record with aggregated data for this leaf node.
++   * @throws Exception
++   */
++  private void splitLeafNodesOnTimeColumn() throws Exception {
++    Queue<StarTreeIndexNode> nodes = new LinkedList<>();
++    nodes.add(starTreeRootIndexNode);
++
++    while (!nodes.isEmpty()) {
++      StarTreeIndexNode node = nodes.remove();
++      if (node.isLeaf()) {
++        // If we have time column, split on time column, helps in time based filtering
++        if (timeColumnName != null) {
++          int level = node.getLevel();
++          int[] newSortOrder = moveColumnInSortOrder(timeColumnName, getSortOrder(), level);
++
++          StarTreeDataTable leafDataTable =
++              new StarTreeDataTable(dataFile, dimensionSizeBytes, metricSizeBytes, newSortOrder);
++          int startDocId = node.getStartDocumentId();
++          int endDocId = node.getEndDocumentId();
++          leafDataTable.sort(startDocId, endDocId);
++          int timeColIndex = dimensionNameToIndexMap.get(timeColumnName);
++          Map<Integer, IntPair> timeColumnRangeMap =
++              leafDataTable.groupByIntColumnCount(startDocId, endDocId, timeColIndex);
++
++          node.setChildDimensionName(timeColIndex);
++          node.setChildren(new HashMap<Integer, StarTreeIndexNode>());
++
++          for (int timeValue : timeColumnRangeMap.keySet()) {
++            IntPair range = timeColumnRangeMap.get(timeValue);
++            StarTreeIndexNode child = new StarTreeIndexNode();
++            child.setDimensionName(timeColIndex);
++            child.setDimensionValue(timeValue);
++            child.setParent(node);
++            child.setLevel(node.getLevel() + 1);
++            child.setStartDocumentId(range.getLeft());
++            child.setEndDocumentId(range.getRight());
++            node.getChildren().put(timeValue, child);
++          }
++        }
++      } else {
++        nodes.addAll(node.getChildren().values());
++      }
++    }
++  }
++
++  /**
++   * Helper method that moves the given column from its current position to
++   * the specified new position.
++   * @param columnToMove
++   * @param origSortOrder
++   * @param newPositionForTimeColumn
++   * @return
++   */
++  private int[] moveColumnInSortOrder(String columnToMove, int[] origSortOrder,
++      int newPositionForTimeColumn) {
++    Preconditions.checkArgument(columnToMove != null);
++    Preconditions.checkArgument(
++        newPositionForTimeColumn >= 0 && newPositionForTimeColumn < origSortOrder.length);
++
++    int timeDimensionIndex = dimensionNameToIndexMap.get(columnToMove);
++    int[] newSortOrder = new int[origSortOrder.length];
++    int index = 0;
++
++    // Retain the sort order based on the path to this leaf node
++    for (int i = 0; i < newPositionForTimeColumn; i++) {
++      newSortOrder[index++] = origSortOrder[i];
++    }
++
++    // Move time to the front
++    newSortOrder[index++] = timeDimensionIndex;
++
++    // Append remaining columns
++    for (int i = newPositionForTimeColumn; i < numDimensions; i++) {
++      if (i != timeDimensionIndex) {
++        newSortOrder[index++] = origSortOrder[i];
++      }
++    }
++
++    return newSortOrder;
++  }
++
++  /**
++   * Debug method to print the tree.
++   * @param node
++   * @param level
++   */
+   private void printTree(StarTreeIndexNode node, int level) {
+     for (int i = 0; i < level; i++) {
+       LOG.debug("  ");
+@@ -354,12 +513,14 @@ private void printTree(StarTreeIndexNode node, int level) {
+     if (node.getDimensionValue() != StarTreeIndexNode.all()) {
+       dimValue = dictionaryMap.get(dimName).inverse().get(node.getDimensionValue());
+     }
+-    String formattedOutput =
+-        Objects.toStringHelper(node).add("nodeId", node.getNodeId()).add("level", level).add("dimensionName", dimName)
+-            .add("dimensionValue", dimValue).add("childDimensionName", inverse.get(node.getChildDimensionName()))
+-            .add("childCount", node.getChildren() == null ? 0 : node.getChildren().size())
+-            .add("startDocumentId", node.getStartDocumentId()).add("endDocumentId", node.getEndDocumentId())
+-            .add("documentCount", (node.getEndDocumentId() - node.getStartDocumentId())).toString();
++
++    String formattedOutput = Objects.toStringHelper(node).add("nodeId", node.getNodeId())
++        .add("level", level).add("dimensionName", dimName).add("dimensionValue", dimValue)
++        .add("childDimensionName", inverse.get(node.getChildDimensionName()))
++        .add("childCount", node.getChildren() == null ? 0 : node.getChildren().size())
++        .add("startDocumentId", node.getStartDocumentId())
++        .add("endDocumentId", node.getEndDocumentId())
++        .add("documentCount", (node.getEndDocumentId() - node.getStartDocumentId())).toString();
+     LOG.debug(formattedOutput);
+ 
+     if (!node.isLeaf()) {
+@@ -372,9 +533,11 @@ private void printTree(StarTreeIndexNode node, int level) {
+ 
+   private List<String> computeDefaultSplitOrder() {
+     ArrayList<String> defaultSplitOrder = new ArrayList<>();
+-    //include only the dimensions not time column. Also, assumes that skipMaterializationForDimensions is built.
++    // include only the dimensions not time column. Also, assumes that
++    // skipMaterializationForDimensions is built.
+     for (String dimensionName : dimensionNames) {
+-      if (skipMaterializationForDimensions != null && !skipMaterializationForDimensions.contains(dimensionName)) {
++      if (skipMaterializationForDimensions != null
++          && !skipMaterializationForDimensions.contains(dimensionName)) {
+         defaultSplitOrder.add(dimensionName);
+       }
+     }
+@@ -384,13 +547,12 @@ private List<String> computeDefaultSplitOrder() {
+     Collections.sort(defaultSplitOrder, new Comparator<String>() {
+       @Override
+       public int compare(String o1, String o2) {
+-        return dictionaryMap.get(o2).size() - dictionaryMap.get(o1).size(); //descending
++        return dictionaryMap.get(o2).size() - dictionaryMap.get(o1).size(); // descending
+       }
+     });
+     return defaultSplitOrder;
+   }
+ 
+-
+   private Set<String> computeDefaultDimensionsToSkipMaterialization() {
+     Set<String> skipDimensions = new HashSet<String>();
+     for (String dimensionName : dimensionNames) {
+@@ -401,7 +563,6 @@ private Set<String> computeDefaultDimensionsToSkipMaterialization() {
+     return skipDimensions;
+   }
+ 
+-
+   /*
+    * Sorts the file on all dimensions
+    */
+@@ -411,7 +572,8 @@ private void sort(File file, int startDocId, int endDocId) throws IOException {
+       printFile(file, startDocId, endDocId);
+     }
+ 
+-    StarTreeDataTable dataSorter = new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
++    StarTreeDataTable dataSorter =
++        new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
+     dataSorter.sort(startDocId, endDocId, 0, dimensionSizeBytes);
+     if (debugMode) {
+       LOG.info("AFTER SORTING");
+@@ -425,7 +587,7 @@ private int[] getSortOrder() {
+       for (int i = 0; i < dimensionsSplitOrder.size(); i++) {
+         sortOrder[i] = dimensionNameToIndexMap.get(dimensionsSplitOrder.get(i));
+       }
+-      //add remaining dimensions that were not part of dimensionsSplitOrder
++      // add remaining dimensions that were not part of dimensionsSplitOrder
+       int counter = 0;
+       for (String dimName : dimensionNames) {
+         if (!dimensionsSplitOrder.contains(dimName)) {
+@@ -439,7 +601,8 @@ private int[] getSortOrder() {
+ 
+   private void printFile(File file, int startDocId, int endDocId) throws IOException {
+     LOG.info("Contents of file:{} from:{} to:{}", file.getName(), startDocId, endDocId);
+-    StarTreeDataTable dataSorter = new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
++    StarTreeDataTable dataSorter =
++        new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
+     Iterator<Pair<byte[], byte[]>> iterator = dataSorter.iterator(startDocId, endDocId);
+     int numRecordsToPrint = 100;
+     int counter = 0;
+@@ -453,17 +616,18 @@ private void printFile(File file, int startDocId, int endDocId) throws IOExcepti
+     }
+   }
+ 
+-  private int constructStarTree(StarTreeIndexNode node, int startDocId, int endDocId, int level, File file)
+-      throws Exception {
+-    //node.setStartDocumentId(startDocId);
++  private int constructStarTree(StarTreeIndexNode node, int startDocId, int endDocId, int level,
++      File file) throws Exception {
++    // node.setStartDocumentId(startDocId);
+     int docsAdded = 0;
+     if (level == dimensionsSplitOrder.size() - 1) {
+       return 0;
+     }
+     String splitDimensionName = dimensionsSplitOrder.get(level);
+     Integer splitDimensionId = dimensionNameToIndexMap.get(splitDimensionName);
+-    LOG.debug("Building tree at level:{} using file:{} from startDoc:{} endDocId:{} splitting on dimension:{}", level,
+-        file.getName(), startDocId, endDocId, splitDimensionName);
++    LOG.debug(
++        "Building tree at level:{} using file:{} from startDoc:{} endDocId:{} splitting on dimension:{}",
++        level, file.getName(), startDocId, endDocId, splitDimensionName);
+     Map<Integer, IntPair> sortGroupBy = groupBy(startDocId, endDocId, splitDimensionId, file);
+     LOG.debug("Group stats:{}", sortGroupBy);
+     node.setChildDimensionName(splitDimensionId);
+@@ -495,11 +659,12 @@ private int constructStarTree(StarTreeIndexNode node, int startDocId, int endDoc
+     }
+ 
+     // Return if star node does not need to be created.
+-    if (skipStarNodeCreationForDimensions != null && skipStarNodeCreationForDimensions.contains(splitDimensionName)) {
++    if (skipStarNodeCreationForDimensions != null
++        && skipStarNodeCreationForDimensions.contains(splitDimensionName)) {
+       return docsAdded;
+     }
+ 
+-    //create star node
++    // create star node
+     StarTreeIndexNode starChild = new StarTreeIndexNode();
+     starChild.setDimensionName(splitDimensionId);
+     starChild.setDimensionValue(StarTreeIndexNode.all());
+@@ -524,13 +689,14 @@ private int constructStarTree(StarTreeIndexNode node, int startDocId, int endDoc
+     }
+     docsAdded += rowsAdded;
+     LOG.debug("Added {} additional records at level {}", rowsAdded, level);
+-    //flush
++    // flush
+     dataBuffer.flush();
+ 
+     int childDocs = 0;
+     if (rowsAdded >= maxLeafRecords) {
+       sort(dataFile, startOffset, startOffset + rowsAdded);
+-      childDocs = constructStarTree(starChild, startOffset, startOffset + rowsAdded, level + 1, dataFile);
++      childDocs =
++          constructStarTree(starChild, startOffset, startOffset + rowsAdded, level + 1, dataFile);
+       docsAdded += childDocs;
+     }
+ 
+@@ -539,12 +705,13 @@ private int constructStarTree(StarTreeIndexNode node, int startDocId, int endDoc
+       starChild.setStartDocumentId(startOffset);
+       starChild.setEndDocumentId(startOffset + rowsAdded);
+     }
+-    //node.setEndDocumentId(endDocId + docsAdded);
++    // node.setEndDocumentId(endDocId + docsAdded);
+     return docsAdded;
+   }
+ 
+   /**
+-   * Assumes the file is already sorted, returns the unique combinations after removing a specified dimension.
++   * Assumes the file is already sorted, returns the unique combinations after removing a specified
++   * dimension.
+    * Aggregates the metrics for each unique combination, currently only sum is supported by default
+    * @param startDocId
+    * @param endDocId
+@@ -553,12 +720,15 @@ private int constructStarTree(StarTreeIndexNode node, int startDocId, int endDoc
+    * @return
+    * @throws Exception
+    */
+-  private Iterator<Pair<DimensionBuffer, MetricBuffer>> uniqueCombinations(int startDocId, int endDocId, File file,
+-      int splitDimensionId) throws Exception {
+-    StarTreeDataTable dataSorter = new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
++  private Iterator<Pair<DimensionBuffer, MetricBuffer>> uniqueCombinations(int startDocId,
++      int endDocId, File file, int splitDimensionId) throws Exception {
++    StarTreeDataTable dataSorter =
++        new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
+     Iterator<Pair<byte[], byte[]>> iterator1 = dataSorter.iterator(startDocId, endDocId);
+-    File tempFile = new File(outDir, file.getName() + "_" + startDocId + "_" + endDocId + ".unique.tmp");
+-    DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(tempFile)));
++    File tempFile =
++        new File(outDir, file.getName() + "_" + startDocId + "_" + endDocId + ".unique.tmp");
++    DataOutputStream dos =
++        new DataOutputStream(new BufferedOutputStream(new FileOutputStream(tempFile)));
+     while (iterator1.hasNext()) {
+       Pair<byte[], byte[]> next = iterator1.next();
+       byte[] dimensionBuffer = next.getLeft();
+@@ -566,8 +736,8 @@ private Iterator<Pair<DimensionBuffer, MetricBuffer>> uniqueCombinations(int sta
+       DimensionBuffer dimensions = DimensionBuffer.fromBytes(dimensionBuffer);
+       for (int i = 0; i < numDimensions; i++) {
+         String dimensionName = dimensionNameToIndexMap.inverse().get(i);
+-        if (i == splitDimensionId || (skipMaterializationForDimensions != null &&
+-            skipMaterializationForDimensions.contains(dimensionName))) {
++        if (i == splitDimensionId || (skipMaterializationForDimensions != null
++            && skipMaterializationForDimensions.contains(dimensionName))) {
+           dos.writeInt(StarTreeIndexNode.all());
+         } else {
+           dos.writeInt(dimensions.getDimension(i));
+@@ -576,7 +746,8 @@ private Iterator<Pair<DimensionBuffer, MetricBuffer>> uniqueCombinations(int sta
+       dos.write(metricBuffer);
+     }
+     dos.close();
+-    dataSorter = new StarTreeDataTable(tempFile, dimensionSizeBytes, metricSizeBytes, getSortOrder());
++    dataSorter =
++        new StarTreeDataTable(tempFile, dimensionSizeBytes, metricSizeBytes, getSortOrder());
+     dataSorter.sort(0, endDocId - startDocId);
+     if (debugMode) {
+       printFile(tempFile, 0, endDocId - startDocId);
+@@ -604,10 +775,12 @@ public Pair<DimensionBuffer, MetricBuffer> next() {
+           byte[] dimBuffer = next.getLeft();
+           byte[] metricBuffer = next.getRight();
+           if (prev == null) {
+-            prev = Pair.of(DimensionBuffer.fromBytes(dimBuffer), MetricBuffer.fromBytes(metricBuffer, metricTypes));
++            prev = Pair.of(DimensionBuffer.fromBytes(dimBuffer),
++                MetricBuffer.fromBytes(metricBuffer, metricTypes));
+           } else {
+             Pair<DimensionBuffer, MetricBuffer> current =
+-                Pair.of(DimensionBuffer.fromBytes(dimBuffer), MetricBuffer.fromBytes(metricBuffer, metricTypes));
++                Pair.of(DimensionBuffer.fromBytes(dimBuffer),
++                    MetricBuffer.fromBytes(metricBuffer, metricTypes));
+             if (!current.getLeft().equals(prev.getLeft())) {
+               Pair<DimensionBuffer, MetricBuffer> ret = prev;
+               prev = current;
+@@ -626,15 +799,18 @@ public Pair<DimensionBuffer, MetricBuffer> next() {
+   }
+ 
+   /**
+-   * sorts the file from start to end on a dimension index
++   * Group by on dimension column, assumes data is already sorted on this dimension from start to
++   * end doc id
+    * @param startDocId
+    * @param endDocId
+    * @param dimension
+    * @param file
+    * @return
+    */
+-  private Map<Integer, IntPair> groupBy(int startDocId, int endDocId, Integer dimension, File file) {
+-    StarTreeDataTable dataSorter = new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
++  private Map<Integer, IntPair> groupBy(int startDocId, int endDocId, Integer dimension,
++      File file) {
++    StarTreeDataTable dataSorter =
++        new StarTreeDataTable(file, dimensionSizeBytes, metricSizeBytes, getSortOrder());
+     return dataSorter.groupByIntColumnCount(startDocId, endDocId, dimension);
+   }
+ 
+@@ -643,7 +819,8 @@ private Map<Integer, IntPair> groupBy(int startDocId, int endDocId, Integer dime
+    */
+   @Override
+   public Iterator<GenericRow> iterator(final int startDocId, final int endDocId) throws Exception {
+-    StarTreeDataTable dataSorter = new StarTreeDataTable(dataFile, dimensionSizeBytes, metricSizeBytes, getSortOrder());
++    StarTreeDataTable dataSorter =
++        new StarTreeDataTable(dataFile, dimensionSizeBytes, metricSizeBytes, getSortOrder());
+     final Iterator<Pair<byte[], byte[]>> iterator = dataSorter.iterator(startDocId, endDocId);
+     return new Iterator<GenericRow>() {
+       @Override
+@@ -672,8 +849,8 @@ public JSONObject getStarTreeAsJSON() throws Exception {
+     return json;
+   }
+ 
+-  private void toJson(JSONObject json, StarTreeIndexNode node, Map<String, HashBiMap<Object, Integer>> dictionaryMap)
+-      throws Exception {
++  private void toJson(JSONObject json, StarTreeIndexNode node,
++      Map<String, HashBiMap<Object, Integer>> dictionaryMap) throws Exception {
+     String dimName = "ALL";
+     Object dimValue = "ALL";
+     if (node.getDimensionName() != StarTreeIndexNode.all()) {
+diff --git a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeDataTable.java b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeDataTable.java
+index 0dc42d763c5..f8ac7f88691 100644
+--- a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeDataTable.java
++++ b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeDataTable.java
+@@ -172,10 +172,8 @@ public Map<Integer, IntPair> groupByIntColumnCount(int startDocId, int endDocId,
+           prevStart = i;
+         }
+         prevValue = value;
+-        if (i == length - 1) {
+-          rangeMap.put(prevValue, new IntPair(startDocId + prevStart, startDocId + i));
+-        }
+       }
++      rangeMap.put(prevValue, new IntPair(startDocId + prevStart, endDocId));
+       return rangeMap;
+     } catch (IOException e) {
+       e.printStackTrace();
+diff --git a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeIndexNode.java b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeIndexNode.java
+index 492dc032d90..197dd429ddd 100644
+--- a/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeIndexNode.java
++++ b/pinot-core/src/main/java/com/linkedin/pinot/core/startree/StarTreeIndexNode.java
+@@ -40,11 +40,13 @@ public class StarTreeIndexNode implements Serializable {
+   private int level;
+   private int dimensionName;
+   private int dimensionValue;
+-  private int childDimensionName;
++  private int childDimensionName = -1;
+   private Map<Integer, StarTreeIndexNode> children;
+   private StarTreeIndexNode parent;
+-  private int startDocumentId;
+-  private int endDocumentId;
++  private int startDocumentId = -1;
++  private int endDocumentId = -1;
++  // materialized document id that contains aggregated data for this node
++  private int aggregatedDocumentId = -1;
+ 
+   /**
+    * An element in the StarTreeIndex.
+@@ -128,10 +130,18 @@ public void setEndDocumentId(int endDocumentId) {
+     this.endDocumentId = endDocumentId;
+   }
+ 
++  public void setAggregatedDocumentId(int aggregatedDocumentId) {
++    this.aggregatedDocumentId = aggregatedDocumentId;
++  }
++
++  public int getAggregatedDocumentId() {
++    return aggregatedDocumentId;
++  }
++
+   @Override
+   public int hashCode() {
+-    return Objects.hashCode(nodeId, dimensionName, dimensionValue, childDimensionName, startDocumentId,
+-        endDocumentId);
++    return Objects.hashCode(nodeId, dimensionName, dimensionValue, childDimensionName,
++        startDocumentId, endDocumentId, aggregatedDocumentId);
+   }
+ 
+   @Override
+@@ -141,24 +151,26 @@ public boolean equals(Object o) {
+     }
+     StarTreeIndexNode n = (StarTreeIndexNode) o;
+     return Objects.equal(nodeId, n.getNodeId()) && Objects.equal(level, n.getLevel())
+-        && Objects.equal(dimensionName, n.getDimensionName()) && Objects.equal(dimensionValue, n.getDimensionValue())
+-        && Objects.equal(childDimensionName, n.getChildDimensionName()) && Objects.equal(children, n.getChildren())
++        && Objects.equal(dimensionName, n.getDimensionName())
++        && Objects.equal(dimensionValue, n.getDimensionValue())
++        && Objects.equal(childDimensionName, n.getChildDimensionName())
++        && Objects.equal(children, n.getChildren())
+         && Objects.equal(startDocumentId, n.getStartDocumentId())
+-        && Objects.equal(endDocumentId, n.getEndDocumentId());
++        && Objects.equal(endDocumentId, n.getEndDocumentId())
++        && Objects.equal(aggregatedDocumentId, n.getAggregatedDocumentId());
+   }
+ 
+   @Override
+   public String toString() {
+-    return Objects.toStringHelper(this).add("nodeId", nodeId).add("level", level).add("dimensionName", dimensionName)
+-        .add("dimensionValue", dimensionValue).add("childDimensionName", childDimensionName)
++    return Objects.toStringHelper(this).add("nodeId", nodeId).add("level", level)
++        .add("dimensionName", dimensionName).add("dimensionValue", dimensionValue)
++        .add("childDimensionName", childDimensionName)
+         .add("childCount", children == null ? 0 : children.size())
+-        .add("startDocumentId", startDocumentId)
+-        .add("endDocumentId", endDocumentId)
++        .add("startDocumentId", startDocumentId).add("endDocumentId", endDocumentId)
+         .add("documentCount", (endDocumentId - startDocumentId))
+-        .toString();
++        .add("aggregatedDocumentId", aggregatedDocumentId).toString();
+   }
+ 
+-
+   /**
+    * Returns the dimension IDs, in order of tree level, to this node.
+    */
+diff --git a/pinot-core/src/test/java/com/linkedin/pinot/core/startree/TestStarTreeIntegrationTest.java b/pinot-core/src/test/java/com/linkedin/pinot/core/startree/TestStarTreeIntegrationTest.java
+index ae65e5f9ec8..fc3d294715e 100644
+--- a/pinot-core/src/test/java/com/linkedin/pinot/core/startree/TestStarTreeIntegrationTest.java
++++ b/pinot-core/src/test/java/com/linkedin/pinot/core/startree/TestStarTreeIntegrationTest.java
+@@ -88,7 +88,7 @@ public void testSimple() throws Exception {
+         map.put(dimName, dimName + "-v" + row % (numDimensions - i));
+       }
+       //time
+-      map.put("daysSinceEpoch", 1);
++      map.put("daysSinceEpoch", row % 7);
+       for (int i = 0; i < numMetrics; i++) {
+         String metName = schema.getMetricFieldSpecs().get(i).getName();
+         map.put(metName, 1);
+@@ -100,11 +100,13 @@ public void testSimple() throws Exception {
+     RecordReader reader = createReader(schema, data);
+     driver.init(config, reader);
+     driver.build();
+-
++    System.out.println("Generated segment at " + tempOutputDir);
+     ReadMode mode = ReadMode.heap;
+     //query to test
+     String[] metricNames = new String[] { "m1" };
+-    String query = "select sum(m1) from T";
++    String query = "select sum(m1) from T where d1 = 'd1-v2' group by d2";
++//    String query = "select sum(m1) from T";
++
+     Pql2Compiler compiler = new Pql2Compiler();
+     BrokerRequest brokerRequest = compiler.compileToBrokerRequest(query);
+ 
+@@ -142,6 +144,7 @@ public void testSimple() throws Exception {
+ 
+     double[] actualSums = computeSum(segment, starTreeDocIdIterator, metricNames);
+     System.out.println("actualSums=" + Arrays.toString(actualSums));
++    
+   }
+ 
+   private double[] computeSum(IndexSegment segment, BlockDocIdIterator docIdIterator, String... metricNames) {
+@@ -157,7 +160,7 @@ private double[] computeSum(IndexSegment segment, BlockDocIdIterator docIdIterat
+     }
+     double[] sums = new double[metricNames.length];
+     while ((docId = docIdIterator.next()) != Constants.EOF) {
+-      System.out.println("docId:" + docId);
++      System.out.println("Matching DocId: " + docId);
+       for (int i = 0; i < numMetrics; i++) {
+         valIterators[i].skipTo(docId);
+         int dictId = valIterators[i].nextIntVal();

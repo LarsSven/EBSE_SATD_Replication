@@ -1,0 +1,219 @@
+diff --git a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOITCase.java b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOITCase.java
+index d9b02fb359036..ea39124f3cc9e 100644
+--- a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOITCase.java
++++ b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOITCase.java
+@@ -24,9 +24,11 @@
+ import org.apache.flink.configuration.Configuration;
+ import org.apache.flink.configuration.GlobalConfiguration;
+ import org.apache.flink.runtime.clusterframework.messages.GetClusterStatusResponse;
++import org.apache.flink.test.testdata.WordCountData;
+ import org.apache.flink.yarn.cli.FlinkYarnSessionCli;
+ import org.apache.flink.yarn.configuration.YarnConfigOptions;
+ 
++import org.apache.commons.io.FileUtils;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.yarn.api.records.ApplicationId;
+ import org.apache.hadoop.yarn.api.records.ApplicationReport;
+@@ -53,6 +55,7 @@
+ 
+ import static org.apache.flink.yarn.UtilsTest.addTestAppender;
+ import static org.apache.flink.yarn.UtilsTest.checkForLogString;
++import static org.apache.flink.yarn.util.YarnTestUtils.getTestJarPath;
+ 
+ /**
+  * This test starts a MiniYARNCluster with a FIFO scheduler.
+@@ -85,54 +88,75 @@ public void checkForProhibitedLogContents() {
+ 	public void testDetachedMode() throws InterruptedException, IOException {
+ 		LOG.info("Starting testDetachedMode()");
+ 		addTestAppender(FlinkYarnSessionCli.class, Level.INFO);
+-		Runner runner =
+-			startWithArgs(new String[]{"-j", flinkUberjar.getAbsolutePath(),
+-						"-t", flinkLibFolder.getAbsolutePath(),
+-						"-n", "1",
+-						"-jm", "768",
+-						"-tm", "1024",
+-						"--name", "MyCustomName", // test setting a custom name
+-						"--detached"},
+-				"Flink JobManager is now running on", RunTypes.YARN_SESSION);
+-
++		File exampleJarLocation = getTestJarPath("StreamingWordCount.jar");
++		// get temporary file for reading input data for wordcount example
++		File tmpInFile;
++		try {
++			tmpInFile = tmp.newFile();
++			FileUtils.writeStringToFile(tmpInFile, WordCountData.TEXT);
++		}
++		catch (IOException e) {
++			throw new RuntimeException(e);
++		}
++		Runner runner = isNewMode ?
++				startWithArgs(new String[]{"run", "-m", "yarn-cluster",
++								"-yj", flinkUberjar.getAbsolutePath(),
++								"-yt", flinkLibFolder.getAbsolutePath(),
++								"-yn", "1",
++								"-yjm", "768",
++								"-ytm", "1024",
++								"-ynm", "MyCustomName", // test setting a custom name
++								"--detached", exampleJarLocation.getAbsolutePath(),
++								"--input", tmpInFile.getAbsoluteFile().toString()},
++						"Job has been submitted with JobID", RunTypes.CLI_FRONTEND) :
++				startWithArgs(new String[]{"-j", flinkUberjar.getAbsolutePath(),
++								"-t", flinkLibFolder.getAbsolutePath(),
++								"-n", "1",
++								"-jm", "768",
++								"-tm", "1024",
++								"--name", "MyCustomName", // test setting a custom name
++								"--detached"},
++						"Flink JobManager is now running on", RunTypes.YARN_SESSION);
+ 		// before checking any strings outputted by the CLI, first give it time to return
+ 		runner.join();
+-		checkForLogString("The Flink YARN client has been started in detached mode");
+ 
+-		if (!isNewMode) {
+-			LOG.info("Waiting until two containers are running");
+-			// wait until two containers are running
+-			while (getRunningContainers() < 2) {
+-				sleep(500);
+-			}
++		LOG.info("Waiting until two containers are running");
++		// wait until two containers are running
++		while (getRunningContainers() < 2) {
++			sleep(500);
+ 		}
+ 
+ 		// additional sleep for the JM/TM to start and establish connection
+ 		long startTime = System.nanoTime();
+ 		while (System.nanoTime() - startTime < TimeUnit.NANOSECONDS.convert(10, TimeUnit.SECONDS) &&
+ 				!(verifyStringsInNamedLogFiles(
+-						new String[]{"YARN Application Master started"}, "jobmanager.log") &&
++						new String[]{isNewMode ? "JobManager successfully registered at ResourceManager"
++								: "YARN Application Master started"}, "jobmanager.log") &&
+ 						verifyStringsInNamedLogFiles(
+-								new String[]{"Starting TaskManager actor"}, "taskmanager.log"))) {
++								new String[]{isNewMode ? "Successful registration at job manager"
++										: "Starting TaskManager actor"}, "taskmanager.log"))) {
+ 			LOG.info("Still waiting for JM/TM to initialize...");
+ 			sleep(500);
+ 		}
+ 		LOG.info("Two containers are running. Killing the application");
+ 
++		// Wait for the cluster to shutdown itself, so it wont get killed externally during shutdown.
++		sleep(2000);
+ 		// kill application "externally".
+ 		try {
+ 			YarnClient yc = YarnClient.createYarnClient();
+ 			yc.init(YARN_CONFIGURATION);
+ 			yc.start();
+ 			List<ApplicationReport> apps = yc.getApplications(EnumSet.of(YarnApplicationState.RUNNING));
+-			Assert.assertEquals(1, apps.size()); // Only one running
+-			ApplicationReport app = apps.get(0);
+-
+-			Assert.assertEquals("MyCustomName", app.getName());
+-			ApplicationId id = app.getApplicationId();
+-			yc.killApplication(id);
++			if (apps.size() > 0) {
++				ApplicationReport app = apps.get(0);
++				Assert.assertEquals("MyCustomName", app.getName());
++				ApplicationId id = app.getApplicationId();
++				yc.killApplication(id);
++			}
+ 
+-			while (yc.getApplications(EnumSet.of(YarnApplicationState.KILLED)).size() == 0) {
++			while (yc.getApplications(EnumSet.of(YarnApplicationState.KILLED)).size() == 0 &&
++					yc.getApplications(EnumSet.of(YarnApplicationState.FINISHED)).size() == 0) {
+ 				sleep(500);
+ 			}
+ 		} catch (Throwable t) {
+@@ -158,7 +182,6 @@ public void testDetachedMode() throws InterruptedException, IOException {
+ 			} catch (Exception e) {
+ 				LOG.warn("testDetachedPerJobYarnClusterInternal: Exception while deleting the JobManager address file", e);
+ 			}
+-
+ 		}
+ 
+ 		LOG.info("Finished testDetachedMode()");
+diff --git a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOSecuredITCase.java b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOSecuredITCase.java
+index 46a37a0f8fdf8..1bda82289e0eb 100644
+--- a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOSecuredITCase.java
++++ b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionFIFOSecuredITCase.java
+@@ -19,6 +19,7 @@
+ package org.apache.flink.yarn;
+ 
+ import org.apache.flink.configuration.Configuration;
++import org.apache.flink.configuration.CoreOptions;
+ import org.apache.flink.configuration.SecurityOptions;
+ import org.apache.flink.runtime.security.SecurityConfiguration;
+ import org.apache.flink.runtime.security.SecurityUtils;
+@@ -32,21 +33,35 @@
+ import org.hamcrest.Matchers;
+ import org.junit.AfterClass;
+ import org.junit.Assert;
++import org.junit.Before;
+ import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import java.io.IOException;
++import java.util.Arrays;
+ import java.util.Collections;
++import java.util.List;
+ import java.util.concurrent.Callable;
+ 
+ /**
+  * An extension of the {@link YARNSessionFIFOITCase} that runs the tests in a secured YARN cluster.
+  */
++@RunWith(Parameterized.class)
+ public class YARNSessionFIFOSecuredITCase extends YARNSessionFIFOITCase {
+-
+ 	protected static final Logger LOG = LoggerFactory.getLogger(YARNSessionFIFOSecuredITCase.class);
+ 
++	@Parameterized.Parameter
++	public String mode;
++
++	@Parameterized.Parameters(name = "Mode = {0}")
++	public static List<String> parameters() {
++		return Arrays.asList(CoreOptions.LEGACY_MODE, CoreOptions.NEW_MODE);
++	}
++
+ 	@BeforeClass
+ 	public static void setup() {
+ 
+@@ -100,6 +115,14 @@ public static void teardownSecureCluster() throws Exception {
+ 		SecureTestEnvironment.cleanup();
+ 	}
+ 
++	@Before
++	public void setMode() {
++		flinkConfiguration.setString(CoreOptions.MODE.key(), mode);
++		isNewMode = CoreOptions.NEW_MODE.equalsIgnoreCase(
++				flinkConfiguration.getString(CoreOptions.MODE));
++	}
++
++	@Test(timeout = 60000) // timeout after a minute.
+ 	@Override
+ 	public void testDetachedMode() throws InterruptedException, IOException {
+ 		super.testDetachedMode();
+diff --git a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java
+index 421e4c0ebfc9b..3b5bc208a5286 100644
+--- a/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java
++++ b/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java
+@@ -81,8 +81,6 @@
+ import java.util.concurrent.ConcurrentMap;
+ import java.util.regex.Pattern;
+ 
+-import static org.apache.flink.configuration.CoreOptions.LEGACY_MODE;
+-
+ /**
+  * This base class allows to use the MiniYARNCluster.
+  * The cluster is re-used for all tests.
+@@ -528,7 +526,6 @@ private static void start(YarnConfiguration conf, String principal, String keyta
+ 
+ 				globalConfiguration.setString(SecurityOptions.KERBEROS_LOGIN_KEYTAB.key(), keytab);
+ 				globalConfiguration.setString(SecurityOptions.KERBEROS_LOGIN_PRINCIPAL.key(), principal);
+-				globalConfiguration.setString(CoreOptions.MODE.key(), LEGACY_MODE);
+ 
+ 				BootstrapTools.writeConfiguration(
+ 					globalConfiguration,
