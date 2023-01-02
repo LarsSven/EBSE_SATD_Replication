@@ -45,7 +45,7 @@ with open('sampling_input.csv', 'r', newline='') as csvfile, open('sampled.csv',
         pull_requests = categories[category]
 
         # Calculate how many samples should be extracted from the category
-        contribution = len(pull_requests) / totalAmount * 100
+        contribution = len(pull_requests) / totalAmount * 173
         toSample = math.floor(contribution)
         remainder += contribution - math.floor(contribution)
 
