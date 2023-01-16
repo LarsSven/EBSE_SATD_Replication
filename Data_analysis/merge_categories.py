@@ -10,7 +10,7 @@ with open('categories.csv', 'r', newline='') as categoriesfile, open('full_datas
     next(dataset)
     
     # Write the header of the new dataset
-    output.writerow["Project", "Pull Number", "Pull type", "ID", "Category"]
+    output.writerow(["Project", "Pull Number", "Pull type", "ID", "Category"])
 
     categoriesMap = dict()
     idMap = dict()
