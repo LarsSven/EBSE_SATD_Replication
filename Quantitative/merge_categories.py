@@ -5,3 +5,18 @@ with open('categories.csv', 'r', newline='') as categoriesfile, open('full_datas
     categories = csv.reader(categoriesfile)
     dataset = csv.reader(datasetfile)
     output = csv.writer(outputfile)
+
+    # Remove header
+    next(dataset)
+
+    categoriesMap = dict()
+    idMap = dict()
+
+    #Store all categories in a map to easily access them
+    for row in categories:
+        categoriesMap[(row[0], row[1])] = row[2]
+    
+    for row in dataset:
+        output.writerow([row[0], row[1], row[2], row[3], categoriesMap[(row[0], row[1])]])
+    
+    
