@@ -1,13 +1,33 @@
 # Creates a CSV file that contains the categories together with the relevant data from the full dataset.
+import csv, glob, pathlib
 from collections import defaultdict
-import csv, glob, pathlib, radon
 from os import path
+from radon.complexity import cc_visit
+
+def calculatePythonComplexity(file):
+    code = open(file, 'r').read()
+
+    complexity = 0
+
+    try:
+        result = cc_visit(code)
+        for function in result:
+            complexity += function["complexity"]
+        return complexity
+        
+    except SyntaxError:
+        return 0
 
 def appendComplexity(project):
     unhandledExtensions = defaultdict(int)
 
     for file in glob.iglob(project + "/before/" + '**/*.*', recursive=True):
-        unhandledExtensions[pathlib.Path(file).suffix] += 1
+        suffix = pathlib.Path(file).suffix
+
+        if suffix == ".py":
+            calculatePythonComplexity(file)
+        else:
+            unhandledExtensions[pathlib.Path(file).suffix] += 1
 
     return [dict(unhandledExtensions)]
 
