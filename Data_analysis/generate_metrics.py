@@ -1,6 +1,15 @@
 # Creates a CSV file that contains the categories together with the relevant data from the full dataset.
-import csv
+from collections import defaultdict
+import csv, glob, pathlib, radon
 from os import path
+
+def appendComplexity(project):
+    unhandledExtensions = defaultdict(int)
+
+    for file in glob.iglob(project + "/before/" + '**/*.*', recursive=True):
+        unhandledExtensions[pathlib.Path(file).suffix] += 1
+
+    return [dict(unhandledExtensions)]
 
 def appendDiffs(filename):
     LOC_added = 0
@@ -25,7 +34,7 @@ with open('merged.csv', 'r', newline='') as inputfile, open('output.csv', 'w', n
     next(dataset)
 
     # Write the header of the new dataset
-    output.writerow(["Project", "Pull Number", "Pull type", "ID", "Category", "Diffs available", "LOC Added", "LOC Removed", "Files changed"])
+    output.writerow(["Project", "Pull Number", "Pull type", "ID", "Category", "Diffs available", "LOC Added", "LOC Removed", "Files changed", "Extensions without complexity"])
 
     for row in dataset:
         # Diffs are stored as "/project/pull_number/id"
@@ -33,6 +42,7 @@ with open('merged.csv', 'r', newline='') as inputfile, open('output.csv', 'w', n
         if path.exists(file):
             row.append("Yes")
             row.extend(appendDiffs(file + "/changes.diff"))
+            row.extend(appendComplexity(file))
         else:
             row.append("No")
         output.writerow(row)
