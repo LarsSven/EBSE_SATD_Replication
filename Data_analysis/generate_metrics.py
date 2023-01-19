@@ -1,23 +1,32 @@
 # Creates a CSV file that contains the categories together with the relevant data from the full dataset.
-import csv, glob, pathlib
+import csv, glob, pathlib, lizard
 from collections import defaultdict
 from os import path
 from radon.complexity import cc_visit
 
-def calculatePythonComplexity(file):
-    code = open(file, 'r').read()
-
+def calculateLizardComplexity(file):
     complexity = 0
 
-    try:
-        result = cc_visit(code)
-    except SyntaxError:
-        print(file, "does not have valid Python syntax, ignoring...")
-        return 0
+    for function in lizard.analyze_file(file).function_list:
+        complexity += function.cyclomatic_complexity
     
-    for function in result:
-        complexity += function.complexity
     return complexity
+
+def calculateComplexity(file):
+    diff = 0
+    amountOfFiles = 0
+
+    before = calculateLizardComplexity(file)
+    afterPath = file.replace("/before/", "/after/", 1)
+    if(path.exists(afterPath)):
+        after = calculateLizardComplexity(afterPath)
+        if before != 0 and after != 0:
+            amountOfFiles = 1
+            diff = (before - after)
+    else:
+        print(file, "does not have an after version.")
+    
+    return (diff, amountOfFiles)
 
 def appendComplexity(project):
     unhandledExtensions = defaultdict(int)
@@ -26,18 +35,13 @@ def appendComplexity(project):
     amountOfFiles = 0
 
     for file in glob.iglob(project + "/before/" + '**/*.*', recursive=True):
+
         suffix = pathlib.Path(file).suffix
 
-        if suffix == ".py":
-            before = calculatePythonComplexity(file)
-            afterPath = file.replace("/before/", "/after/", 1)
-            if(path.exists(afterPath)):
-                after = calculatePythonComplexity(afterPath)
-                if before != 0 and after != 0:
-                    amountOfFiles += 1
-                    diff += (before - after)
-            else:
-                print(file, "does not have an after version.")
+        if suffix in [".py", ".java", ".scala", ".go", ".c", ".cc", ".cpp", ".js", ".jsx", ".ts", ".tsx", ".erb"]:
+            (newDiff, newFiles) = calculateComplexity(file)
+            diff += newDiff
+            amountOfFiles += newFiles
         else:
             unhandledExtensions[pathlib.Path(file).suffix] += 1
 
