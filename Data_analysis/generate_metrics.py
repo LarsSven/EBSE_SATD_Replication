@@ -11,25 +11,37 @@ def calculatePythonComplexity(file):
 
     try:
         result = cc_visit(code)
-        for function in result:
-            complexity += function["complexity"]
-        return complexity
-        
     except SyntaxError:
+        print(file, "does not have valid Python syntax, ignoring...")
         return 0
+    
+    for function in result:
+        complexity += function.complexity
+    return complexity
 
 def appendComplexity(project):
     unhandledExtensions = defaultdict(int)
+
+    diff = 0
+    amountOfFiles = 0
 
     for file in glob.iglob(project + "/before/" + '**/*.*', recursive=True):
         suffix = pathlib.Path(file).suffix
 
         if suffix == ".py":
-            calculatePythonComplexity(file)
+            before = calculatePythonComplexity(file)
+            afterPath = file.replace("/before/", "/after/", 1)
+            if(path.exists(afterPath)):
+                after = calculatePythonComplexity(afterPath)
+                if before != 0 and after != 0:
+                    amountOfFiles += 1
+                    diff += (before - after)
+            else:
+                print(file, "does not have an after version.")
         else:
             unhandledExtensions[pathlib.Path(file).suffix] += 1
 
-    return [dict(unhandledExtensions)]
+    return [dict(unhandledExtensions), amountOfFiles, diff]
 
 def appendDiffs(filename):
     LOC_added = 0
@@ -54,7 +66,7 @@ with open('merged.csv', 'r', newline='') as inputfile, open('output.csv', 'w', n
     next(dataset)
 
     # Write the header of the new dataset
-    output.writerow(["Project", "Pull Number", "Pull type", "ID", "Category", "Diffs available", "LOC Added", "LOC Removed", "Files changed", "Extensions without complexity"])
+    output.writerow(["Project", "Pull Number", "Pull type", "ID", "Category", "Diffs available", "LOC Added", "LOC Removed", "Files changed", "Files excluded", "Files included", "Mean complexity difference"])
 
     for row in dataset:
         # Diffs are stored as "/project/pull_number/id"
