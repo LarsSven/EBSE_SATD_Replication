@@ -22,6 +22,9 @@ def process_item(row):
 
     path = f'CodeChanges/{project}/{pull_number}/{id}'
 
+    if before == 'None' or after == 'None':
+        return
+
     if os.path.exists(path):
         return
 

@@ -1,0 +1,280 @@
+diff --git a/core/src/main/scala/org/apache/spark/deploy/SparkSubmit.scala b/core/src/main/scala/org/apache/spark/deploy/SparkSubmit.scala
+index 2901ada53d37d..4f1f9289849d0 100644
+--- a/core/src/main/scala/org/apache/spark/deploy/SparkSubmit.scala
++++ b/core/src/main/scala/org/apache/spark/deploy/SparkSubmit.scala
+@@ -717,10 +717,10 @@ object SparkSubmit extends CommandLineUtils {
+       printWarning("Subclasses of scala.App may not work correctly. Use a main() method instead.")
+     }
+ 
+-    val sparkAppMainMethodArr = mainClass.getMethods().filter(_.getName() == "sparkMain")
++    val sparkAppMainMethodArr = mainClass.getMethods().filter{_.getName() == "sparkMain"}
+     val isSparkApp = sparkAppMainMethodArr.length > 0
+ 
+-    val childSparkConf = sysProps.filter( p => p._1.startsWith("spark.")).toMap
++    val childSparkConf = sysProps.filter{p => p._1.startsWith("spark.")}.toMap
+ 
+     // If running a SparkApp we can explicitly pass in the confs separately.
+     // If we aren't running a SparkApp they get passed via the system properties.
+diff --git a/core/src/main/scala/org/apache/spark/launcher/LauncherBackend.scala b/core/src/main/scala/org/apache/spark/launcher/LauncherBackend.scala
+index 8c164cba3d147..f6a141e3ce07b 100644
+--- a/core/src/main/scala/org/apache/spark/launcher/LauncherBackend.scala
++++ b/core/src/main/scala/org/apache/spark/launcher/LauncherBackend.scala
+@@ -58,17 +58,16 @@ private[spark] abstract class LauncherBackend extends Logging {
+     _isConnected = true
+     if (stopOnShutdown) {
+       logDebug("Adding shutdown hook") // force eager creation of logger
+-      var _shutdownHookRef = ShutdownHookManager.addShutdownHook(
++      ShutdownHookManager.addShutdownHook(
+         ShutdownHookManager.SPARK_CONTEXT_SHUTDOWN_PRIORITY) { () =>
+         logInfo("Invoking onStopRequest() from shutdown hook")
+         try {
+           if (_isConnected) {
+             onStopRequest()
+           }
+-        }
+-        catch {
+-          case anotherIOE: IOException =>
+-            logError("Error while running LauncherBackend shutdownHook...", anotherIOE)
++        } catch {
++          case ioException: IOException =>
++            logError("Error while running LauncherBackend shutdownHook...", ioException)
+         }
+       }
+     }
+diff --git a/core/src/test/java/org/apache/spark/launcher/SparkLauncherSuite.java b/core/src/test/java/org/apache/spark/launcher/SparkLauncherSuite.java
+index 6b1f1c7d589e7..e7a761a59b1e1 100644
+--- a/core/src/test/java/org/apache/spark/launcher/SparkLauncherSuite.java
++++ b/core/src/test/java/org/apache/spark/launcher/SparkLauncherSuite.java
+@@ -175,7 +175,7 @@ public void testChildProcLauncher() throws Exception {
+       .setConf(SparkLauncher.DRIVER_EXTRA_CLASSPATH, System.getProperty("java.class.path"))
+       .addSparkArg(opts.CLASS, "ShouldBeOverriddenBelow")
+       .setMainClass(SparkLauncherTestApp.class.getName())
+-      .autoShutdown()
++      .autoShutdown(true)
+       .addAppArgs("proc");
+     final Process app = launcher.launch();
+ 
+@@ -197,15 +197,11 @@ public void testThreadLauncher() throws Exception {
+     launcher
+       .setMaster("local")
+       .setAppResource(SparkLauncher.NO_RESOURCE)
+-      .addSparkArg(opts.CONF,
+-        String.format("%s=-Dfoo=ShouldBeOverriddenBelow", SparkLauncher.DRIVER_EXTRA_JAVA_OPTIONS))
+       .setConf(SparkLauncher.DRIVER_EXTRA_JAVA_OPTIONS,
+         "-Dfoo=bar -Dtest.appender=childproc")
+       .setConf(SparkLauncher.DRIVER_EXTRA_CLASSPATH, System.getProperty("java.class.path"))
+-      .addSparkArg(opts.CLASS, "ShouldBeOverriddenBelow")
+       .setMainClass(SparkLauncherTestApp.class.getName())
+       .launchAsThread(true)
+-      .autoShutdown()
+       .addAppArgs("proc");
+     final Process app = launcher.launch();
+ 
+diff --git a/launcher/src/main/java/org/apache/spark/launcher/SparkAppHandle.java b/launcher/src/main/java/org/apache/spark/launcher/SparkAppHandle.java
+index d021649aeefb5..253b4aaabb916 100644
+--- a/launcher/src/main/java/org/apache/spark/launcher/SparkAppHandle.java
++++ b/launcher/src/main/java/org/apache/spark/launcher/SparkAppHandle.java
+@@ -96,7 +96,7 @@ public boolean isFinal() {
+ 
+   /**
+    * Disconnects the handle from the application. If using {@link SparkLauncher#autoShutdown()}
+-   * option, this method would shutdown stop/kill the application. After this method is called,
++   * option, this method will also stop the child Spark application. After this method is called,
+    * the handle will not be able to communicate with the application anymore.
+    */
+   void disconnect();
+diff --git a/launcher/src/main/java/org/apache/spark/launcher/SparkLauncher.java b/launcher/src/main/java/org/apache/spark/launcher/SparkLauncher.java
+index d92c5216e56f3..4ec054f4b4989 100644
+--- a/launcher/src/main/java/org/apache/spark/launcher/SparkLauncher.java
++++ b/launcher/src/main/java/org/apache/spark/launcher/SparkLauncher.java
+@@ -101,7 +101,7 @@ public class SparkLauncher {
+ 
+   static final Map<String, String> launcherConfig = new HashMap<>();
+ 
+-  private boolean stopOnShutdown = false;
++  private boolean autoShutdown = false;
+ 
+   /** Flag to decide on launching spark-submit as a child process or a thread **/
+   private boolean launchAsThread = false;
+@@ -119,15 +119,18 @@ public static void setConfig(String name, String value) {
+     launcherConfig.put(name, value);
+   }
+ 
++
++
+   /**
+    * Specifies that Spark Application be stopped if current process goes away.
+-   * It tries stop/kill Spark Application if {@link LauncherServer} goes away.
++   * It tries stop/kill Spark Application if launching process goes away.
+    *
+    * @since 2.2.0
++   * @param autoShutdown Flag for shutdown Spark Application if launcher process goes away.
+    * @return This launcher.
+    */
+-  public SparkLauncher autoShutdown() {
+-    this.stopOnShutdown = true;
++  public SparkLauncher autoShutdown(boolean autoShutdown) {
++    this.autoShutdown = autoShutdown;
+     return this;
+   }
+ 
+@@ -136,6 +139,7 @@ public SparkLauncher autoShutdown() {
+    * this feature is currently supported only for YARN cluster deployment mode.
+    *
+    * @since 2.2.0
++   * @param launchAsThread Flag for launching app as a thread.
+    * @return This launcher.
+    */
+   public SparkLauncher launchAsThread(boolean launchAsThread) {
+@@ -559,7 +563,8 @@ public SparkAppHandle startApplication(SparkAppHandle.Listener... listeners) thr
+     return startApplicationAsChildProc(listeners);
+   }
+ 
+-  private SparkAppHandle startApplicationAsChildProc(SparkAppHandle.Listener[] listeners) throws IOException {
++  private SparkAppHandle startApplicationAsChildProc(SparkAppHandle.Listener[] listeners)
++      throws IOException {
+     ChildProcAppHandle handle = LauncherServer.newAppHandle();
+     for (SparkAppHandle.Listener l : listeners) {
+       handle.addListener(l);
+@@ -579,7 +584,8 @@ private SparkAppHandle startApplicationAsChildProc(SparkAppHandle.Listener[] lis
+     pb.environment().put(LauncherProtocol.ENV_LAUNCHER_PORT,
+       String.valueOf(LauncherServer.getServerInstance().getPort()));
+     pb.environment().put(LauncherProtocol.ENV_LAUNCHER_SECRET, handle.getSecret());
+-    pb.environment().put(LauncherProtocol.ENV_LAUNCHER_STOP_IF_SHUTDOWN, String.valueOf(stopOnShutdown));
++    pb.environment().put(LauncherProtocol.ENV_LAUNCHER_STOP_IF_SHUTDOWN,
++        String.valueOf(autoShutdown));
+     try {
+       handle.setChildProc(pb.start(), loggerName);
+     } catch (IOException ioe) {
+@@ -589,7 +595,8 @@ private SparkAppHandle startApplicationAsChildProc(SparkAppHandle.Listener[] lis
+     return handle;
+   }
+ 
+-  private SparkAppHandle startApplicationAsThread(SparkAppHandle.Listener... listeners) throws IOException {
++  private SparkAppHandle startApplicationAsThread(SparkAppHandle.Listener... listeners)
++      throws IOException {
+     ChildThreadAppHandle handle = LauncherServer.newAppThreadHandle();
+     for (SparkAppHandle.Listener l : listeners) {
+       handle.addListener(l);
+@@ -598,22 +605,23 @@ private SparkAppHandle startApplicationAsThread(SparkAppHandle.Listener... liste
+     String appName = getAppName();
+     setConf(LAUNCHER_INTERNAL_PORT, String.valueOf(LauncherServer.getServerInstance().getPort()));
+     setConf(LAUNCHER_INTERNAL_CHILD_PROCESS_SECRET, handle.getSecret());
+-    setConf(LAUNCHER_INTERNAL_STOP_ON_SHUTDOWN, String.valueOf(stopOnShutdown));
++    setConf(LAUNCHER_INTERNAL_STOP_ON_SHUTDOWN, String.valueOf(autoShutdown));
+     try {
+       // It is important that SparkSubmit class is available in the classpath.
+       // Trying to see if method is available in the classpath else throws Exception.
+       Method main = SparkSubmitRunner.getSparkSubmitMain();
+-      Thread submitJobThread = new Thread(new SparkSubmitRunner(main, builder.buildSparkSubmitArgs()));
++      Thread submitJobThread = new Thread(new SparkSubmitRunner(main,
++          builder.buildSparkSubmitArgs()));
+       submitJobThread.setName(appName);
+       submitJobThread.setDaemon(true);
+       handle.setChildThread(submitJobThread);
+       submitJobThread.start();
+     } catch (ClassNotFoundException cnfe) {
+-      throw new IOException("Please make sure the spark jar containing SparkSubmit is in the classpath.",
+-          cnfe);
++      throw new IOException("Please make sure the spark jar " +
++          "containing SparkSubmit is in the classpath.", cnfe);
+     } catch (NoSuchMethodException nsme) {
+-      throw new IOException("Please make sure the spark jar containing SparkSubmit version is correct.",
+-          nsme);
++      throw new IOException("Please make sure the spark jar containing SparkSubmit " +
++          "version is correct.", nsme);
+     }
+     return handle;
+   }
+diff --git a/launcher/src/main/java/org/apache/spark/launcher/package-info.java b/launcher/src/main/java/org/apache/spark/launcher/package-info.java
+index 9b10d2b088840..e60d699c5dc77 100644
+--- a/launcher/src/main/java/org/apache/spark/launcher/package-info.java
++++ b/launcher/src/main/java/org/apache/spark/launcher/package-info.java
+@@ -51,10 +51,10 @@
+  * </pre>
+  *
+  * <p>
+- * Here is example of launching application in thread mode for yarn cluster mode
+- * with the stop if launcher shutdown option enabled. Showing use case of both
+- * {@link org.apache.spark.launcher.SparkLauncher#stopOnShutdown} and
+- * {@link org.apache.spark.launcher.SparkLauncher#launchAsThread} methods
++ * Here is example of launching application in thread mode for YARN cluster mode
++ * with the auto shutdown option enabled. Showing use case of both
++ * {@link org.apache.spark.launcher.SparkLauncher#autoShutdown()} and
++ * {@link org.apache.spark.launcher.SparkLauncher#launchAsThread(boolean)} methods
+  * </p>
+  *
+  * <pre>
+diff --git a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/Client.scala b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/Client.scala
+index 33db73cfaf449..9860ca2aab0b5 100644
+--- a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/Client.scala
++++ b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/Client.scala
+@@ -67,9 +67,9 @@ private[spark] class Client(
+   import YarnSparkHadoopUtil._
+ 
+   def this(
+-    clientArgs: ClientArguments,
+-    spConf: SparkConf,
+-    sysEnv: scala.collection.immutable.Map[String, String]) =
++      clientArgs: ClientArguments,
++      spConf: SparkConf,
++      sysEnv: scala.collection.immutable.Map[String, String]) =
+     this(clientArgs, SparkHadoopUtil.get.newConfiguration(spConf), spConf, sysEnv)
+ 
+   def this(clientArgs: ClientArguments, hadoopConf: Configuration, spConf: SparkConf) =
+@@ -83,12 +83,6 @@ private[spark] class Client(
+ 
+   private val isClusterMode = sparkConf.get("spark.submit.deployMode", "client") == "cluster"
+ 
+-  private val launcherServerPort : Int =
+-    sparkConf.get(SparkLauncher.LAUNCHER_INTERNAL_PORT, "0").toInt
+-  private val launcherServerSecret : String =
+-    sparkConf.get(SparkLauncher.LAUNCHER_INTERNAL_CHILD_PROCESS_SECRET, "")
+-  private val launcherServerStopIfShutdown : Boolean =
+-    sparkConf.get(SparkLauncher.LAUNCHER_INTERNAL_STOP_ON_SHUTDOWN, "false").toBoolean
+   // AM related configurations
+   private val amMemory = if (isClusterMode) {
+     sparkConf.get(DRIVER_MEMORY).toInt
+@@ -160,6 +154,11 @@ private[spark] class Client(
+    */
+   def submitApplication(): ApplicationId = {
+     var appId: ApplicationId = null
++    val launcherServerPort: Int = sparkConf.get(SparkLauncher.LAUNCHER_INTERNAL_PORT, "0").toInt
++    val launcherServerSecret: String =
++      sparkConf.get(SparkLauncher.LAUNCHER_INTERNAL_CHILD_PROCESS_SECRET, "")
++    val launcherServerStopIfShutdown: Boolean =
++      sparkConf.get(SparkLauncher.LAUNCHER_INTERNAL_STOP_ON_SHUTDOWN, "false").toBoolean
+     try {
+       if (launcherServerSecret != null && launcherServerSecret != "" && launcherServerPort != 0) {
+         launcherBackend.connect(
+diff --git a/resource-managers/yarn/src/test/scala/org/apache/spark/deploy/yarn/YarnClusterSuite.scala b/resource-managers/yarn/src/test/scala/org/apache/spark/deploy/yarn/YarnClusterSuite.scala
+index b0cb31d1447b2..cf7dd4a7f1a3b 100644
+--- a/resource-managers/yarn/src/test/scala/org/apache/spark/deploy/yarn/YarnClusterSuite.scala
++++ b/resource-managers/yarn/src/test/scala/org/apache/spark/deploy/yarn/YarnClusterSuite.scala
+@@ -210,7 +210,7 @@ class YarnClusterSuite extends BaseYarnClusterSuite {
+     finalState should be (SparkAppHandle.State.FAILED)
+   }
+ 
+-  test("monitor app using launcher library for thread") {
++  test("monitor app running in thread using launcher library") {
+     val env = new JHashMap[String, String]()
+     env.put("YARN_CONF_DIR", hadoopConfDir.getAbsolutePath())
+ 
+@@ -254,7 +254,7 @@ class YarnClusterSuite extends BaseYarnClusterSuite {
+       .setPropertiesFile(propsFile)
+       .setMaster("yarn")
+       .setDeployMode("cluster")
+-      .autoShutdown()
++      .autoShutdown(true)
+       .setAppResource(SparkLauncher.NO_RESOURCE)
+       .setMainClass(mainClassName(YarnLauncherTestApp.getClass))
+       .startApplication()
+@@ -292,7 +292,7 @@ class YarnClusterSuite extends BaseYarnClusterSuite {
+       .setMaster("yarn")
+       .setDeployMode("cluster")
+       .launchAsThread(true)
+-      .autoShutdown()
++      .autoShutdown(true)
+       .setAppResource(SparkLauncher.NO_RESOURCE)
+       .setMainClass(mainClassName(YarnLauncherTestApp.getClass))
+       .startApplication()

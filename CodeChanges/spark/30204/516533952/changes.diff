@@ -1,0 +1,711 @@
+diff --git a/core/src/main/scala/org/apache/spark/resource/ResourceProfile.scala b/core/src/main/scala/org/apache/spark/resource/ResourceProfile.scala
+index 8a37670c31b9a..6499e267c1c1e 100644
+--- a/core/src/main/scala/org/apache/spark/resource/ResourceProfile.scala
++++ b/core/src/main/scala/org/apache/spark/resource/ResourceProfile.scala
+@@ -29,6 +29,7 @@ import org.apache.spark.annotation.{Evolving, Since}
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.internal.config._
+ import org.apache.spark.internal.config.Python.PYSPARK_EXECUTOR_MEMORY
++import org.apache.spark.util.Utils
+ 
+ /**
+  * Resource profile to associate with an RDD. A ResourceProfile allows the user to
+@@ -256,6 +257,8 @@ object ResourceProfile extends Logging {
+   val UNKNOWN_RESOURCE_PROFILE_ID = -1
+   val DEFAULT_RESOURCE_PROFILE_ID = 0
+ 
++  private[spark] val MEMORY_OVERHEAD_MIN = 384L
++
+   private lazy val nextProfileId = new AtomicInteger(0)
+   private val DEFAULT_PROFILE_LOCK = new Object()
+ 
+@@ -263,6 +266,7 @@ object ResourceProfile extends Logging {
+   // var so that it can be reset for testing purposes.
+   @GuardedBy("DEFAULT_PROFILE_LOCK")
+   private var defaultProfile: Option[ResourceProfile] = None
++  private var defaultProfileExecutorResources: Option[DefaultProfileExecutorResources] = None
+ 
+   private[spark] def getNextProfileId: Int = nextProfileId.getAndIncrement()
+ 
+@@ -284,6 +288,14 @@ object ResourceProfile extends Logging {
+     }
+   }
+ 
++  private[spark] def getDefaultProfileExecutorResources(
++      conf: SparkConf): DefaultProfileExecutorResources = {
++    defaultProfileExecutorResources.getOrElse {
++      getOrCreateDefaultProfile(conf)
++      defaultProfileExecutorResources.get
++    }
++  }
++
+   private def getDefaultTaskResources(conf: SparkConf): Map[String, TaskResourceRequest] = {
+     val cpusPerTask = conf.get(CPUS_PER_TASK)
+     val treqs = new TaskResourceRequests().cpus(cpusPerTask)
+@@ -293,20 +305,32 @@ object ResourceProfile extends Logging {
+ 
+   private def getDefaultExecutorResources(conf: SparkConf): Map[String, ExecutorResourceRequest] = {
+     val ereqs = new ExecutorResourceRequests()
+-    ereqs.cores(conf.get(EXECUTOR_CORES))
+-    ereqs.memory(conf.get(EXECUTOR_MEMORY).toString)
+-    conf.get(EXECUTOR_MEMORY_OVERHEAD).map(mem => ereqs.memoryOverhead(mem.toString))
+-    conf.get(PYSPARK_EXECUTOR_MEMORY).map(mem => ereqs.pysparkMemory(mem.toString))
+-    if (conf.get(MEMORY_OFFHEAP_ENABLED)) {
+-      // Explicitly add suffix b as default unit of offHeapMemory is Mib
+-      ereqs.offHeapMemory(conf.get(MEMORY_OFFHEAP_SIZE).toString + "b")
+-    }
++    val cores = conf.get(EXECUTOR_CORES)
++    ereqs.cores(cores)
++    val memory = conf.get(EXECUTOR_MEMORY)
++    ereqs.memory(memory.toString)
++    val overheadMem = conf.get(EXECUTOR_MEMORY_OVERHEAD)
++    overheadMem.map(mem => ereqs.memoryOverhead(mem.toString))
++    val pysparkMem = conf.get(PYSPARK_EXECUTOR_MEMORY)
++    pysparkMem.map(mem => ereqs.pysparkMemory(mem.toString))
++    val offheapMem = Utils.executorOffHeapMemorySizeAsMb(conf)
++    ereqs.offHeapMemory(offheapMem.toString)
+     val execReq = ResourceUtils.parseAllResourceRequests(conf, SPARK_EXECUTOR_PREFIX)
++    val customResources = new mutable.HashMap[String, ExecutorResourceRequest]
+     execReq.foreach { req =>
+       val name = req.id.resourceName
++      customResources(name) =
++        new ExecutorResourceRequest(
++          req.id.resourceName,
++          req.amount,
++          req.discoveryScript.orElse(""),
++          req.vendor.orElse(""))
+       ereqs.resource(name, req.amount, req.discoveryScript.orElse(""),
+         req.vendor.orElse(""))
+     }
++    defaultProfileExecutorResources =
++      Some(DefaultProfileExecutorResources(cores, memory, offheapMem, pysparkMem,
++        overheadMem, customResources.toMap))
+     ereqs.requests
+   }
+ 
+@@ -320,6 +344,7 @@ object ResourceProfile extends Logging {
+   private[spark] def clearDefaultProfile(): Unit = {
+     DEFAULT_PROFILE_LOCK.synchronized {
+       defaultProfile = None
++      defaultProfileExecutorResources = None
+     }
+   }
+ 
+@@ -342,6 +367,105 @@ object ResourceProfile extends Logging {
+     rp.getTaskCpus.getOrElse(conf.get(CPUS_PER_TASK))
+   }
+ 
++  /**
++   * Get offHeap memory size from [[ExecutorResourceRequest]]
++   * return 0 if MEMORY_OFFHEAP_ENABLED is false.
++   */
++  private[spark] def executorOffHeapMemorySizeAsMb(sparkConf: SparkConf,
++      execRequest: ExecutorResourceRequest): Long = {
++    Utils.checkOffHeapEnabled(sparkConf, execRequest.amount)
++  }
++
++  private[spark] case class ExecutorResourcesOrDefaults(
++      cores: Int,
++      executorMemoryMiB: Long,
++      memoryOffHeapMiB: Long,
++      pysparkMemoryMiB: Long,
++      memoryOverheadMiB: Long,
++      totalMemMiB: Long,
++      customResources: Map[String, ExecutorResourceRequest])
++
++  private[spark] case class DefaultProfileExecutorResources(
++      cores: Int,
++      executorMemoryMiB: Long,
++      memoryOffHeapMiB: Long,
++      pysparkMemoryMiB: Option[Long],
++      memoryOverheadMiB: Option[Long],
++      customResources: Map[String, ExecutorResourceRequest])
++
++  private[spark] def calculateOverHeadMemory(
++      overHeadMemFromConf: Option[Long],
++      executorMemoryMiB: Long,
++      overheadFactor: Double): Long = {
++    overHeadMemFromConf.getOrElse(math.max((overheadFactor * executorMemoryMiB).toInt,
++        ResourceProfile.MEMORY_OVERHEAD_MIN))
++  }
++
++  // Returns the resources from the execResources passed in or if not specified it
++  // returns the resource defaults. Custom resources do not use the default settings.
++  private[spark] def getResourcesForClusterManager(
++      rpId: Int,
++      execResources: Map[String, ExecutorResourceRequest],
++      overheadFactor: Double,
++      conf: SparkConf,
++      isPythonApp: Boolean,
++      resourceMappings: Map[String, String]): ExecutorResourcesOrDefaults = {
++    val defaultResources = getDefaultProfileExecutorResources(conf)
++    if (rpId == DEFAULT_RESOURCE_PROFILE_ID) {
++      val memoryOverheadMiB = ResourceProfile.calculateOverHeadMemory(
++        defaultResources.memoryOverheadMiB, defaultResources.executorMemoryMiB, overheadFactor)
++      val pysparkMemToUseMiB = if (isPythonApp) {
++        defaultResources.pysparkMemoryMiB.getOrElse(0)
++      } else {
++        0
++      }
++      val totalMemMiB = defaultResources.executorMemoryMiB +
++          defaultResources.memoryOffHeapMiB + pysparkMemToUseMiB + memoryOverheadMiB
++      val customResources = defaultResources.customResources.map { case (rName, execReq) =>
++        val nameToUse = resourceMappings.get(rName).getOrElse(rName)
++        (nameToUse, execReq)
++      }
++      ExecutorResourcesOrDefaults(defaultResources.cores, defaultResources.executorMemoryMiB,
++        defaultResources.memoryOffHeapMiB, pysparkMemToUseMiB, memoryOverheadMiB,
++        totalMemMiB, customResources)
++    } else {
++      var executorMemoryMiB = defaultResources.executorMemoryMiB
++      var cores = defaultResources.cores
++      var memoryOffHeapMiB = defaultResources.memoryOffHeapMiB
++      var memoryOverheadMiB = calculateOverHeadMemory(defaultResources.memoryOverheadMiB,
++        executorMemoryMiB, overheadFactor)
++      var pysparkMemoryMiB = defaultResources.pysparkMemoryMiB.getOrElse(0)
++      val customResources = new mutable.HashMap[String, ExecutorResourceRequest]
++      execResources.foreach { case (r, execReq) =>
++        r match {
++          case ResourceProfile.MEMORY =>
++            executorMemoryMiB = execReq.amount
++          case ResourceProfile.OVERHEAD_MEM =>
++            memoryOverheadMiB = execReq.amount
++          case ResourceProfile.PYSPARK_MEM =>
++            pysparkMemoryMiB = execReq.amount
++          case ResourceProfile.OFFHEAP_MEM =>
++            memoryOffHeapMiB = executorOffHeapMemorySizeAsMb(conf, execReq)
++          case ResourceProfile.CORES =>
++            cores = execReq.amount.toInt
++          case rName =>
++            val nameToUse = resourceMappings.get(rName).getOrElse(rName)
++            customResources(nameToUse) = execReq
++        }
++      }
++      // only add in pyspark memory if actually a python application
++      val pysparkMemToUseMiB = if (isPythonApp) {
++        pysparkMemoryMiB
++      } else {
++        0
++      }
++      val totalMemMiB =
++        (executorMemoryMiB + memoryOverheadMiB + memoryOffHeapMiB + pysparkMemToUseMiB)
++      ExecutorResourcesOrDefaults(cores, executorMemoryMiB, memoryOffHeapMiB,
++        pysparkMemToUseMiB, memoryOverheadMiB, totalMemMiB, customResources.toMap)
++    }
++  }
++
+   private[spark] val PYSPARK_MEMORY_LOCAL_PROPERTY = "resource.pyspark.memory"
+   private[spark] val EXECUTOR_CORES_LOCAL_PROPERTY = "resource.executor.cores"
+ }
+diff --git a/core/src/main/scala/org/apache/spark/resource/ResourceProfileManager.scala b/core/src/main/scala/org/apache/spark/resource/ResourceProfileManager.scala
+index 9bc78e36dc660..d538f0bcc423e 100644
+--- a/core/src/main/scala/org/apache/spark/resource/ResourceProfileManager.scala
++++ b/core/src/main/scala/org/apache/spark/resource/ResourceProfileManager.scala
+@@ -54,7 +54,8 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
+   private val master = sparkConf.getOption("spark.master")
+   private val isYarn = master.isDefined && master.get.equals("yarn")
+   private val isK8s = master.isDefined && master.get.startsWith("k8s://")
+-  private val errorForTesting = !isTesting || sparkConf.get(RESOURCE_PROFILE_MANAGER_TESTING)
++  private val notRunningUnitTests = !isTesting
++  private val testExceptionThrown = sparkConf.get(RESOURCE_PROFILE_MANAGER_TESTING)
+ 
+   // If we use anything except the default profile, its only supported on YARN right now.
+   // Throw an exception if not supported.
+@@ -63,7 +64,10 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
+     val notYarnOrK8sAndNotDefaultProfile = isNotDefaultProfile && !(isYarn || isK8s)
+     val YarnOrK8sNotDynAllocAndNotDefaultProfile =
+       isNotDefaultProfile && (isYarn || isK8s) && !dynamicEnabled
+-    if (errorForTesting &&
++    // We want the exception to be thrown only when we are specifically testing for the
++    // exception or in a real application. Otherwise in all other testing scenarios we want
++    // to skip throwing the exception so that we can test in other modes to make testing easier.
++    if ((notRunningUnitTests || testExceptionThrown) &&
+         (notYarnOrK8sAndNotDefaultProfile || YarnOrK8sNotDynAllocAndNotDefaultProfile)) {
+       throw new SparkException("ResourceProfiles are only supported on YARN and Kubernetes " +
+         "with dynamic allocation enabled.")
+diff --git a/docs/running-on-kubernetes.md b/docs/running-on-kubernetes.md
+index fbfe94410a817..642459b1e799f 100644
+--- a/docs/running-on-kubernetes.md
++++ b/docs/running-on-kubernetes.md
+@@ -1401,4 +1401,4 @@ Kubernetes does not tell Spark the addresses of the resources allocated to each
+ 
+ ### Stage Level Scheduling Overview
+ 
+-Stage level scheduling is supported on Kubernetes when dynamic allocation is enabled. This also requires <code>spark.dynamicAllocation.shuffleTracking.enabled</code> to be enabled since Kubernetes doesn't support an external shuffle service a this time. The order in which containers for different profiles is requested from Kubernetes is not guaranteed. Note that since dynamic allocation on Kubernetes requires the shuffle tracking feature, this means that executors from previous stages that used a different ResourceProfile may not idle timeout due to having shuffle data on them. This could result in using more cluster resources and in the worst case if there are no remaining resources on the Kubernetes cluster then Spark could potentially hang. You may consider looking at config <code>spark.dynamicAllocation.shuffleTracking.timeout</code> to set a timeout, but that could result in data having to be recomputed if the shuffle data is really needed.
++Stage level scheduling is supported on Kubernetes when dynamic allocation is enabled. This also requires <code>spark.dynamicAllocation.shuffleTracking.enabled</code> to be enabled since Kubernetes doesn't support an external shuffle service at this time. The order in which containers for different profiles is requested from Kubernetes is not guaranteed. Note that since dynamic allocation on Kubernetes requires the shuffle tracking feature, this means that executors from previous stages that used a different ResourceProfile may not idle timeout due to having shuffle data on them. This could result in using more cluster resources and in the worst case if there are no remaining resources on the Kubernetes cluster then Spark could potentially hang. You may consider looking at config <code>spark.dynamicAllocation.shuffleTracking.timeout</code> to set a timeout, but that could result in data having to be recomputed if the shuffle data is really needed.
+diff --git a/docs/running-on-yarn.md b/docs/running-on-yarn.md
+index 6f7aaf2baeccd..7429bcb13ed17 100644
+--- a/docs/running-on-yarn.md
++++ b/docs/running-on-yarn.md
+@@ -644,6 +644,7 @@ YARN does not tell Spark the addresses of the resources allocated to each contai
+ # Stage Level Scheduling Overview
+ 
+ Stage level scheduling is supported on YARN when dynamic allocation is enabled. One thing to note that is YARN specific is that each ResourceProfile requires a different container priority on YARN. The mapping is simply the ResourceProfile id becomes the priority, on YARN lower numbers are higher priority. This means that profiles created earlier will have a higher priority in YARN. Normally this won't matter as Spark finishes one stage before starting another one, the only case this might have an affect is in a job server type scenario, so its something to keep in mind.
++Note there is a difference in the way custom resources are handled between the base default profile and custom ResourceProfiles. To allow for the user to request YARN containers with extra resources without Spark scheduling on them, the user can specify resources via the <code>spark.yarn.executor.resource.</code> config. Those configs are only used in the base default profile though and do not get propogated into any other custom ResourceProfiles. This is because there would be no way to remove them if you wanted a stage to not have them. This results in your default profile getting custom resources defined in <code>spark.yarn.executor.resource.</code> plus spark defined resources of GPU or FPGA. Spark converts GPU and FPGA resources into the YARN built in types <code>yarn.io/gpu</code>) and <code>yarn.io/fpga</code>, but does not know the mapping of any other resources. Any other Spark custom resources are not propogated to YARN for the default profile. So if you want Spark to schedule based off a custom resource and have it requested from YARN, you must specify it in both YARN (<code>spark.yarn.{driver/executor}.resource.</code>) and Spark (<code>spark.{driver/executor}.resource.</code>) configs. Leave the Spark config off if you only want YARN containers with the extra resources but Spark not to schedule using them. Now for custom ResourceProfiles, it doesn't currently have a way to only specify YARN resources without Spark scheduling off of them. This means for custom ResourceProfiles we propogate all the resources defined in the ResourceProfile to YARN. We still convert GPU and FPGA to the YARN build in types as well. This requires that the name of any custom resources you specify match what they are defined as in YARN.
+ 
+ # Important notes
+ 
+diff --git a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/Constants.scala b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/Constants.scala
+index fd4c6ed02caf7..7d9e4949a8dbb 100644
+--- a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/Constants.scala
++++ b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/Constants.scala
+@@ -86,7 +86,6 @@ private[spark] object Constants {
+   val KUBERNETES_MASTER_INTERNAL_URL = "https://kubernetes.default.svc"
+   val DEFAULT_DRIVER_CONTAINER_NAME = "spark-kubernetes-driver"
+   val DEFAULT_EXECUTOR_CONTAINER_NAME = "spark-kubernetes-executor"
+-  val MEMORY_OVERHEAD_MIN_MIB = 384L
+   val NON_JVM_MEMORY_OVERHEAD_FACTOR = 0.4d
+ 
+   // Hadoop Configuration
+diff --git a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicDriverFeatureStep.scala b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicDriverFeatureStep.scala
+index 63f18129328b0..bcb92e9e34583 100644
+--- a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicDriverFeatureStep.scala
++++ b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicDriverFeatureStep.scala
+@@ -27,6 +27,7 @@ import org.apache.spark.deploy.k8s.Config._
+ import org.apache.spark.deploy.k8s.Constants._
+ import org.apache.spark.deploy.k8s.submit._
+ import org.apache.spark.internal.config._
++import org.apache.spark.resource.ResourceProfile
+ import org.apache.spark.ui.SparkUI
+ import org.apache.spark.util.Utils
+ 
+@@ -66,7 +67,8 @@ private[spark] class BasicDriverFeatureStep(conf: KubernetesDriverConf)
+ 
+   private val memoryOverheadMiB = conf
+     .get(DRIVER_MEMORY_OVERHEAD)
+-    .getOrElse(math.max((overheadFactor * driverMemoryMiB).toInt, MEMORY_OVERHEAD_MIN_MIB))
++    .getOrElse(math.max((overheadFactor * driverMemoryMiB).toInt,
++      ResourceProfile.MEMORY_OVERHEAD_MIN))
+   private val driverMemoryWithOverheadMiB = driverMemoryMiB + memoryOverheadMiB
+ 
+   override def configurePod(pod: SparkPod): SparkPod = {
+diff --git a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicExecutorFeatureStep.scala b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicExecutorFeatureStep.scala
+index 1f68344e5cab5..bd97b3dbf46fd 100644
+--- a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicExecutorFeatureStep.scala
++++ b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/deploy/k8s/features/BasicExecutorFeatureStep.scala
+@@ -17,7 +17,6 @@
+ package org.apache.spark.deploy.k8s.features
+ 
+ import scala.collection.JavaConverters._
+-import scala.collection.mutable
+ 
+ import io.fabric8.kubernetes.api.model._
+ 
+@@ -27,7 +26,6 @@ import org.apache.spark.deploy.k8s.Config._
+ import org.apache.spark.deploy.k8s.Constants._
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.internal.config._
+-import org.apache.spark.internal.config.Python._
+ import org.apache.spark.resource.{ExecutorResourceRequest, ResourceProfile}
+ import org.apache.spark.rpc.RpcEndpointAddress
+ import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
+@@ -54,58 +52,28 @@ private[spark] class BasicExecutorFeatureStep(
+     kubernetesConf.sparkConf.getInt(DRIVER_PORT.key, DEFAULT_DRIVER_PORT),
+     CoarseGrainedSchedulerBackend.ENDPOINT_NAME).toString
+ 
+-  private var executorMemoryMiB = kubernetesConf.get(EXECUTOR_MEMORY)
++  private val isDefaultProfile = resourceProfile.id == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
++  private val isPythonApp = kubernetesConf.get(APP_RESOURCE_TYPE) == Some(APP_RESOURCE_TYPE_PYTHON)
+ 
+-  private var memoryOverheadMiB = kubernetesConf
+-    .get(EXECUTOR_MEMORY_OVERHEAD)
+-    .getOrElse(math.max(
+-      (kubernetesConf.get(MEMORY_OVERHEAD_FACTOR) * executorMemoryMiB).toInt,
+-      MEMORY_OVERHEAD_MIN_MIB))
+-
+-  private var executorCores = kubernetesConf.sparkConf.get(EXECUTOR_CORES)
+-
+-  private var pysparkMemoryMiB =
+-    kubernetesConf.get(PYSPARK_EXECUTOR_MEMORY).map(_.toInt).getOrElse(0).toLong
+-
+-  private var memoryOffHeapMiB = Utils.executorOffHeapMemorySizeAsMb(kubernetesConf.sparkConf)
+-
+-  private val customResources = new mutable.HashSet[ExecutorResourceRequest]
+-  resourceProfile.executorResources.foreach { case (resource, execReq) =>
+-    resource match {
+-      case ResourceProfile.MEMORY =>
+-        executorMemoryMiB = execReq.amount
+-      case ResourceProfile.OVERHEAD_MEM =>
+-        memoryOverheadMiB = execReq.amount
+-      case ResourceProfile.PYSPARK_MEM =>
+-        pysparkMemoryMiB = execReq.amount
+-      case ResourceProfile.OFFHEAP_MEM =>
+-        memoryOffHeapMiB = execReq.amount.toInt
+-      case ResourceProfile.CORES =>
+-        executorCores = execReq.amount.toInt
+-      case rName =>
+-        customResources += execReq
+-    }
+-  }
+-
+-  private val executorMemoryString = s"${executorMemoryMiB}m"
++  val execResources = ResourceProfile.getResourcesForClusterManager(
++    resourceProfile.id,
++    resourceProfile.executorResources,
++    kubernetesConf.get(MEMORY_OVERHEAD_FACTOR),
++    kubernetesConf.sparkConf,
++    isPythonApp,
++    Map.empty)
+ 
++  private val executorMemoryString = s"${execResources.executorMemoryMiB}m"
++  // we don't include any kubernetes conf specific requests or limits when using custom
++  // ResourceProfiles because we don't have a way of overriding them if needed
+   private val executorCoresRequest =
+-    if (kubernetesConf.sparkConf.contains(KUBERNETES_EXECUTOR_REQUEST_CORES)) {
++    if (isDefaultProfile && kubernetesConf.sparkConf.contains(KUBERNETES_EXECUTOR_REQUEST_CORES)) {
+       kubernetesConf.get(KUBERNETES_EXECUTOR_REQUEST_CORES).get
+     } else {
+-      executorCores.toString
++      execResources.cores.toString
+     }
+   private val executorLimitCores = kubernetesConf.get(KUBERNETES_EXECUTOR_LIMIT_CORES)
+ 
+-  private val executorMemoryWithOverhead =
+-    executorMemoryMiB + memoryOverheadMiB + memoryOffHeapMiB
+-  private val executorMemoryTotal =
+-    if (kubernetesConf.get(APP_RESOURCE_TYPE) == Some(APP_RESOURCE_TYPE_PYTHON)) {
+-      executorMemoryWithOverhead + pysparkMemoryMiB
+-    } else {
+-      executorMemoryWithOverhead
+-    }
+-
+   private def buildExecutorResourcesQuantities(
+       customResources: Set[ExecutorResourceRequest]): Map[String, Quantity] = {
+     customResources.map { request =>
+@@ -132,15 +100,20 @@ private[spark] class BasicExecutorFeatureStep(
+       // Replace dangerous characters in the remaining string with a safe alternative.
+       .replaceAll("[^\\w-]+", "_")
+ 
+-    val executorMemoryQuantity = new Quantity(s"${executorMemoryTotal}Mi")
++    val executorMemoryQuantity = new Quantity(s"${execResources.totalMemMiB}Mi")
+     val executorCpuQuantity = new Quantity(executorCoresRequest)
+ 
+-    val executorResourceQuantities = buildExecutorResourcesQuantities(customResources.toSet)
++    // TODO - we need to remove any resources from the template when not using the
++    if (isDefaultProfile) {
++      logWarning("default profile so pick up template stuff, otherwise remove extra resources")
++    }
++    val executorResourceQuantities =
++      buildExecutorResourcesQuantities(execResources.customResources.values.toSet)
+ 
+     val executorEnv: Seq[EnvVar] = {
+         (Seq(
+           (ENV_DRIVER_URL, driverUrl),
+-          (ENV_EXECUTOR_CORES, executorCores.toString),
++          (ENV_EXECUTOR_CORES, execResources.cores.toString),
+           (ENV_EXECUTOR_MEMORY, executorMemoryString),
+           (ENV_APPLICATION_ID, kubernetesConf.appId),
+           // This is to set the SPARK_CONF_DIR to be /opt/spark/conf
+@@ -208,6 +181,8 @@ private[spark] class BasicExecutorFeatureStep(
+           .build()
+       }
+ 
++    logWarning("k8s pod limits are: " + pod.container.getResources().getLimits())
++
+     val executorContainer = new ContainerBuilder(pod.container)
+       .withName(Option(pod.container.getName).getOrElse(DEFAULT_EXECUTOR_CONTAINER_NAME))
+       .withImage(executorContainerImage)
+@@ -226,14 +201,18 @@ private[spark] class BasicExecutorFeatureStep(
+       .withPorts(requiredPorts.asJava)
+       .addToArgs("executor")
+       .build()
+-    val containerWithLimitCores = executorLimitCores.map { limitCores =>
+-      val executorCpuLimitQuantity = new Quantity(limitCores)
+-      new ContainerBuilder(executorContainer)
+-        .editResources()
++    val containerWithLimitCores = if (isDefaultProfile) {
++      executorLimitCores.map { limitCores =>
++        val executorCpuLimitQuantity = new Quantity(limitCores)
++        new ContainerBuilder(executorContainer)
++          .editResources()
+           .addToLimits("cpu", executorCpuLimitQuantity)
+           .endResources()
+-        .build()
+-    }.getOrElse(executorContainer)
++          .build()
++      }.getOrElse(executorContainer)
++    } else {
++      executorContainer
++    }
+     val containerWithLifecycle =
+       if (!kubernetesConf.workerDecommissioning) {
+         logInfo("Decommissioning not enabled, skipping shutdown script")
+diff --git a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/ExecutorPodsAllocator.scala b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/ExecutorPodsAllocator.scala
+index 1c9740bf7f863..c029b248f7ea4 100644
+--- a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/ExecutorPodsAllocator.scala
++++ b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/ExecutorPodsAllocator.scala
+@@ -168,15 +168,15 @@ private[spark] class ExecutorPodsAllocator(
+     // Map the pods into per ResourceProfile id so we can check per ResourceProfile,
+     // add a fast path if not using other ResourceProfiles.
+     val rpIdToExecsAndPodState =
+-      mutable.HashMap[Int, mutable.LinkedHashMap[Long, ExecutorPodState]]()
++      mutable.HashMap[Int, mutable.HashMap[Long, ExecutorPodState]]()
+     if (totalExpectedExecutorsPerResourceProfileId.size <= 1) {
+       rpIdToExecsAndPodState(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) =
+-        mutable.LinkedHashMap.empty ++= lastSnapshot.executorPods
++        mutable.HashMap.empty ++= lastSnapshot.executorPods
+     } else {
+       lastSnapshot.executorPods.foreach { case (execId, execPodState) =>
+         val rpId = execPodState.pod.getMetadata.getLabels.get(SPARK_RESOURCE_PROFILE_ID_LABEL).toInt
+         val execPods = rpIdToExecsAndPodState.getOrElseUpdate(rpId,
+-          mutable.LinkedHashMap[Long, ExecutorPodState]())
++          mutable.HashMap[Long, ExecutorPodState]())
+         execPods(execId) = execPodState
+       }
+     }
+@@ -184,7 +184,7 @@ private[spark] class ExecutorPodsAllocator(
+     var totalPendingCount = 0
+     // The order we request executors for each ResourceProfile is not guaranteed.
+     totalExpectedExecutorsPerResourceProfileId.asScala.foreach { case (rpId, targetNum) =>
+-      val podsForRpId = rpIdToExecsAndPodState.getOrElse(rpId, mutable.LinkedHashMap.empty)
++      val podsForRpId = rpIdToExecsAndPodState.getOrElse(rpId, mutable.HashMap.empty)
+ 
+       val currentRunningCount = podsForRpId.values.count {
+         case PodRunning(_) => true
+diff --git a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesClusterSchedulerBackend.scala b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesClusterSchedulerBackend.scala
+index 7e2b8c21e3067..138948ca5154a 100644
+--- a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesClusterSchedulerBackend.scala
++++ b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesClusterSchedulerBackend.scala
+@@ -78,7 +78,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
+ 
+   override def start(): Unit = {
+     super.start()
+-    val initExecs = Map(ResourceProfile.getOrCreateDefaultProfile(conf) -> initialExecutors)
++    val initExecs = Map(defaultProfile -> initialExecutors)
+     podAllocator.setTotalExpectedExecutors(initExecs)
+     lifecycleEventHandler.start(this)
+     podAllocator.start(applicationId())
+diff --git a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesExecutorBuilder.scala b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesExecutorBuilder.scala
+index 1672c2afd6aa3..5388d185489f2 100644
+--- a/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesExecutorBuilder.scala
++++ b/resource-managers/kubernetes/core/src/main/scala/org/apache/spark/scheduler/cluster/k8s/KubernetesExecutorBuilder.scala
+@@ -53,6 +53,8 @@ private[spark] class KubernetesExecutorBuilder {
+       initialPod,
+       executorKubernetesResources = Seq.empty)
+ 
++    // If using a template this will always get the resources from that and combine
++    // them with any Spark conf or ResourceProfile resources.
+     features.foldLeft(spec) { case (spec, feature) =>
+       val configuredPod = feature.configurePod(spec.pod)
+       val addedResources = feature.getAdditionalKubernetesResources()
+diff --git a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/ResourceRequestHelper.scala b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/ResourceRequestHelper.scala
+index 3d800be9e210b..3aabc467a9de9 100644
+--- a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/ResourceRequestHelper.scala
++++ b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/ResourceRequestHelper.scala
+@@ -43,6 +43,8 @@ private object ResourceRequestHelper extends Logging {
+   private val RESOURCE_NOT_FOUND = "org.apache.hadoop.yarn.exceptions.ResourceNotFoundException"
+   val YARN_GPU_RESOURCE_CONFIG = "yarn.io/gpu"
+   val YARN_FPGA_RESOURCE_CONFIG = "yarn.io/fpga"
++  private[yarn] val resourceNameMapping =
++    Map(GPU -> YARN_GPU_RESOURCE_CONFIG, FPGA -> YARN_FPGA_RESOURCE_CONFIG)
+   @volatile private var numResourceErrors: Int = 0
+ 
+   private[yarn] def getYarnResourcesAndAmounts(
+@@ -76,7 +78,7 @@ private object ResourceRequestHelper extends Logging {
+       confPrefix: String,
+       sparkConf: SparkConf
+   ): Map[String, String] = {
+-    Map(GPU -> YARN_GPU_RESOURCE_CONFIG, FPGA -> YARN_FPGA_RESOURCE_CONFIG).map {
++    resourceNameMapping.map {
+       case (rName, yarnName) =>
+         (yarnName -> sparkConf.get(new ResourceID(confPrefix, rName).amountConf, "0"))
+     }.filter { case (_, count) => count.toLong > 0 }
+diff --git a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala
+index cc7157d7cdeb0..e14a18a48e355 100644
+--- a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala
++++ b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala
+@@ -37,7 +37,6 @@ import org.apache.spark.deploy.yarn.YarnSparkHadoopUtil._
+ import org.apache.spark.deploy.yarn.config._
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.internal.config._
+-import org.apache.spark.internal.config.Python._
+ import org.apache.spark.resource.ResourceProfile
+ import org.apache.spark.resource.ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
+ import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef}
+@@ -46,7 +45,6 @@ import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RemoveExe
+ import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RetrieveLastAllocatedExecutorId
+ import org.apache.spark.scheduler.cluster.SchedulerBackendUtils
+ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils}
+-import org.apache.spark.util.Utils
+ 
+ /**
+  * YarnAllocator is charged with requesting containers from the YARN ResourceManager and deciding
+@@ -163,34 +161,7 @@ private[yarn] class YarnAllocator(
+   private val allocatorBlacklistTracker =
+     new YarnAllocatorBlacklistTracker(sparkConf, amClient, failureTracker)
+ 
+-  // Executor memory in MiB.
+-  protected val executorMemory = sparkConf.get(EXECUTOR_MEMORY).toInt
+-  // Executor offHeap memory in MiB.
+-  protected val executorOffHeapMemory = Utils.executorOffHeapMemorySizeAsMb(sparkConf)
+-  // Additional memory overhead.
+-  protected val memoryOverhead: Int = sparkConf.get(EXECUTOR_MEMORY_OVERHEAD).getOrElse(
+-    math.max((MEMORY_OVERHEAD_FACTOR * executorMemory).toInt, MEMORY_OVERHEAD_MIN)).toInt
+-  protected val pysparkWorkerMemory: Int = if (sparkConf.get(IS_PYTHON_APP)) {
+-    sparkConf.get(PYSPARK_EXECUTOR_MEMORY).map(_.toInt).getOrElse(0)
+-  } else {
+-    0
+-  }
+-  // Number of cores per executor for the default profile
+-  protected val defaultExecutorCores = sparkConf.get(EXECUTOR_CORES)
+-
+-  private val executorResourceRequests =
+-    getYarnResourcesAndAmounts(sparkConf, config.YARN_EXECUTOR_RESOURCE_TYPES_PREFIX) ++
+-    getYarnResourcesFromSparkResources(SPARK_EXECUTOR_PREFIX, sparkConf)
+-
+-  // Resource capability requested for each executor for the default profile
+-  private[yarn] val defaultResource: Resource = {
+-    val resource: Resource = Resource.newInstance(
+-      executorMemory + executorOffHeapMemory + memoryOverhead + pysparkWorkerMemory,
+-      defaultExecutorCores)
+-    ResourceRequestHelper.setResourceRequests(executorResourceRequests, resource)
+-    logDebug(s"Created resource capability: $resource")
+-    resource
+-  }
++  private val isPythonApp = sparkConf.get(IS_PYTHON_APP)
+ 
+   private val launcherPool = ThreadUtils.newDaemonCachedThreadPool(
+     "ContainerLauncher", sparkConf.get(CONTAINER_LAUNCH_MAX_THREADS))
+@@ -212,11 +183,10 @@ private[yarn] class YarnAllocator(
+       new HashMap[String, mutable.Set[ContainerId]]()
+     runningExecutorsPerResourceProfileId.put(DEFAULT_RESOURCE_PROFILE_ID, mutable.HashSet[String]())
+     numExecutorsStartingPerResourceProfileId(DEFAULT_RESOURCE_PROFILE_ID) = new AtomicInteger(0)
+-    targetNumExecutorsPerResourceProfileId(DEFAULT_RESOURCE_PROFILE_ID) =
+-      SchedulerBackendUtils.getInitialTargetExecutorNumber(sparkConf)
+-    rpIdToYarnResource.put(DEFAULT_RESOURCE_PROFILE_ID, defaultResource)
+-    rpIdToResourceProfile(DEFAULT_RESOURCE_PROFILE_ID) =
+-      ResourceProfile.getOrCreateDefaultProfile(sparkConf)
++    val initTargetExecNum = SchedulerBackendUtils.getInitialTargetExecutorNumber(sparkConf)
++    targetNumExecutorsPerResourceProfileId(DEFAULT_RESOURCE_PROFILE_ID) = initTargetExecNum
++    val defaultProfile = ResourceProfile.getOrCreateDefaultProfile(sparkConf)
++    createYarnResourceForResourceProfile(defaultProfile)
+   }
+ 
+   initDefaultProfile()
+@@ -303,48 +273,38 @@ private[yarn] class YarnAllocator(
+   }
+ 
+   // if a ResourceProfile hasn't been seen yet, create the corresponding YARN Resource for it
+-  private def createYarnResourceForResourceProfile(
+-      resourceProfileToTotalExecs: Map[ResourceProfile, Int]): Unit = synchronized {
+-    resourceProfileToTotalExecs.foreach { case (rp, num) =>
+-      if (!rpIdToYarnResource.contains(rp.id)) {
+-        // Start with the application or default settings
+-        var heapMem = executorMemory.toLong
+-        var offHeapMem = executorOffHeapMemory.toLong
+-        var overheadMem = memoryOverhead.toLong
+-        var pysparkMem = pysparkWorkerMemory.toLong
+-        var cores = defaultExecutorCores
+-        val customResources = new mutable.HashMap[String, String]
+-        // track the resource profile if not already there
+-        getOrUpdateRunningExecutorForRPId(rp.id)
+-        logInfo(s"Resource profile ${rp.id} doesn't exist, adding it")
+-        val execResources = rp.executorResources
+-        execResources.foreach { case (r, execReq) =>
+-          r match {
+-            case ResourceProfile.MEMORY =>
+-              heapMem = execReq.amount
+-            case ResourceProfile.OVERHEAD_MEM =>
+-              overheadMem = execReq.amount
+-            case ResourceProfile.PYSPARK_MEM =>
+-              pysparkMem = execReq.amount
+-            case ResourceProfile.OFFHEAP_MEM =>
+-              offHeapMem = YarnSparkHadoopUtil.executorOffHeapMemorySizeAsMb(sparkConf, execReq)
+-            case ResourceProfile.CORES =>
+-              cores = execReq.amount.toInt
+-            case "gpu" =>
+-              customResources(YARN_GPU_RESOURCE_CONFIG) = execReq.amount.toString
+-            case "fpga" =>
+-              customResources(YARN_FPGA_RESOURCE_CONFIG) = execReq.amount.toString
+-            case rName =>
+-              customResources(rName) = execReq.amount.toString
+-          }
++  private def createYarnResourceForResourceProfile(rp: ResourceProfile): Unit = synchronized {
++    if (!rpIdToYarnResource.contains(rp.id)) {
++      // track the resource profile if not already there
++      getOrUpdateRunningExecutorForRPId(rp.id)
++      logInfo(s"Resource profile ${rp.id} doesn't exist, adding it")
++      val resourcesWithDefaults =
++        ResourceProfile.getResourcesForClusterManager(rp.id, rp.executorResources,
++          MEMORY_OVERHEAD_FACTOR, sparkConf, isPythonApp,
++          ResourceRequestHelper.resourceNameMapping)
++      val customSparkResources =
++        resourcesWithDefaults.customResources.map { case (name, execReq) =>
++          (name, execReq.amount.toString)
+         }
+-        val totalMem = (heapMem + offHeapMem + overheadMem + pysparkMem).toInt
+-        val resource = Resource.newInstance(totalMem, cores)
+-        ResourceRequestHelper.setResourceRequests(customResources.toMap, resource)
+-        logDebug(s"Created resource capability: $resource")
+-        rpIdToYarnResource.putIfAbsent(rp.id, resource)
+-        rpIdToResourceProfile(rp.id) = rp
++      // YARN specified resources are only supported with the default profile and we only
++      // pick up Spark custom resources for GPU and FPGA with the default profile
++      // to allow option of them being scheduled off of or not.
++      // We don't currently have a way to specify just YARN custom resources via the
++      // ResourceProfile so we send along all custom resources defined.
++      val customResources = if (rp.id == DEFAULT_RESOURCE_PROFILE_ID) {
++        getYarnResourcesAndAmounts(sparkConf, config.YARN_EXECUTOR_RESOURCE_TYPES_PREFIX) ++
++          customSparkResources.filterKeys { r =>
++            (r == YARN_GPU_RESOURCE_CONFIG || r == YARN_FPGA_RESOURCE_CONFIG)
++          }
++      } else {
++        customSparkResources
+       }
++      val resource =
++        Resource.newInstance(resourcesWithDefaults.totalMemMiB, resourcesWithDefaults.cores)
++      ResourceRequestHelper.setResourceRequests(customResources, resource)
++      logDebug(s"Created resource capability: $resource")
++      rpIdToYarnResource.putIfAbsent(rp.id, resource)
++      rpIdToResourceProfile(rp.id) = rp
+     }
+   }
+ 
+@@ -371,9 +331,8 @@ private[yarn] class YarnAllocator(
+     this.numLocalityAwareTasksPerResourceProfileId = numLocalityAwareTasksPerResourceProfileId
+     this.hostToLocalTaskCountPerResourceProfileId = hostToLocalTaskCountPerResourceProfileId
+ 
+-    createYarnResourceForResourceProfile(resourceProfileToTotalExecs)
+-
+     val res = resourceProfileToTotalExecs.map { case (rp, numExecs) =>
++      createYarnResourceForResourceProfile(rp)
+       if (numExecs != getOrUpdateTargetNumExecutorsForRPId(rp.id)) {
+         logInfo(s"Driver requested a total number of $numExecs executor(s) " +
+           s"for resource profile id: ${rp.id}.")
+@@ -478,7 +437,7 @@ private[yarn] class YarnAllocator(
+           var requestContainerMessage = s"Will request $missing executor container(s) for " +
+             s" ResourceProfile Id: $rpId, each with " +
+             s"${resource.getVirtualCores} core(s) and " +
+-            s"${resource.getMemory} MB memory (including $memoryOverhead MB of overhead)"
++            s"${resource.getMemory} MB memory."
+           if (ResourceRequestHelper.isYarnResourceTypesAvailable() &&
+             ResourceRequestHelper.isYarnCustomResourcesNonEmpty(resource)) {
+             requestContainerMessage ++= s" with custom resources: " + resource.toString
+@@ -724,9 +683,13 @@ private[yarn] class YarnAllocator(
+       }
+ 
+       val rp = rpIdToResourceProfile(rpId)
++      // TODO - different
++      val defaultResources = ResourceProfile.getDefaultProfileExecutorResources(sparkConf)
+       val containerMem = rp.executorResources.get(ResourceProfile.MEMORY).
+-        map(_.amount.toInt).getOrElse(executorMemory)
+-      val containerCores = rp.getExecutorCores.getOrElse(defaultExecutorCores)
++        map(_.amount.toInt).getOrElse(defaultResources.executorMemoryMiB).toInt
++
++      val containerCores = rp.getExecutorCores.getOrElse(defaultResources.cores)
++
+       val rpRunningExecs = getOrUpdateRunningExecutorForRPId(rpId).size
+       if (rpRunningExecs < getOrUpdateTargetNumExecutorsForRPId(rpId)) {
+         getOrUpdateNumExecutorsStartingForRPId(rpId).incrementAndGet()
+diff --git a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnSparkHadoopUtil.scala b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnSparkHadoopUtil.scala
+index 3d68882c90a68..0273de10993eb 100644
+--- a/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnSparkHadoopUtil.scala
++++ b/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnSparkHadoopUtil.scala
+@@ -38,7 +38,6 @@ object YarnSparkHadoopUtil {
+   // the common cases. Memory overhead tends to grow with container size.
+ 
+   val MEMORY_OVERHEAD_FACTOR = 0.10
+-  val MEMORY_OVERHEAD_MIN = 384L
+ 
+   val ANY_HOST = "*"
+ 

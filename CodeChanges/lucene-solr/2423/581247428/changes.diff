@@ -1,0 +1,215 @@
+diff --git a/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/AffixCondition.java b/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/AffixCondition.java
+index 28b1e0807d50..be0d8ba28651 100644
+--- a/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/AffixCondition.java
++++ b/lucene/analysis/common/src/java/org/apache/lucene/analysis/hunspell/AffixCondition.java
+@@ -19,10 +19,7 @@
+ import static org.apache.lucene.analysis.hunspell.AffixKind.PREFIX;
+ import static org.apache.lucene.analysis.hunspell.AffixKind.SUFFIX;
+ 
+-import java.util.ArrayList;
+-import java.util.List;
+ import java.util.regex.PatternSyntaxException;
+-import java.util.stream.Collectors;
+ import org.apache.lucene.util.automaton.CharacterRunAutomaton;
+ import org.apache.lucene.util.automaton.RegExp;
+ 
+@@ -56,7 +53,7 @@ static String uniqueKey(AffixKind kind, String strip, String condition) {
+         || kind == SUFFIX && strip.endsWith(condition) && !isRegexp(condition)) {
+       return ALWAYS_TRUE_KEY;
+     }
+-    return kind == SUFFIX ? ".*" + condition : condition + ".*";
++    return condition + " " + kind + " " + strip;
+   }
+ 
+   /**
+@@ -64,92 +61,74 @@ static String uniqueKey(AffixKind kind, String strip, String condition) {
+    * check that condition.
+    */
+   static AffixCondition compile(AffixKind kind, String strip, String condition, String line) {
+-    String stemCondition = removeStrip(strip, condition, line, kind);
+-    if (stemCondition == null) {
+-      return ALWAYS_FALSE;
+-    }
+-
+-    if (stemCondition.isEmpty()) {
+-      return ALWAYS_TRUE;
+-    }
+-
+-    if (!isRegexp(stemCondition)) {
+-      return substringCondition(kind, stemCondition);
+-    }
+-
+-    try {
+-      return regexpCondition(kind, escapeDash(stemCondition));
+-    } catch (IllegalArgumentException e) {
+-      throw new IllegalArgumentException("On line: " + line, e);
+-    }
+-  }
+-
+-  private static boolean isRegexp(String condition) {
+-    return condition.contains("[") || condition.contains(".") || condition.contains("-");
+-  }
+-
+-  /** Removes the "strip" from "condition", to check only the remaining stem part */
+-  private static String removeStrip(String strip, String condition, String line, AffixKind kind) {
+     if (!isRegexp(condition)) {
+       if (kind == SUFFIX && condition.endsWith(strip)) {
+-        return condition.substring(0, condition.length() - strip.length());
++        return substringCondition(
++            kind, condition.substring(0, condition.length() - strip.length()));
+       }
+       if (kind == PREFIX && condition.startsWith(strip)) {
+-        return condition.substring(strip.length());
++        return substringCondition(kind, condition.substring(strip.length()));
+       }
++      return ALWAYS_FALSE;
++    }
++
++    int lastBracket = condition.lastIndexOf('[');
++    if (lastBracket >= 0 && condition.indexOf(']', lastBracket + 1) < 0) {
++      // unclosed [ is tolerated by Hunspell and occurs in some dictionaries
++      condition = condition + "]";
+     }
+ 
+-    List<String> charPatterns = parse(condition);
+     try {
+-      if (charPatterns.size() < strip.length()) {
+-        String regexp = unitePatterns(charPatterns);
+-        return strip.matches(kind == SUFFIX ? ".*" + regexp : regexp + ".*") ? "" : null;
++      int conditionChars = countCharPatterns(condition);
++      if (conditionChars <= strip.length()) {
++        String regex = kind == PREFIX ? ".*" + condition : condition + ".*";
++        return strip.matches(regex) ? ALWAYS_TRUE : ALWAYS_FALSE;
+       }
+ 
+-      int stripRangeStart = kind == PREFIX ? 0 : charPatterns.size() - strip.length();
+-      int stripRangeEnd = kind == PREFIX ? strip.length() : charPatterns.size();
+-      if (!strip.isEmpty()
+-          && !strip.matches(unitePatterns(charPatterns.subList(stripRangeStart, stripRangeEnd)))) {
+-        return null;
++      if (kind == PREFIX) {
++        int split = skipCharPatterns(condition, strip.length());
++        if (!strip.matches(condition.substring(0, split))) {
++          return ALWAYS_FALSE;
++        }
++        return regexpCondition(kind, condition.substring(split), conditionChars - strip.length());
+       }
+ 
+-      if (kind == PREFIX) {
+-        return unitePatterns(charPatterns.subList(stripRangeEnd, charPatterns.size()));
++      int split = skipCharPatterns(condition, conditionChars - strip.length());
++      if (!strip.matches(condition.substring(split))) {
++        return ALWAYS_FALSE;
+       }
+-      return unitePatterns(charPatterns.subList(0, stripRangeStart));
++      return regexpCondition(kind, condition.substring(0, split), conditionChars - strip.length());
+     } catch (PatternSyntaxException e) {
+-      throw new IllegalArgumentException("On line " + line, e);
++      return ALWAYS_FALSE;
++    } catch (Throwable e) {
++      throw new IllegalArgumentException("On line: " + line, e);
+     }
+   }
+ 
+-  /** Produces a regexp from groups returned by {@link #parse} */
+-  private static String unitePatterns(List<String> charPatterns) {
+-    return charPatterns.stream()
+-        .map(s -> s.length() == 1 && "()?$^{}*+|\\".indexOf(s.charAt(0)) >= 0 ? "\\" + s : s)
+-        .collect(Collectors.joining());
++  private static int skipCharPatterns(String condition, int count) {
++    int pos = 0;
++    for (int i = 0; i < count; i++) pos = skipCharPattern(condition, pos);
++    return pos;
+   }
+ 
+-  /** Splits condition into small regexps, each standing for a single char to be matched. */
+-  private static List<String> parse(String condition) {
+-    List<String> groups = new ArrayList<>();
+-    for (int i = 0; i < condition.length(); i++) {
+-      char c = condition.charAt(i);
+-      if (c == '[') {
+-        int closing = condition.indexOf(']', i + 1);
+-        if (closing <= 0) {
+-          groups.add(condition.substring(i) + "]");
+-          break;
+-        }
++  private static int countCharPatterns(String condition) {
++    int conditionChars = 0;
++    for (int i = 0; i < condition.length(); i = skipCharPattern(condition, i)) conditionChars++;
++    return conditionChars;
++  }
+ 
+-        groups.add(condition.substring(i, closing + 1));
+-        i = closing;
+-      } else if (c == '.') {
+-        groups.add(".");
+-      } else {
+-        groups.add(String.valueOf(c));
++  private static int skipCharPattern(String condition, int pos) {
++    if (condition.charAt(pos) == '[') {
++      pos = condition.indexOf(']', pos + 1);
++      if (pos < 0) {
++        throw new AssertionError("Malformed condition " + condition);
+       }
+     }
+-    return groups;
++    return pos + 1;
++  }
++
++  private static boolean isRegexp(String condition) {
++    return condition.contains("[") || condition.contains(".") || condition.contains("-");
+   }
+ 
+   private static AffixCondition substringCondition(AffixKind kind, String stemCondition) {
+@@ -169,25 +148,13 @@ private static AffixCondition substringCondition(AffixKind kind, String stemCond
+     };
+   }
+ 
+-  private static AffixCondition regexpCondition(AffixKind kind, String stemCondition) {
++  private static AffixCondition regexpCondition(AffixKind kind, String condition, int charCount) {
+     boolean forSuffix = kind == AffixKind.SUFFIX;
+-    int condLength = parse(stemCondition).size();
+     CharacterRunAutomaton automaton =
+-        new CharacterRunAutomaton(conditionRegexp(stemCondition).toAutomaton());
++        new CharacterRunAutomaton(new RegExp(escapeDash(condition), RegExp.NONE).toAutomaton());
+     return (word, offset, length) ->
+-        length >= condLength
+-            && automaton.run(word, forSuffix ? offset + length - condLength : offset, condLength);
+-  }
+-
+-  private static RegExp conditionRegexp(String regex) {
+-    try {
+-      return new RegExp(regex, RegExp.NONE);
+-    } catch (IllegalArgumentException e) {
+-      if (e.getMessage().contains("expected ']'")) {
+-        return conditionRegexp(regex + "]");
+-      }
+-      throw e;
+-    }
++        length >= charCount
++            && automaton.run(word, forSuffix ? offset + length - charCount : offset, charCount);
+   }
+ 
+   // "dash hasn't got special meaning" (we must escape it)
+diff --git a/lucene/analysis/common/src/test/org/apache/lucene/analysis/hunspell/TestAffixCondition.java b/lucene/analysis/common/src/test/org/apache/lucene/analysis/hunspell/TestAffixCondition.java
+index bdcce75934c6..f32a7ac06c06 100644
+--- a/lucene/analysis/common/src/test/org/apache/lucene/analysis/hunspell/TestAffixCondition.java
++++ b/lucene/analysis/common/src/test/org/apache/lucene/analysis/hunspell/TestAffixCondition.java
+@@ -33,6 +33,8 @@ public void testDotMatching() {
+   public void testUniqueKey() {
+     assertNotEquals(
+         AffixCondition.uniqueKey(PREFIX, "", "x"), AffixCondition.uniqueKey(SUFFIX, "", "x"));
++    assertNotEquals(
++        AffixCondition.uniqueKey(SUFFIX, "y", "x"), AffixCondition.uniqueKey(SUFFIX, "", "x"));
+     assertEquals(ALWAYS_TRUE_KEY, AffixCondition.uniqueKey(PREFIX, "", "."));
+     assertEquals(ALWAYS_TRUE_KEY, AffixCondition.uniqueKey(SUFFIX, "abc", "abc"));
+ 
+@@ -51,5 +53,8 @@ public void testImpossibleCondition() {
+ 
+   public void testNonHunspellPatternCharacters() {
+     assertEquals(ALWAYS_FALSE, AffixCondition.compile(SUFFIX, "x", "(^ax)", ""));
++    assertEquals(ALWAYS_FALSE, AffixCondition.compile(SUFFIX, "x", "(^.x)", ""));
++    assertEquals(ALWAYS_FALSE, AffixCondition.compile(SUFFIX, "x", "[z](^ax)", ""));
++    assertEquals(ALWAYS_FALSE, AffixCondition.compile(SUFFIX, "x", "(^ax)[z]", ""));
+   }
+ }

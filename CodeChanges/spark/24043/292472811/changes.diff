@@ -1,0 +1,235 @@
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/SchemaMergeUtils.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/SchemaMergeUtils.scala
+index c5a01ae1b3099..99882b0f7c7b0 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/SchemaMergeUtils.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/SchemaMergeUtils.scala
+@@ -31,16 +31,18 @@ object SchemaMergeUtils extends Logging {
+    * Figures out a merged Parquet/ORC schema with a distributed Spark job.
+    */
+   def mergeSchemasInParallel(
+-    sparkSession: SparkSession,
+-    files: Seq[FileStatus],
+-    parallelSchemaReader: (Seq[FileStatus], Configuration, Boolean) => Seq[StructType])
+-    : Option[StructType] = {
++      sparkSession: SparkSession,
++      files: Seq[FileStatus],
++      schemaReader: (Seq[FileStatus], Configuration, Boolean) => Seq[StructType])
++      : Option[StructType] = {
+     val serializedConf = new SerializableConfiguration(sparkSession.sessionState.newHadoopConf())
+ 
+     // !! HACK ALERT !!
++    // Here is a hack for Parquet, but it can be used by Orc as well.
+     //
+-    // Parquet requires `FileStatus`es to read footers.  Here we try to send cached `FileStatus`es
+-    // to executor side to avoid fetching them again.  However, `FileStatus` is not `Serializable`
++    // Parquet requires `FileStatus`es to read footers.
++    // Here we try to send cached `FileStatus`es to executor side to avoid fetching them again.
++    // However, `FileStatus` is not `Serializable`
+     // but only `Writable`.  What makes it worse, for some reason, `FileStatus` doesn't play well
+     // with `SerializableWritable[T]` and always causes a weird `IllegalStateException`.  These
+     // facts virtually prevents us to serialize `FileStatus`es.
+@@ -68,9 +70,7 @@ object SchemaMergeUtils extends Logging {
+             new FileStatus(length, false, 0, 0, 0, 0, null, null, null, new Path(path))
+           }.toSeq
+ 
+-          // Reads schemas in multi-threaded manner within each task
+-          val schemas = parallelSchemaReader(
+-            fakeFileStatuses, serializedConf.value, ignoreCorruptFiles)
++          val schemas = schemaReader(fakeFileStatuses, serializedConf.value, ignoreCorruptFiles)
+ 
+           if (schemas.isEmpty) {
+             Iterator.empty
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/ReadSchemaSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/ReadSchemaSuite.scala
+index af99e5bc6634d..d5502ba5737c0 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/ReadSchemaSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/ReadSchemaSuite.scala
+@@ -17,6 +17,7 @@
+ 
+ package org.apache.spark.sql.execution.datasources
+ 
++import org.apache.spark.SparkConf
+ import org.apache.spark.sql.internal.SQLConf
+ 
+ /**
+@@ -148,16 +149,10 @@ class MergedOrcReadSchemaSuite
+ 
+   override val format: String = "orc"
+ 
+-  override def beforeAll() {
+-    super.beforeAll()
+-    originalConf = spark.conf.get(SQLConf.ORC_SCHEMA_MERGING_ENABLED)
+-    spark.conf.set(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key, "true")
+-  }
+-
+-  override def afterAll() {
+-    spark.conf.set(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key, originalConf)
+-    super.afterAll()
+-  }
++  override protected def sparkConf: SparkConf =
++    super
++      .sparkConf
++      .set(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key, "true")
+ }
+ 
+ class ParquetReadSchemaSuite
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/orc/OrcSourceSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/orc/OrcSourceSuite.scala
+index fa04779c1f92a..c9f5d9cb23e6b 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/orc/OrcSourceSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/datasources/orc/OrcSourceSuite.scala
+@@ -192,7 +192,7 @@ abstract class OrcSuite extends OrcTest with BeforeAndAfterAll {
+ 
+   protected def testMergeSchemasInParallel(
+       ignoreCorruptFiles: Boolean,
+-      parallelSchemaReader: (Seq[FileStatus], Configuration, Boolean) => Seq[StructType]): Unit = {
++      schemaReader: (Seq[FileStatus], Configuration, Boolean) => Seq[StructType]): Unit = {
+     withSQLConf(
+       SQLConf.IGNORE_CORRUPT_FILES.key -> ignoreCorruptFiles.toString,
+       SQLConf.ORC_IMPLEMENTATION.key -> orcImp) {
+@@ -214,9 +214,9 @@ abstract class OrcSuite extends OrcTest with BeforeAndAfterAll {
+         val schema = SchemaMergeUtils.mergeSchemasInParallel(
+           spark,
+           fileStatuses,
+-          parallelSchemaReader)
++          schemaReader)
+ 
+-        assert(schema.isDefined == true)
++        assert(schema.isDefined)
+         assert(schema.get == StructType(Seq(
+           StructField("a", LongType, true),
+           StructField("b", LongType, true))))
+@@ -225,10 +225,10 @@ abstract class OrcSuite extends OrcTest with BeforeAndAfterAll {
+   }
+ 
+   protected def testMergeSchemasInParallel(
+-      parallelSchemaReader: (Seq[FileStatus], Configuration, Boolean) => Seq[StructType]): Unit = {
+-    testMergeSchemasInParallel(true, parallelSchemaReader)
++      schemaReader: (Seq[FileStatus], Configuration, Boolean) => Seq[StructType]): Unit = {
++    testMergeSchemasInParallel(true, schemaReader)
+     val exception = intercept[SparkException] {
+-      testMergeSchemasInParallel(false, parallelSchemaReader)
++      testMergeSchemasInParallel(false, schemaReader)
+     }.getCause
+     assert(exception.getCause.getMessage.contains("Could not read footer for file"))
+   }
+@@ -377,6 +377,107 @@ abstract class OrcSuite extends OrcTest with BeforeAndAfterAll {
+       assert(version === SPARK_VERSION_SHORT)
+     }
+   }
++
++  test("SPARK-11412 test orc merge schema option") {
++    val conf = spark.sessionState.conf
++    // Test if the default of spark.sql.orc.mergeSchema is false
++    assert(new OrcOptions(Map.empty[String, String], conf).mergeSchema == false)
++
++    // OrcOptions's parameters have a higher priority than SQL configuration.
++    // `mergeSchema` -> `spark.sql.orc.mergeSchema`
++    withSQLConf(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key -> "true") {
++      val map1 = Map(OrcOptions.MERGE_SCHEMA -> "true")
++      val map2 = Map(OrcOptions.MERGE_SCHEMA -> "false")
++      assert(new OrcOptions(map1, conf).mergeSchema == true)
++      assert(new OrcOptions(map2, conf).mergeSchema == false)
++    }
++
++    withSQLConf(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key -> "false") {
++      val map1 = Map(OrcOptions.MERGE_SCHEMA -> "true")
++      val map2 = Map(OrcOptions.MERGE_SCHEMA -> "false")
++      assert(new OrcOptions(map1, conf).mergeSchema == true)
++      assert(new OrcOptions(map2, conf).mergeSchema == false)
++    }
++  }
++
++  test("SPARK-11412 test enabling/disabling schema merging") {
++    def testSchemaMerging(expectedColumnNumber: Int): Unit = {
++      withTempDir { dir =>
++        val basePath = dir.getCanonicalPath
++        spark.range(0, 10).toDF("a").write.orc(new Path(basePath, "foo=1").toString)
++        spark.range(0, 10).toDF("b").write.orc(new Path(basePath, "foo=2").toString)
++        assert(spark.read.orc(basePath).columns.length === expectedColumnNumber)
++
++        // OrcOptions.MERGE_SCHEMA has higher priority
++        assert(spark.read.option(OrcOptions.MERGE_SCHEMA, true)
++          .orc(basePath).columns.length === 3)
++        assert(spark.read.option(OrcOptions.MERGE_SCHEMA, false)
++          .orc(basePath).columns.length === 2)
++      }
++    }
++
++    withSQLConf(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key -> "true") {
++      testSchemaMerging(3)
++    }
++
++    withSQLConf(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key -> "false") {
++      testSchemaMerging(2)
++    }
++  }
++
++  test("SPARK-11412 test enabling/disabling schema merging with data type conflicts") {
++    withTempDir { dir =>
++      val basePath = dir.getCanonicalPath
++      spark.range(0, 10).toDF("a").write.orc(new Path(basePath, "foo=1").toString)
++      spark.range(0, 10).map(s => s"value_$s").toDF("a")
++        .write.orc(new Path(basePath, "foo=2").toString)
++
++      // with schema merging, there should throw exception
++      withSQLConf(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key -> "true") {
++        val exception = intercept[SparkException] {
++          spark.read.orc(basePath).columns.length
++        }.getCause
++
++        val innerMessage = orcImp match {
++          case "native" => exception.getMessage
++          case "hive" => exception.getCause.getMessage
++          case impl =>
++            throw new UnsupportedOperationException(s"Unknown ORC implementation: $impl")
++        }
++
++        assert(innerMessage.contains("Failed to merge incompatible data types"))
++      }
++
++      // it is ok if no schema merging
++      withSQLConf(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key -> "false") {
++        assert(spark.read.orc(basePath).columns.length === 2)
++      }
++    }
++  }
++
++  test("SPARK-11412 test schema merging with corrupt files") {
++    withSQLConf(SQLConf.ORC_SCHEMA_MERGING_ENABLED.key -> "true") {
++      withTempDir { dir =>
++        val basePath = dir.getCanonicalPath
++        spark.range(0, 10).toDF("a").write.orc(new Path(basePath, "foo=1").toString)
++        spark.range(0, 10).toDF("b").write.orc(new Path(basePath, "foo=2").toString)
++        spark.range(0, 10).toDF("c").write.json(new Path(basePath, "foo=3").toString)
++
++        // ignore corrupt files
++        withSQLConf(SQLConf.IGNORE_CORRUPT_FILES.key -> "true") {
++          assert(spark.read.orc(basePath).columns.length === 3)
++        }
++
++        // don't ignore corrupt files
++        withSQLConf(SQLConf.IGNORE_CORRUPT_FILES.key -> "false") {
++          val exception = intercept[SparkException] {
++            spark.read.orc(basePath).columns.length
++          }.getCause
++          assert(exception.getCause.getMessage.contains("Could not read footer for file"))
++        }
++      }
++    }
++  }
+ }
+ 
+ class OrcSourceSuite extends OrcSuite with SharedSQLContext {
+diff --git a/sql/hive/src/main/scala/org/apache/spark/sql/hive/orc/OrcFileOperator.scala b/sql/hive/src/main/scala/org/apache/spark/sql/hive/orc/OrcFileOperator.scala
+index 1496352e9762a..1a5f47bf5aa7d 100644
+--- a/sql/hive/src/main/scala/org/apache/spark/sql/hive/orc/OrcFileOperator.scala
++++ b/sql/hive/src/main/scala/org/apache/spark/sql/hive/orc/OrcFileOperator.scala
+@@ -107,8 +107,8 @@ private[hive] object OrcFileOperator extends Logging {
+    * This is visible for testing.
+    */
+   def readOrcSchemasInParallel(
+-    partFiles: Seq[FileStatus], conf: Configuration, ignoreCorruptFiles: Boolean)
+-    : Seq[StructType] = {
++      partFiles: Seq[FileStatus], conf: Configuration, ignoreCorruptFiles: Boolean)
++      : Seq[StructType] = {
+     ThreadUtils.parmap(partFiles, "readingOrcSchemas", 8) { currentFile =>
+       val file = currentFile.getPath.toString
+       getFileReader(file, Some(conf), ignoreCorruptFiles).map(reader => {

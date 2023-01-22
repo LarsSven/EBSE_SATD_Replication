@@ -1,0 +1,217 @@
+diff --git a/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializer.java b/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializer.java
+index a613a8f57c94e..a5ecb799f3a3a 100644
+--- a/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializer.java
++++ b/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializer.java
+@@ -38,8 +38,6 @@
+ import org.apache.flink.core.memory.DataOutputViewStreamWrapper;
+ import org.apache.flink.util.Preconditions;
+ 
+-import javax.annotation.Nullable;
+-
+ import java.io.IOException;
+ import java.io.ObjectInputStream;
+ import java.io.ObjectOutputStream;
+@@ -116,6 +114,9 @@
+ 
+ 	private transient ClassLoader cl;
+ 
++	/**
++	 * Constructor to create a new {@link PojoSerializer}.
++	 */
+ 	@SuppressWarnings("unchecked")
+ 	public PojoSerializer(
+ 			Class<T> clazz,
+@@ -145,6 +146,10 @@ public PojoSerializer(
+ 		this.subclassSerializerCache = new HashMap<>();
+ 	}
+ 
++	/**
++	 * Constructor to create a restore serializer or a reconfigured serializer
++	 * from a {@link PojoSerializerSnapshot}.
++	 */
+ 	PojoSerializer(
+ 			Class<T> clazz,
+ 			Field[] fields,
+@@ -152,7 +157,7 @@ public PojoSerializer(
+ 			LinkedHashMap<Class<?>, Integer> registeredClasses,
+ 			TypeSerializer<?>[] registeredSerializers,
+ 			HashMap<Class<?>, TypeSerializer<?>> subclassSerializerCache,
+-			@Nullable ExecutionConfig executionConfig) {
++			ExecutionConfig executionConfig) {
+ 
+ 		this.clazz = checkNotNull(clazz);
+ 		this.fields = checkNotNull(fields);
+@@ -161,8 +166,7 @@ public PojoSerializer(
+ 		this.registeredClasses = checkNotNull(registeredClasses);
+ 		this.registeredSerializers = checkNotNull(registeredSerializers);
+ 		this.subclassSerializerCache = checkNotNull(subclassSerializerCache);
+-
+-		this.executionConfig = executionConfig;
++		this.executionConfig = checkNotNull(executionConfig);
+ 	}
+ 	
+ 	@Override
+diff --git a/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializerSnapshot.java b/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializerSnapshot.java
+index 95b0cc89e650c..24ea59734755d 100644
+--- a/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializerSnapshot.java
++++ b/flink-core/src/main/java/org/apache/flink/api/java/typeutils/runtime/PojoSerializerSnapshot.java
+@@ -19,6 +19,7 @@
+ package org.apache.flink.api.java.typeutils.runtime;
+ 
+ import org.apache.flink.annotation.Internal;
++import org.apache.flink.api.common.ExecutionConfig;
+ import org.apache.flink.api.common.typeutils.CompositeTypeSerializerUtil;
+ import org.apache.flink.api.common.typeutils.TypeSerializer;
+ import org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility;
+@@ -113,13 +114,13 @@ public int getCurrentVersion() {
+ 
+ 	@Override
+ 	public void writeSnapshot(DataOutputView out) throws IOException {
+-		this.snapshotData.writeSnapshotData(out);
++		snapshotData.writeSnapshotData(out);
+ 	}
+ 
+ 	@Override
+ 	public void readSnapshot(int readVersion, DataInputView in, ClassLoader userCodeClassLoader) throws IOException {
+ 		checkArgument(readVersion == 2, "unrecognized read version %d", readVersion);
+-		this.snapshotData = PojoSerializerSnapshotData.createFrom(in, userCodeClassLoader);
++		snapshotData = PojoSerializerSnapshotData.createFrom(in, userCodeClassLoader);
+ 	}
+ 
+ 	@Override
+@@ -150,7 +151,7 @@ public TypeSerializer<T> restoreSerializer() {
+ 			decomposedSubclassSerializerRegistry.f0,
+ 			decomposedSubclassSerializerRegistry.f1,
+ 			nonRegisteredSubclassSerializers,
+-			null);
++			new ExecutionConfig());
+ 	}
+ 
+ 	@Override
+@@ -170,44 +171,54 @@ public TypeSerializerSchemaCompatibility<T> resolveSchemaCompatibility(TypeSeria
+ 			return TypeSerializerSchemaCompatibility.incompatible();
+ 		}
+ 
+-		if (!registeredSubclassSerializerSnapshots.absentKeysOrValues().isEmpty()) {
++		if (registeredSubclassSerializerSnapshots.hasAbsentKeysOrValues()) {
+ 			return TypeSerializerSchemaCompatibility.incompatible();
+ 		}
+ 
+-		if (!nonRegisteredSubclassSerializerSnapshots.absentKeysOrValues().isEmpty()) {
++		if (nonRegisteredSubclassSerializerSnapshots.hasAbsentKeysOrValues()) {
+ 			return TypeSerializerSchemaCompatibility.incompatible();
+ 		}
+ 
+-		final CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T> fieldSerializerCompatibility =
++		final CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T> preExistingFieldSerializersCompatibility =
+ 			getCompatibilityOfPreExistingFields(newPojoSerializer, fieldSerializerSnapshots);
+ 
++		if (preExistingFieldSerializersCompatibility.isIncompatible()) {
++			return TypeSerializerSchemaCompatibility.incompatible();
++		}
++
+ 		final CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T> preExistingRegistrationsCompatibility =
+ 			getCompatibilityOfPreExistingRegisteredSubclasses(newPojoSerializer, registeredSubclassSerializerSnapshots);
+ 
+-		if (fieldSerializerCompatibility.isIncompatible() || preExistingRegistrationsCompatibility.isIncompatible()) {
++		if (preExistingRegistrationsCompatibility.isIncompatible()) {
+ 			return TypeSerializerSchemaCompatibility.incompatible();
+ 		}
+ 
+-		if (newPojoHasNewOrRemovedFields(fieldSerializerSnapshots, newPojoSerializer)
+-				|| fieldSerializerCompatibility.isCompatibleAfterMigration()
+-				|| preExistingRegistrationsCompatibility.isCompatibleAfterMigration()) {
++		if (newPojoSerializerIsCompatibleAfterMigration(
++				newPojoSerializer,
++				preExistingFieldSerializersCompatibility,
++				preExistingRegistrationsCompatibility,
++				fieldSerializerSnapshots)) {
+ 
+ 			return TypeSerializerSchemaCompatibility.compatibleAfterMigration();
+-		} else if (newPojoHasDifferentSubclassRegistrationOrder(registeredSubclassSerializerSnapshots, newPojoSerializer)
+-				|| previousSerializerHasNonRegisteredSubclasses(nonRegisteredSubclassSerializerSnapshots)
+-				|| fieldSerializerCompatibility.isCompatibleWithReconfiguredSerializer()
+-				|| preExistingRegistrationsCompatibility.isCompatibleWithReconfiguredSerializer()) {
++		}
++
++		if (newPojoSerializerIsCompatibleWithReconfiguredSerializer(
++				newPojoSerializer,
++				preExistingFieldSerializersCompatibility,
++				preExistingRegistrationsCompatibility,
++				registeredSubclassSerializerSnapshots,
++				nonRegisteredSubclassSerializerSnapshots)) {
+ 
+ 			return TypeSerializerSchemaCompatibility.compatibleWithReconfiguredSerializer(
+ 				constructReconfiguredPojoSerializer(
+ 					newPojoSerializer,
+-					fieldSerializerCompatibility,
++					preExistingFieldSerializersCompatibility,
+ 					registeredSubclassSerializerSnapshots,
+ 					preExistingRegistrationsCompatibility,
+ 					nonRegisteredSubclassSerializerSnapshots));
+-		} else {
+-			return TypeSerializerSchemaCompatibility.compatibleAsIs();
+ 		}
++
++		return TypeSerializerSchemaCompatibility.compatibleAsIs();
+ 	}
+ 
+ 	// ---------------------------------------------------------------------------------------------
+@@ -306,6 +317,34 @@ private static <T> CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T
+ 			associatedSubclassSerializerSnapshots.toArray(new TypeSerializerSnapshot<?>[associatedSubclassSerializerSnapshots.size()]));
+ 	}
+ 
++	/**
++	 * Checks if the new {@link PojoSerializer} is compatible after migration.
++	 */
++	private static <T> boolean newPojoSerializerIsCompatibleAfterMigration(
++			PojoSerializer<T> newPojoSerializer,
++			CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T> fieldSerializerCompatibility,
++			CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T> preExistingRegistrationsCompatibility,
++			LinkedOptionalMap<Field, TypeSerializerSnapshot<?>> fieldSerializerSnapshots) {
++		return newPojoHasNewOrRemovedFields(fieldSerializerSnapshots, newPojoSerializer)
++			|| fieldSerializerCompatibility.isCompatibleAfterMigration()
++			|| preExistingRegistrationsCompatibility.isCompatibleAfterMigration();
++	}
++
++	/**
++	 * Checks if the new {@link PojoSerializer} is compatible with a reconfigured instance.
++	 */
++	private static <T> boolean newPojoSerializerIsCompatibleWithReconfiguredSerializer(
++			PojoSerializer<T> newPojoSerializer,
++			CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T> fieldSerializerCompatibility,
++			CompositeTypeSerializerUtil.IntermediateCompatibilityResult<T> preExistingRegistrationsCompatibility,
++			LinkedOptionalMap<Class<?>, TypeSerializerSnapshot<?>> registeredSubclassSerializerSnapshots,
++			LinkedOptionalMap<Class<?>, TypeSerializerSnapshot<?>> nonRegisteredSubclassSerializerSnapshots) {
++		return newPojoHasDifferentSubclassRegistrationOrder(registeredSubclassSerializerSnapshots, newPojoSerializer)
++			|| previousSerializerHasNonRegisteredSubclasses(nonRegisteredSubclassSerializerSnapshots)
++			|| fieldSerializerCompatibility.isCompatibleWithReconfiguredSerializer()
++			|| preExistingRegistrationsCompatibility.isCompatibleWithReconfiguredSerializer();
++	}
++
+ 	/**
+ 	 * Checks whether the new {@link PojoSerializer} has new or removed fields compared to the previous one.
+ 	 */
+diff --git a/flink-core/src/main/java/org/apache/flink/util/LinkedOptionalMap.java b/flink-core/src/main/java/org/apache/flink/util/LinkedOptionalMap.java
+index 71aacdcc49a47..c80b00fbcbf43 100644
+--- a/flink-core/src/main/java/org/apache/flink/util/LinkedOptionalMap.java
++++ b/flink-core/src/main/java/org/apache/flink/util/LinkedOptionalMap.java
+@@ -133,6 +133,18 @@ public Set<String> absentKeysOrValues() {
+ 			.collect(Collectors.toCollection(LinkedHashSet::new));
+ 	}
+ 
++	/**
++	 * Checks whether there are entries with absent keys or values.
++	 */
++	public boolean hasAbsentKeysOrValues() {
++		for (Entry<String, KeyValue<K, V>> entry : underlyingMap.entrySet()) {
++			if (keyOrValueIsAbsent(entry)) {
++				return true;
++			}
++		}
++		return false;
++	}
++
+ 	/**
+ 	 * A {@link java.util.function.Consumer} that throws exceptions.
+ 	 */
