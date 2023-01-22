@@ -2,7 +2,6 @@
 import csv, glob, pathlib, lizard
 from collections import defaultdict
 from os import path
-from radon.complexity import cc_visit
 
 def calculateLizardComplexity(file):
     complexity = 0
@@ -35,6 +34,8 @@ def appendComplexity(project):
     amountOfFiles = 0
 
     for file in glob.iglob(project + "/before/" + '**/*.*', recursive=True):
+        if not path.isfile(file): # Some projects have folders with names like "options.java"
+            continue
 
         suffix = pathlib.Path(file).suffix
 
