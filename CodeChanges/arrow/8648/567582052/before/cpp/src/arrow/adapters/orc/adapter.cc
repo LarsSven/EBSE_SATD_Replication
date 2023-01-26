@@ -47,6 +47,10 @@
 #include "arrow/util/visibility.h"
 #include "orc/Exceptions.hh"
 
+// The following are required by ORC to be uint64_t
+static constexpr uint64_t kOrcWriterBatchSize = 128 * 1024;
+static constexpr uint64_t kOrcNaturalWriteSize = 128 * 1024;
+
 // alias to not interfere with nested orc namespace
 namespace liborc = orc;
 
@@ -69,14 +73,11 @@ namespace liborc = orc;
   ORC_ASSIGN_OR_THROW_IMPL(ARROW_ASSIGN_OR_RAISE_NAME(_error_or_value, __COUNTER__), \
                            lhs, rexpr);
 
-const uint64_t ORC_NATURAL_WRITE_SIZE = 128 * 1024;  // Required by liborc::Outstream
-
 namespace arrow {
-
-using internal::checked_cast;
-
 namespace adapters {
 namespace orc {
+
+using internal::checked_cast;
 
 class ArrowInputFile : public liborc::InputStream {
  public:
@@ -481,13 +482,15 @@ class ArrowOutputStream : public liborc::OutputStream {
 
   uint64_t getLength() const override { return length_; }
 
-  uint64_t getNaturalWriteSize() const override { return ORC_NATURAL_WRITE_SIZE; }
+  uint64_t getNaturalWriteSize() const override { return kOrcNaturalWriteSize; }
 
   void write(const void* buf, size_t length) override {
     ORC_THROW_NOT_OK(output_stream_.Write(buf, static_cast<int64_t>(length)));
     length_ += static_cast<int64_t>(length);
   }
 
+  // Mandatory due to us implementing an ORC virtual class.
+  // Used by ORC for error messages, not used by Arrow
   const std::string& getName() const override {
     static const std::string filename("ArrowOutputFile");
     return filename;
@@ -508,40 +511,38 @@ class ArrowOutputStream : public liborc::OutputStream {
 
 class ORCFileWriter::Impl {
  public:
-  Status Open(arrow::io::OutputStream& output_stream) {
+  Status Open(arrow::io::OutputStream* output_stream) {
     out_stream_ = std::unique_ptr<liborc::OutputStream>(
-        static_cast<liborc::OutputStream*>(new ArrowOutputStream(output_stream)));
+        checked_cast<liborc::OutputStream*>(new ArrowOutputStream(*output_stream)));
     return Status::OK();
   }
   Status Write(const Table& table) {
     std::unique_ptr<liborc::WriterOptions> orc_options =
         std::unique_ptr<liborc::WriterOptions>(new liborc::WriterOptions());
-    std::unique_ptr<liborc::Type> orc_schema;
-    RETURN_NOT_OK(GetORCType(*(table.schema()), &orc_schema));
+    ARROW_ASSIGN_OR_RAISE(auto orc_schema, GetOrcType(*(table.schema())));
     try {
-      writer_ = createWriter(*orc_schema, out_stream_.get(), *orc_options);
+      writer_ = liborc::createWriter(*orc_schema, out_stream_.get(), *orc_options);
     } catch (const liborc::ParseError& e) {
       return Status::IOError(e.what());
     }
     int64_t num_rows = table.num_rows();
     const int num_cols_ = table.num_columns();
-    const int64_t batch_size = 1024;  // Doesn't matter what it is
     std::vector<int64_t> arrow_index_offset(num_cols_, 0);
     std::vector<int> arrow_chunk_offset(num_cols_, 0);
     std::unique_ptr<liborc::ColumnVectorBatch> batch =
-        writer_->createRowBatch(batch_size);
+        writer_->createRowBatch(kOrcWriterBatchSize);
     liborc::StructVectorBatch* root =
         internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
     while (num_rows > 0) {
       for (int i = 0; i < num_cols_; i++) {
         RETURN_NOT_OK(adapters::orc::WriteBatch(
             (root->fields)[i], &(arrow_index_offset[i]), &(arrow_chunk_offset[i]),
-            batch_size, *(table.column(i))));
+            kOrcWriterBatchSize, *(table.column(i))));
       }
       root->numElements = (root->fields)[0]->numElements;
       writer_->add(*batch);
       batch->clear();
-      num_rows -= batch_size;
+      num_rows -= kOrcWriterBatchSize;
     }
     return Status::OK();
   }
@@ -560,15 +561,12 @@ ORCFileWriter::~ORCFileWriter() {}
 ORCFileWriter::ORCFileWriter() { impl_.reset(new ORCFileWriter::Impl()); }
 
 Result<std::unique_ptr<ORCFileWriter>> ORCFileWriter::Open(
-    io::OutputStream& output_stream) {
+    io::OutputStream* output_stream) {
   std::unique_ptr<ORCFileWriter> result =
       std::unique_ptr<ORCFileWriter>(new ORCFileWriter());
   Status status = result->impl_->Open(output_stream);
-  if (status.ok()) {
-    return result;
-  } else {
-    return status;
-  }
+  RETURN_NOT_OK(status);
+  return result;
 }
 
 Status ORCFileWriter::Write(const Table& table) { return impl_->Write(table); }
