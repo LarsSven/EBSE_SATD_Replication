@@ -1,0 +1,182 @@
+diff --git a/src/main/java/org/apache/sysml/hops/NaryOp.java b/src/main/java/org/apache/sysml/hops/NaryOp.java
+index 55cc78a2c4f..b8dc0a73fea 100644
+--- a/src/main/java/org/apache/sysml/hops/NaryOp.java
++++ b/src/main/java/org/apache/sysml/hops/NaryOp.java
+@@ -159,7 +159,6 @@ else if ( areDimsBelowThreshold() )
+ 		setRequiresRecompileIfNecessary();
+ 		
+ 		//ensure cp exec type for single-node operations
+-		//TODO eval function only supports CP execution type
+ 		if ( _op == OpOpN.PRINTF  || _op == OpOpN.EVAL)
+ 			_etype = ExecType.CP;
+ 		
+diff --git a/src/main/java/org/apache/sysml/parser/BuiltinFunctionExpression.java b/src/main/java/org/apache/sysml/parser/BuiltinFunctionExpression.java
+index 3a6b219c660..3c4b72edf4b 100644
+--- a/src/main/java/org/apache/sysml/parser/BuiltinFunctionExpression.java
++++ b/src/main/java/org/apache/sysml/parser/BuiltinFunctionExpression.java
+@@ -382,7 +382,18 @@ public void validateExpression(HashMap<String, DataIdentifier> ids, HashMap<Stri
+ 		switch (this.getOpCode()) {
+ 		case EVAL:
+ 			if (_args.length == 0) {
+-				raiseValidateError("Function eval should provide at least one arguments.", false);
++				raiseValidateError("Function eval should provide at least one argument, i.e., the function name.", false);
++			}
++			// convert the alias of namespace to the path of namespace
++			String funcName = ((StringIdentifier) _args[0]).getValue();
++			String[] splits = DMLProgram.splitFunctionKey(funcName);
++			if (splits.length == 2) {
++				String ns = splits[0];
++				ConstIdentifier nsPath = constVars.get(ns);
++				if (nsPath == null) {
++					raiseValidateError(String.format("Namespace $s doesn't exist.", ns), false);
++				}
++				_args[0] = new StringIdentifier(DMLProgram.constructFunctionKey(((StringIdentifier)nsPath).getValue(), splits[1]), this);
+ 			}
+ 			output.setDataType(DataType.MATRIX);
+ 			output.setValueType(ValueType.DOUBLE);
+@@ -1803,9 +1814,6 @@ else if ( functionName.equals("ifelse") )
+ 			bifop = Expression.BuiltinFunctionOp.IFELSE;
+ 		else if (functionName.equals("eval")) {
+ 			bifop = Expression.BuiltinFunctionOp.EVAL;
+-			//Need to cast the first param "name of the referenced func" into a string identifier
+-			DataIdentifier func = (DataIdentifier) paramExprsPassed.get(0).getExpr();
+-			paramExprsPassed.get(0).setExpr(new StringIdentifier(func.toString(), func));
+ 		}
+ 		else
+ 			return null;
+diff --git a/src/main/java/org/apache/sysml/parser/DMLTranslator.java b/src/main/java/org/apache/sysml/parser/DMLTranslator.java
+index 67bcd09c8fb..220be8aa13e 100644
+--- a/src/main/java/org/apache/sysml/parser/DMLTranslator.java
++++ b/src/main/java/org/apache/sysml/parser/DMLTranslator.java
+@@ -1272,10 +1272,6 @@ public void constructHops(StatementBlock sb)
+ 					if (!(target instanceof IndexedIdentifier)) {
+ 						//process right hand side and accumulation
+ 						Hop ae = processExpression(source, target, ids);
+-						// if it is eval built-in func, add hop to output
+-						if (ae instanceof NaryOp && ((NaryOp) ae).getOp().equals(OpOpN.EVAL)) {
+-							output.add(ae);
+-						}
+ 						if( ((AssignmentStatement)current).isAccumulator() ) {
+ 							DataIdentifier accum = liveIn.getVariable(target.getName());
+ 							if( accum == null )
+diff --git a/src/main/java/org/apache/sysml/parser/StatementBlock.java b/src/main/java/org/apache/sysml/parser/StatementBlock.java
+index f7901c150a2..3bea64548af 100644
+--- a/src/main/java/org/apache/sysml/parser/StatementBlock.java
++++ b/src/main/java/org/apache/sysml/parser/StatementBlock.java
+@@ -759,7 +759,12 @@ else if (current instanceof PrintStatement) {
+ 			}
+ 			// no work to perform for PathStatement or ImportStatement
+ 			else if (current instanceof PathStatement){}
+-			else if (current instanceof ImportStatement){}
++			else if (current instanceof ImportStatement){
++				// the namespace's alias is the macro
++				// inject the namespace's alias into the constVars
++				ImportStatement is = (ImportStatement) current;
++				currConstVars.put(is.getNamespace(), new StringIdentifier(is.getCompletePath(), this));
++			}
+ 			else {
+ 				raiseValidateError("cannot process statement of type " + current.getClass().getSimpleName(), conditional);
+ 			}
+diff --git a/src/main/java/org/apache/sysml/parser/dml/DmlSyntacticValidator.java b/src/main/java/org/apache/sysml/parser/dml/DmlSyntacticValidator.java
+index 260ab52e325..211fd5c0f03 100644
+--- a/src/main/java/org/apache/sysml/parser/dml/DmlSyntacticValidator.java
++++ b/src/main/java/org/apache/sysml/parser/dml/DmlSyntacticValidator.java
+@@ -507,19 +507,6 @@ private void castAsScalarDeprecationCheck(String functionName, ParserRuleContext
+ 		}
+ 	}
+ 
+-	private void convertNamespace(ArrayList<ParameterExpression> params) {
+-		for (ParameterExpression p : params) {
+-			if (p.getExpr() instanceof DataIdentifier && ((DataIdentifier) p.getExpr()).getName() != null
+-					&& ((DataIdentifier) p.getExpr()).getName().contains(namespaceResolutionOp())) {
+-				DataIdentifier di = (DataIdentifier) p.getExpr();
+-				String[] names = getQualifiedNames(di.getName());
+-				if(names != null) {
+-					di.setName(names[0] + namespaceResolutionOp() + names[1]);
+-				}
+-			}
+-		}
+-	}
+-
+ 	@Override
+ 	public void exitBuiltinFunctionExpression(BuiltinFunctionExpressionContext ctx) {
+ 		// Double verification: verify passed function name is a (non-parameterized) built-in function.
+@@ -532,8 +519,6 @@ public void exitBuiltinFunctionExpression(BuiltinFunctionExpressionContext ctx)
+ 		String functionName = names[1];
+ 
+ 		ArrayList<ParameterExpression> paramExpression = getParameterExpressionList(ctx.paramExprs);
+-		//convert the namespace for the function identifier arguments
+-		convertNamespace(paramExpression);
+ 		castAsScalarDeprecationCheck(functionName, ctx);
+ 
+ 		ConvertedDMLSyntax convertedSyntax = convertToDMLSyntax(ctx, namespace, functionName, paramExpression, ctx.name);
+diff --git a/src/main/java/org/apache/sysml/runtime/instructions/cp/EvalBuiltinNaryCPInstruction.java b/src/main/java/org/apache/sysml/runtime/instructions/cp/EvalBuiltinNaryCPInstruction.java
+index 9946d2fc603..a86d2d1aa0c 100644
+--- a/src/main/java/org/apache/sysml/runtime/instructions/cp/EvalBuiltinNaryCPInstruction.java
++++ b/src/main/java/org/apache/sysml/runtime/instructions/cp/EvalBuiltinNaryCPInstruction.java
+@@ -1,5 +1,6 @@
+ package org.apache.sysml.runtime.instructions.cp;
+ 
++import org.apache.sysml.parser.DMLProgram;
+ import org.apache.sysml.runtime.DMLRuntimeException;
+ import org.apache.sysml.runtime.controlprogram.caching.FrameObject;
+ import org.apache.sysml.runtime.controlprogram.caching.MatrixObject;
+@@ -29,23 +30,13 @@ public void processInstruction(ExecutionContext ec) throws DMLRuntimeException {
+ 		CPOperand func = inputs[0];
+ 		String funcName = func.getName();
+ 		String namespace = null;
+-		if (func.getName().contains("::")) {
+-			String[] split = func.getName().split("::");
+-			namespace = split[0];
+-			String funcSignature = split[1];
+-			if (funcSignature.matches("(.+)([(].*[)])")) {
+-				// get funcName from a function call identifier
+-				Pattern pattern = Pattern.compile("(.+)([(].*[)])");
+-				Matcher matcher = pattern.matcher(func.getName());
+-				if (matcher.matches()) {
+-					funcName = matcher.group(0);
+-				}
+-			} else {
+-				funcName = funcSignature;
+-			}
++		String[] splits = DMLProgram.splitFunctionKey(funcName);
++		if (splits.length == 2) {
++			namespace = splits[0];
++			funcName = splits[1];
+ 		}
+ 		// bound the inputs to avoiding being deleted after the function call
+-		CPOperand[] boundInputs = Arrays.asList(inputs).subList(1, inputs.length).toArray(new CPOperand[]{});
++		CPOperand[] boundInputs = Arrays.copyOfRange(inputs, 1, inputs.length);
+ 		ArrayList<String> boundOutputNames = new ArrayList<>();
+ 		boundOutputNames.add(output.getName());
+ 		ArrayList<String> boundInputNames = new ArrayList<>();
+@@ -68,8 +59,7 @@ public void processInstruction(ExecutionContext ec) throws DMLRuntimeException {
+ 		MatrixBlock mb = null;
+ 		if (newOutput instanceof ScalarObject) {
+ 			//convert scalar to matrix
+-			mb = new MatrixBlock(1, 1, false);
+-			mb.setValue(0, 0, ((ScalarObject) newOutput).getDoubleValue());
++			mb = new MatrixBlock(((ScalarObject) newOutput).getDoubleValue());
+ 		} else if (newOutput instanceof FrameObject) {
+ 			//convert frame to matrix
+ 			mb = DataConverter.convertToMatrixBlock(((FrameObject) newOutput).acquireRead());
+diff --git a/src/test/scripts/org/apache/sysml/api/mlcontext/eval-test.dml b/src/test/scripts/org/apache/sysml/api/mlcontext/eval-test.dml
+index a0635710cde..333114f15a5 100644
+--- a/src/test/scripts/org/apache/sysml/api/mlcontext/eval-test.dml
++++ b/src/test/scripts/org/apache/sysml/api/mlcontext/eval-test.dml
+@@ -41,11 +41,11 @@ f3 = function (matrix[double] M1, matrix[double] M2) return (matrix[double] res)
+ X = matrix("1 2 3 4", rows=2, cols=2)
+ y = 10
+ 
+-R1 = eval(f1, X, y)
+-R2 = eval(f2, X, y)
+-R3 = eval(f3, X, X)
++R1 = eval("f1", X, y)
++R2 = eval("f2", X, y)
++R3 = eval("f3", X, X)
+ 
+ print(toString(R1))
+ print(toString(R2))
+ print(toString(R3))
+-print(toString(eval(ns1::f4)))
++print(toString(eval("ns1::f4")))

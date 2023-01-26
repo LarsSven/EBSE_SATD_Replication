@@ -1,0 +1,675 @@
+diff --git a/core/src/main/scala/org/apache/spark/util/LargeByteBufferOutputStream.scala b/core/src/main/scala/org/apache/spark/util/LargeByteBufferOutputStream.scala
+index 04e685262f38c..176825b7ec241 100644
+--- a/core/src/main/scala/org/apache/spark/util/LargeByteBufferOutputStream.scala
++++ b/core/src/main/scala/org/apache/spark/util/LargeByteBufferOutputStream.scala
+@@ -29,15 +29,12 @@ class LargeByteBufferOutputStream(chunkSize: Int = 65536)
+ 
+   private[util] val output = new ByteArrayChunkOutputStream(chunkSize)
+ 
+-  private var _pos = 0
+-
+   override def write(b: Int): Unit = {
+     output.write(b)
+   }
+ 
+   override def write(bytes: Array[Byte], offs: Int, len: Int): Unit = {
+     output.write(bytes, offs, len)
+-    _pos += len
+   }
+ 
+   def largeBuffer: LargeByteBuffer = {
+@@ -51,17 +48,17 @@ class LargeByteBufferOutputStream(chunkSize: Int = 65536)
+     // as much as possible.  This is necessary b/c there are a number of parts of spark that
+     // can only deal w/ one nio.ByteBuffer, and can't use a LargeByteBuffer yet.
+     val totalSize = output.size
+-    val chunksNeeded = ((totalSize + maxChunk -1) / maxChunk).toInt
++    val chunksNeeded = ((totalSize + maxChunk - 1) / maxChunk).toInt
+     val chunks = new Array[Array[Byte]](chunksNeeded)
+     var remaining = totalSize
+     var pos = 0
+-    (0 until chunksNeeded).foreach{idx =>
++    (0 until chunksNeeded).foreach { idx =>
+       val nextSize = math.min(maxChunk, remaining).toInt
+       chunks(idx) = output.slice(pos, pos + nextSize)
+       pos += nextSize
+       remaining -= nextSize
+     }
+-    new WrappedLargeByteBuffer(chunks.map{ByteBuffer.wrap})
++    new WrappedLargeByteBuffer(chunks.map(ByteBuffer.wrap))
+   }
+ 
+   override def close(): Unit = {
+diff --git a/core/src/main/scala/org/apache/spark/util/io/ByteArrayChunkOutputStream.scala b/core/src/main/scala/org/apache/spark/util/io/ByteArrayChunkOutputStream.scala
+index 64f1ff7153fe4..34bb6ee6db906 100644
+--- a/core/src/main/scala/org/apache/spark/util/io/ByteArrayChunkOutputStream.scala
++++ b/core/src/main/scala/org/apache/spark/util/io/ByteArrayChunkOutputStream.scala
+@@ -110,8 +110,7 @@ class ByteArrayChunkOutputStream(chunkSize: Int) extends OutputStream {
+       val nextSize = chunkStart + chunks(chunkIdx).size
+       if (nextSize > start) {
+         foundStart = true
+-      }
+-      else {
++      } else {
+         chunkStart = nextSize
+         chunkIdx += 1
+       }
+diff --git a/core/src/test/scala/org/apache/spark/util/LargeByteBufferOutputStreamSuite.scala b/core/src/test/scala/org/apache/spark/util/LargeByteBufferOutputStreamSuite.scala
+index b25dfc5bbaaac..4b28d383df908 100644
+--- a/core/src/test/scala/org/apache/spark/util/LargeByteBufferOutputStreamSuite.scala
++++ b/core/src/test/scala/org/apache/spark/util/LargeByteBufferOutputStreamSuite.scala
+@@ -53,7 +53,7 @@ class LargeByteBufferOutputStreamSuite extends FunSuite with Matchers {
+     Random.nextBytes(bytes)
+     out.write(bytes)
+ 
+-    (10 to 100 by 10).foreach{chunkSize =>
++    (10 to 100 by 10).foreach { chunkSize =>
+       val buffer = out.largeBuffer(chunkSize).asInstanceOf[WrappedLargeByteBuffer]
+       buffer.position() should be (0)
+       buffer.size() should be (100)
+diff --git a/network/common/src/main/java/org/apache/spark/network/buffer/BufferTooLargeException.java b/network/common/src/main/java/org/apache/spark/network/buffer/BufferTooLargeException.java
+index 158d29ad152ce..4e1a85ba1f126 100644
+--- a/network/common/src/main/java/org/apache/spark/network/buffer/BufferTooLargeException.java
++++ b/network/common/src/main/java/org/apache/spark/network/buffer/BufferTooLargeException.java
+@@ -21,12 +21,14 @@
+ public class BufferTooLargeException extends IOException {
+   public final long actualSize;
+   public final long extra;
++  public final long maxSize;
+ 
+-  public BufferTooLargeException(long actualSize) {
+-    super("LargeByteBuffer is too large to convert.  Size: " + actualSize + "; Size Limit: "
+-      + LargeByteBufferHelper.MAX_CHUNK + " (" +
+-      (actualSize - LargeByteBufferHelper.MAX_CHUNK) + " too big)");
+-    this.extra = actualSize - LargeByteBufferHelper.MAX_CHUNK;
++  public BufferTooLargeException(long actualSize, long maxSize) {
++    super(String.format("LargeByteBuffer is too large to convert.  Size: %d; Size Limit: %d (%d " +
++      "too big)", actualSize, maxSize,
++      actualSize - maxSize));
++    this.extra = actualSize - maxSize;
+     this.actualSize = actualSize;
++    this.maxSize = maxSize;
+   }
+ }
+diff --git a/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBuffer.java b/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBuffer.java
+index 12d12647f3bb7..bc48088cc8610 100644
+--- a/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBuffer.java
++++ b/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBuffer.java
+@@ -19,94 +19,95 @@
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.channels.WritableByteChannel;
+-import java.util.List;
+ 
+ public interface LargeByteBuffer {
+-    public byte get();
++  public byte get();
+ 
+-    /**
+-     * Bulk copy data from this buffer into the given array.  First checks there is sufficient
+-     * data in this buffer; if not, throws a {@link java.nio.BufferUnderflowException}.
+-     * @param dst
+-     * @param offset
+-     * @param length
+-     */
+-    public void get(byte[] dst,int offset, int length);
++  /**
++   * Bulk copy data from this buffer into the given array.  First checks there is sufficient
++   * data in this buffer; if not, throws a {@link java.nio.BufferUnderflowException}.
++   *
++   * @param dst
++   * @param offset
++   * @param length
++   */
++  public void get(byte[] dst, int offset, int length);
+ 
+-    public LargeByteBuffer rewind();
++  public LargeByteBuffer rewind();
+ 
+-    /**
+-     * return a deep copy of this buffer.
+-     * The returned buffer will have position == 0.  The position
+-     * of this buffer will not change as a result of copying.
+-     *
+-     * @return a new buffer with a full copy of this buffer's data
+-     */
+-    public LargeByteBuffer deepCopy();
++  /**
++   * Return a deep copy of this buffer.
++   * The returned buffer will have position == 0.  The position
++   * of this buffer will not change as a result of copying.
++   *
++   * @return a new buffer with a full copy of this buffer's data
++   */
++  public LargeByteBuffer deepCopy();
+ 
+-    /**
+-     * Advance the position in this buffer by up to <code>n</code> bytes.  <code>n</code> may be
+-     * positive or negative.  It will move the full <code>n</code> unless that moves
+-     * it past the end (or beginning) of the buffer, in which case it will move to the end
+-     * (or beginning).
+-     *
+-     * @return the number of bytes moved forward (can be negative if <code>n</code> is negative)
+-     */
+-    public long skip(long n);
++  /**
++   * Advance the position in this buffer by up to <code>n</code> bytes.  <code>n</code> may be
++   * positive or negative.  It will move the full <code>n</code> unless that moves
++   * it past the end (or beginning) of the buffer, in which case it will move to the end
++   * (or beginning).
++   *
++   * @return the number of bytes moved forward (can be negative if <code>n</code> is negative)
++   */
++  public long skip(long n);
+ 
+-    public long position();
++  public long position();
+ 
+-    /**
+-     * Creates a new byte buffer that shares this buffer's content.
+-     *
+-     * <p> The content of the new buffer will be that of this buffer.  Changes
+-     * to this buffer's content will be visible in the new buffer, and vice
+-     * versa; the two buffers' positions will be independent.
+-     *
+-     * <p> The new buffer's position will be identical to those of this buffer
+-     * */
+-    public LargeByteBuffer duplicate();
++  /**
++   * Creates a new byte buffer that shares this buffer's content.
++   * <p/>
++   * <p> The content of the new buffer will be that of this buffer.  Changes
++   * to this buffer's content will be visible in the new buffer, and vice
++   * versa; the two buffers' positions will be independent.
++   * <p/>
++   * <p> The new buffer's position will be identical to those of this buffer
++   */
++  public LargeByteBuffer duplicate();
+ 
+ 
+-    public long remaining();
++  public long remaining();
+ 
+-    /**
+-     * the total number of bytes in this buffer
+-     * @return
+-     */
+-    public long size();
++  /**
++   * Total number of bytes in this buffer
++   *
++   * @return
++   */
++  public long size();
+ 
+-    /**
+-     * writes the data from the current <code>position()</code> to the end of this buffer
+-     * to the given channel.  The <code>position()</code> will be moved to the end of
+-     * the buffer after this.
+-     *
+-     * Note that this method will continually attempt to push data to the given channel.  If the
+-     * channel cannot accept more data, this will continuously retry until the channel accepts
+-     * the data.
+-     *
+-     * @param channel
+-     * @return the number of bytes written to the channel
+-     * @throws IOException
+-     */
+-    public long writeTo(WritableByteChannel channel) throws IOException;
++  /**
++   * Writes the data from the current <code>position()</code> to the end of this buffer
++   * to the given channel.  The <code>position()</code> will be moved to the end of
++   * the buffer after this.
++   * <p/>
++   * Note that this method will continually attempt to push data to the given channel.  If the
++   * channel cannot accept more data, this will continuously retry until the channel accepts
++   * the data.
++   *
++   * @param channel
++   * @return the number of bytes written to the channel
++   * @throws IOException
++   */
++  public long writeTo(WritableByteChannel channel) throws IOException;
+ 
+-    /**
+-     * get the entire contents of this as one ByteBuffer, if possible.  The returned ByteBuffer
+-     * will always have the position set 0, and the limit set to the end of the data.  Each
+-     * call will return a new ByteBuffer, but will not require copying the data (eg., it will
+-     * use ByteBuffer#duplicate()).  The returned byte buffer and this may or may not share data.
+-     *
+-     * @return
+-     * @throws BufferTooLargeException if this buffer is too large to fit in one {@link ByteBuffer}
+-     */
+-    public ByteBuffer asByteBuffer() throws BufferTooLargeException;
++  /**
++   * Get the entire contents of this as one ByteBuffer, if possible.  The returned ByteBuffer
++   * will always have the position set 0, and the limit set to the end of the data.  Each
++   * call will return a new ByteBuffer, but will not require copying the data (eg., it will
++   * use ByteBuffer#duplicate()).  The returned byte buffer and this may or may not share data.
++   *
++   * @return
++   * @throws BufferTooLargeException if this buffer is too large to fit in one {@link ByteBuffer}
++   */
++  public ByteBuffer asByteBuffer() throws BufferTooLargeException;
+ 
+-    /**
+-     * Attempt to clean up if it is memory-mapped. This uses an *unsafe* Sun API that
+-     * might cause errors if one attempts to read from the unmapped buffer, but it's better than
+-     * waiting for the GC to find it because that could lead to huge numbers of open files. There's
+-     * unfortunately no standard API to do this.
+-     */
+-    public void dispose();
++  /**
++   * Attempt to clean up if it is memory-mapped. This uses an *unsafe* Sun API that
++   * might cause errors if one attempts to read from the unmapped buffer, but it's better than
++   * waiting for the GC to find it because that could lead to huge numbers of open files. There's
++   * unfortunately no standard API to do this.
++   */
++  public void dispose();
+ }
+diff --git a/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBufferHelper.java b/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBufferHelper.java
+index 9d40fc4f5c07d..f762c686bde12 100644
+--- a/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBufferHelper.java
++++ b/network/common/src/main/java/org/apache/spark/network/buffer/LargeByteBufferHelper.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.spark.network.buffer;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.channels.FileChannel;
+@@ -23,51 +25,58 @@
+ 
+ public class LargeByteBufferHelper {
+ 
+-    public static final int MAX_CHUNK = Integer.MAX_VALUE - 1000000;
++  public static final int MAX_CHUNK = Integer.MAX_VALUE - 1000000;
+ 
+-    public static LargeByteBuffer asLargeByteBuffer(ByteBuffer buffer) {
+-        return new WrappedLargeByteBuffer(new ByteBuffer[]{buffer});
+-    }
++  public static LargeByteBuffer asLargeByteBuffer(ByteBuffer buffer) {
++    return new WrappedLargeByteBuffer(new ByteBuffer[] { buffer } );
++  }
+ 
+-    public static LargeByteBuffer asLargeByteBuffer(byte[] bytes) {
+-        return new WrappedLargeByteBuffer(new ByteBuffer[]{ByteBuffer.wrap(bytes)});
+-    }
++  public static LargeByteBuffer asLargeByteBuffer(byte[] bytes) {
++    return new WrappedLargeByteBuffer(new ByteBuffer[] { ByteBuffer.wrap(bytes) } );
++  }
+ 
+-    public static LargeByteBuffer allocate(long size) {
+-        ArrayList<ByteBuffer> chunks = new ArrayList<ByteBuffer>();
+-        long remaining = size;
+-        while (remaining > 0) {
+-            int nextSize = (int)Math.min(remaining, MAX_CHUNK);
+-            ByteBuffer next = ByteBuffer.allocate(nextSize);
+-            remaining -= nextSize;
+-            chunks.add(next);
+-        }
+-        return new WrappedLargeByteBuffer(chunks.toArray(new ByteBuffer[chunks.size()]));
++  public static LargeByteBuffer allocate(long size) {
++    return allocate(size, MAX_CHUNK);
++  }
++
++  @VisibleForTesting
++  static LargeByteBuffer allocate(long size, int maxChunk) {
++    int chunksNeeded = (int) ((size + maxChunk - 1) / maxChunk);
++    ByteBuffer[] chunks = new ByteBuffer[chunksNeeded];
++    long remaining = size;
++    for (int i = 0; i < chunksNeeded; i++) {
++      int nextSize = (int) Math.min(remaining, maxChunk);
++      ByteBuffer next = ByteBuffer.allocate(nextSize);
++      remaining -= nextSize;
++      chunks[i] = next;
+     }
++    if (remaining != 0) throw new IllegalStateException("remaining = " + remaining);
++    return new WrappedLargeByteBuffer(chunks);
++  }
+ 
+ 
+-    public static LargeByteBuffer mapFile(
+-            FileChannel channel,
+-            FileChannel.MapMode mode,
+-            long offset,
+-            long length
+-    ) throws IOException {
+-        int maxChunk = MAX_CHUNK;
+-        ArrayList<Long> offsets = new ArrayList<Long>();
+-        long curOffset = offset;
+-        long end = offset + length;
+-        while (curOffset < end) {
+-            offsets.add(curOffset);
+-            int chunkLength = (int) Math.min((end - curOffset), maxChunk);
+-            curOffset += chunkLength;
+-        }
+-        offsets.add(end);
+-        ByteBuffer[] chunks = new ByteBuffer[offsets.size() - 1];
+-        for (int i = 0; i< offsets.size() - 1; i++) {
+-            chunks[i] = channel.map(mode, offsets.get(i), offsets.get(i+ 1) - offsets.get(i));
+-        }
+-        return new WrappedLargeByteBuffer(chunks);
++  public static LargeByteBuffer mapFile(
++    FileChannel channel,
++    FileChannel.MapMode mode,
++    long offset,
++    long length
++  ) throws IOException {
++    int maxChunk = MAX_CHUNK;
++    ArrayList<Long> offsets = new ArrayList<Long>();
++    long curOffset = offset;
++    long end = offset + length;
++    while (curOffset < end) {
++      offsets.add(curOffset);
++      int chunkLength = (int) Math.min((end - curOffset), maxChunk);
++      curOffset += chunkLength;
++    }
++    offsets.add(end);
++    ByteBuffer[] chunks = new ByteBuffer[offsets.size() - 1];
++    for (int i = 0; i < offsets.size() - 1; i++) {
++      chunks[i] = channel.map(mode, offsets.get(i), offsets.get(i + 1) - offsets.get(i));
+     }
++    return new WrappedLargeByteBuffer(chunks);
++  }
+ 
+ 
+ }
+diff --git a/network/common/src/main/java/org/apache/spark/network/buffer/WrappedLargeByteBuffer.java b/network/common/src/main/java/org/apache/spark/network/buffer/WrappedLargeByteBuffer.java
+index 8ead571dd102f..d5da70b9000de 100644
+--- a/network/common/src/main/java/org/apache/spark/network/buffer/WrappedLargeByteBuffer.java
++++ b/network/common/src/main/java/org/apache/spark/network/buffer/WrappedLargeByteBuffer.java
+@@ -16,6 +16,7 @@
+ */
+ package org.apache.spark.network.buffer;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import sun.nio.ch.DirectBuffer;
+ 
+ import java.io.IOException;
+@@ -28,53 +29,36 @@
+ 
+ public class WrappedLargeByteBuffer implements LargeByteBuffer {
+ 
+-  //only public for tests
++  @VisibleForTesting
+   public final ByteBuffer[] underlying;
+ 
+   private final long size;
+   private long _pos;
+-  private int currentBufferIdx;
+-  private ByteBuffer currentBuffer;
++  @VisibleForTesting
++  int currentBufferIdx;
++  @VisibleForTesting
++  ByteBuffer currentBuffer;
+ 
+ 
+   public WrappedLargeByteBuffer(ByteBuffer[] underlying) {
+-    this(underlying, findExpectedInitialPosition(underlying));
+-  }
+-
+-  private static long findExpectedInitialPosition(ByteBuffer[] bufs) {
+-    long sum = 0L;
+-    for (ByteBuffer b: bufs) {
+-      if (b.position() > 0) {
+-        // this could still lead to a mix of positions half-way through buffers that
+-        // would be inconsistent -- but we'll discover that in the constructor checks
+-        sum += b.position();
+-      } else {
+-        break;
+-      }
++    if (underlying.length == 0) {
++      throw new IllegalArgumentException("must wrap at least one ByteBuffer");
+     }
+-    return sum;
+-  }
+-
+-  private WrappedLargeByteBuffer(ByteBuffer[] underlying, long initialPosition) {
+     this.underlying = underlying;
+     long sum = 0L;
++    boolean startFound = false;
++    long initialPosition = -1;
+     for (int i = 0; i < underlying.length; i++) {
+       ByteBuffer b = underlying[i];
+-      long nextSum = sum + b.capacity();
+-      int expectedPosition;
+-      if (nextSum < initialPosition) {
+-        expectedPosition = b.capacity();
+-      } else if (sum > initialPosition) {
+-        expectedPosition = 0;
+-      } else {
+-        expectedPosition = (int) (initialPosition - sum);
++      if (startFound) {
++        if (b.position() != 0) {
++          throw new IllegalArgumentException("ByteBuffers have inconsistent positions");
++        }
++      } else if (b.position() != b.capacity()) {
++        startFound = true;
++        initialPosition = sum + b.position();
+       }
+-      if (b.position() != expectedPosition) {
+-        throw new IllegalArgumentException("ByteBuffer[" + i + "]:" + b + " was expected to have" +
+-          " position = " + expectedPosition + " to be consistent with the overall " +
+-          "initialPosition = " + initialPosition);
+-      }
+-      sum = nextSum;
++      sum += b.capacity();
+     }
+     _pos = initialPosition;
+     currentBufferIdx = 0;
+@@ -84,8 +68,9 @@ private WrappedLargeByteBuffer(ByteBuffer[] underlying, long initialPosition) {
+ 
+   @Override
+   public void get(byte[] dest, int offset, int length) {
+-    if (length > remaining())
++    if (length > remaining()) {
+       throw new BufferUnderflowException();
++    }
+     int moved = 0;
+     while (moved < length) {
+       int toRead = Math.min(length - moved, currentBuffer.remaining());
+@@ -117,7 +102,7 @@ public WrappedLargeByteBuffer deepCopy() {
+       ByteBuffer b = underlying[i];
+       dataCopy[i] = ByteBuffer.allocate(b.capacity());
+       int originalPosition = b.position();
+-      b.position(0);
++      b.rewind();
+       dataCopy[i].put(b);
+       dataCopy[i].position(0);
+       b.position(originalPosition);
+@@ -193,7 +178,7 @@ public WrappedLargeByteBuffer duplicate() {
+     for (int i = 0; i < underlying.length; i++) {
+       duplicates[i] = underlying[i].duplicate();
+     }
+-    return new WrappedLargeByteBuffer(duplicates, _pos);
++    return new WrappedLargeByteBuffer(duplicates);
+   }
+ 
+   @Override
+@@ -216,13 +201,29 @@ public long writeTo(WritableByteChannel channel) throws IOException {
+ 
+   @Override
+   public ByteBuffer asByteBuffer() throws BufferTooLargeException {
+-    if (underlying.length > 1) {
+-      throw new BufferTooLargeException(size());
++    return asByteBuffer(LargeByteBufferHelper.MAX_CHUNK);
++  }
++
++  @VisibleForTesting
++  ByteBuffer asByteBuffer(int maxChunkSize) throws BufferTooLargeException {
++    if (underlying.length == 1) {
++      ByteBuffer b = underlying[0].duplicate();
++      b.rewind();
++      return b;
++    } else if (size() > maxChunkSize) {
++      throw new BufferTooLargeException(size(), maxChunkSize);
++    } else {
++      byte[] merged = new byte[(int) size()];
++      long initialPosition = position();
++      rewind();
++      get(merged, 0, merged.length);
++      rewind();
++      skip(initialPosition);
++      return ByteBuffer.wrap(merged);
+     }
+-    return underlying[0];
+   }
+ 
+-  // only needed for tests
++  @VisibleForTesting
+   public List<ByteBuffer> nioBuffers() {
+     return Arrays.asList(underlying);
+   }
+@@ -234,7 +235,7 @@ public List<ByteBuffer> nioBuffers() {
+    * unfortunately no standard API to do this.
+    */
+   private static void dispose(ByteBuffer buffer) {
+-    if (buffer != null && buffer instanceof MappedByteBuffer) {
++    if (buffer != null && buffer instanceof DirectBuffer) {
+       DirectBuffer db = (DirectBuffer) buffer;
+       if (db.cleaner() != null) {
+         db.cleaner().clean();
+diff --git a/network/common/src/test/java/org/apache/spark/network/buffer/LargeByteBufferHelperSuite.java b/network/common/src/test/java/org/apache/spark/network/buffer/LargeByteBufferHelperSuite.java
+index d56f216f11dc0..4b15c42595e02 100644
+--- a/network/common/src/test/java/org/apache/spark/network/buffer/LargeByteBufferHelperSuite.java
++++ b/network/common/src/test/java/org/apache/spark/network/buffer/LargeByteBufferHelperSuite.java
+@@ -68,4 +68,14 @@ public void testMapFile() throws IOException {
+       }
+     }
+   }
++
++  @Test
++  public void testAllocate() {
++    WrappedLargeByteBuffer buf = (WrappedLargeByteBuffer) LargeByteBufferHelper.allocate(95,10);
++    assertEquals(10, buf.underlying.length);
++    for (int i = 0 ; i < 9; i++) {
++      assertEquals(10, buf.underlying[i].capacity());
++    }
++    assertEquals(5, buf.underlying[9].capacity());
++  }
+ }
+diff --git a/network/common/src/test/java/org/apache/spark/network/buffer/WrappedLargeByteBufferSuite.java b/network/common/src/test/java/org/apache/spark/network/buffer/WrappedLargeByteBufferSuite.java
+index 79398c6ae7ab1..62266afb500c9 100644
+--- a/network/common/src/test/java/org/apache/spark/network/buffer/WrappedLargeByteBufferSuite.java
++++ b/network/common/src/test/java/org/apache/spark/network/buffer/WrappedLargeByteBufferSuite.java
+@@ -46,17 +46,54 @@ private WrappedLargeByteBuffer testDataBuf() {
+ 
+   @Test
+   public void asByteBuffer() throws BufferTooLargeException {
+-    //test that it works when buffer is small, and the right error when buffer is big
++    // test that it works when buffer is small
+     LargeByteBuffer buf = LargeByteBufferHelper.asLargeByteBuffer(new byte[100]);
+     ByteBuffer nioBuf = buf.asByteBuffer();
++    assertEquals(0, nioBuf.position());
+     assertEquals(100, nioBuf.remaining());
++    // if we move the large byte buffer, the nio.ByteBuffer we have doesn't change
++    buf.skip(10);
++    assertEquals(0, nioBuf.position());
++    assertEquals(100, nioBuf.remaining());
++    // if we grab another byte buffer while the large byte buffer's position != 0,
++    // the returned buffer still has position 0
++    ByteBuffer nioBuf2 = buf.asByteBuffer();
++    assertEquals(0, nioBuf2.position());
++    assertEquals(100, nioBuf2.remaining());
++    // the two byte buffers we grabbed are independent
++    nioBuf2.position(20);
++    assertEquals(0, nioBuf.position());
++    assertEquals(100, nioBuf.remaining());
++    assertEquals(20, nioBuf2.position());
++    assertEquals(80, nioBuf2.remaining());
+ 
++    // merges the data from multiple buffers
+     ByteBuffer[] bufs = new ByteBuffer[2];
+     for (int i = 0; i < 2; i++) {
+-      bufs[i] = ByteBuffer.allocate(10);
++      bufs[i] = ByteBuffer.allocate(250);
++      bufs[i].get(data, i * 250, 250);
++      bufs[i].rewind();
+     }
++    WrappedLargeByteBuffer wrappedBB = new WrappedLargeByteBuffer(bufs);
++    ByteBuffer mergedBuffer = wrappedBB.asByteBuffer(500);
++    assertConsistent(wrappedBB);
++    assertEquals(0, mergedBuffer.position());
++    byte[] copyData = new byte[500];
++    mergedBuffer.get(copyData);
++    mergedBuffer.rewind();
++    assertArrayEquals(data, copyData);
++    wrappedBB.skip(20);
++    assertConsistent(wrappedBB);
++    ByteBuffer mergedBuffer2 = wrappedBB.asByteBuffer(500);
++    assertEquals(0, mergedBuffer2.position());
++    mergedBuffer2.get(copyData);
++    assertArrayEquals(data, copyData);
++    assertEquals(0, mergedBuffer.position());
++    assertEquals(20, wrappedBB.position());
++
++    // the right error when the buffer is too big
+     try {
+-      new WrappedLargeByteBuffer(bufs).asByteBuffer();
++      wrappedBB.asByteBuffer(499);
+       fail("expected an exception");
+     } catch (BufferTooLargeException btl) {
+     }
+@@ -105,21 +142,6 @@ public void skipAndGet() {
+     }
+   }
+ 
+-  private void assertConsistent(WrappedLargeByteBuffer buffer) {
+-    long pos = buffer.position();
+-    long bufferStartPos = 0;
+-    for (ByteBuffer p: buffer.nioBuffers()) {
+-      if (pos < bufferStartPos) {
+-        assertEquals(0, p.position());
+-      } else if (pos < bufferStartPos + p.capacity()) {
+-        assertEquals(pos - bufferStartPos, p.position());
+-      } else {
+-        assertEquals(p.capacity(), p.position());
+-      }
+-      bufferStartPos += p.capacity();
+-    }
+-  }
+-
+   @Test
+   public void get() {
+     WrappedLargeByteBuffer b = testDataBuf();
+@@ -218,7 +240,32 @@ public void constructWithBuffersWithNonZeroPosition() {
+       fail("expected exception");
+     } catch (IllegalArgumentException ex) {
+     }
++  }
+ 
++  @Test(expected=IllegalArgumentException.class)
++  public void testRequireAtLeastOneBuffer() {
++    new WrappedLargeByteBuffer( new ByteBuffer[0]);
++  }
++
++
++  private void assertConsistent(WrappedLargeByteBuffer buffer) {
++    long pos = buffer.position();
++    long bufferStartPos = 0;
++    if (buffer.currentBufferIdx < buffer.underlying.length) {
++      assertEquals(buffer.currentBuffer, buffer.underlying[buffer.currentBufferIdx]);
++    } else {
++      assertNull(buffer.currentBuffer);
++    }
++    for (ByteBuffer p: buffer.nioBuffers()) {
++      if (pos < bufferStartPos) {
++        assertEquals(0, p.position());
++      } else if (pos < bufferStartPos + p.capacity()) {
++        assertEquals(pos - bufferStartPos, p.position());
++      } else {
++        assertEquals(p.capacity(), p.position());
++      }
++      bufferStartPos += p.capacity();
++    }
+   }
+ 
+   private void assertSubArrayEquals(byte[] exp, int expOffset, byte[] act, int actOffset, int length) {
+@@ -229,5 +276,4 @@ private void assertSubArrayEquals(byte[] exp, int expOffset, byte[] act, int act
+     assertArrayEquals(expCopy, actCopy);
+   }
+ 
+-
+ }

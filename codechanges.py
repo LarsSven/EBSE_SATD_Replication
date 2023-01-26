@@ -66,7 +66,7 @@ def process_item(row):
         os.rename(f'{path}/{project}-{after}', f'{path}/after')
 
 
-with open('commits.csv', 'r') as csvfile:
+with open('CodeChanges_Commits/commits.csv', 'r') as csvfile:
     reader = csv.reader(csvfile)
 
     next(reader)

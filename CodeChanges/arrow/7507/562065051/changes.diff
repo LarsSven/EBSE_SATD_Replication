@@ -1,0 +1,462 @@
+diff --git a/cpp/src/arrow/array/util.cc b/cpp/src/arrow/array/util.cc
+index 0794a45a1c50..b2304daba920 100644
+--- a/cpp/src/arrow/array/util.cc
++++ b/cpp/src/arrow/array/util.cc
+@@ -52,7 +52,7 @@ using internal::checked_cast;
+ // ----------------------------------------------------------------------
+ // Loading from ArrayData
+ 
+-namespace internal {
++namespace {
+ 
+ class ArrayDataWrapper {
+  public:
+@@ -77,9 +77,13 @@ class ArrayDataWrapper {
+ 
+ class ArrayDataEndianSwapper {
+  public:
+-  ArrayDataEndianSwapper(std::shared_ptr<ArrayData>& data, int64_t length,
+-                         std::shared_ptr<ArrayData>* out)
+-      : data_(data), length_(length), out_(out) {}
++  ArrayDataEndianSwapper(const std::shared_ptr<ArrayData>& data, int64_t length)
++      : data_(data), length_(length) {
++    const std::shared_ptr<DataType>& type = data->type;
++    std::vector<std::shared_ptr<Buffer>> buffers(data->buffers.size(), nullptr);
++    std::vector<std::shared_ptr<ArrayData>> child_data(data->child_data.size(), nullptr);
++    out_ = ArrayData::Make(type, data->length, buffers, child_data, data->null_count, 0);
++  }
+ 
+   Status SwapType(const DataType& type) {
+     RETURN_NOT_OK(VisitTypeInline(type, this));
+@@ -87,49 +91,45 @@ class ArrayDataEndianSwapper {
+     return Status::OK();
+   }
+ 
+-  Status SwapChildren(std::vector<std::shared_ptr<Field>> child_fields) {
+-    int i = 0;
+-    for (const auto& child_field : child_fields) {
+-      ARROW_ASSIGN_OR_RAISE(
+-          (*out_)->child_data[i],
+-          SwapEndianArrayData(data_->child_data[i], child_field.get()->type()));
+-      i++;
++  Status SwapChildren(const std::vector<std::shared_ptr<Field>>& child_fields) {
++    for (size_t i = 0; i < child_fields.size(); i++) {
++      ARROW_ASSIGN_OR_RAISE(out_->child_data[i],
++                            internal::SwapEndianArrayData(data_->child_data[i]));
+     }
+     return Status::OK();
+   }
+ 
+   template <typename T>
+-  Result<std::shared_ptr<Buffer>> ByteSwapBuffer(std::shared_ptr<Buffer>& in_buffer,
+-                                                 int64_t length, int64_t extra_size) {
++  Result<std::shared_ptr<Buffer>> ByteSwapBuffer(const std::shared_ptr<Buffer>& in_buffer,
++                                                 int64_t length) {
++    if (sizeof(T) == 1) {
++      // if data size is 1, element is not swapped. We can use the original buffer
++      return in_buffer;
++    }
+     auto in_data = reinterpret_cast<const T*>(in_buffer->data());
+     ARROW_ASSIGN_OR_RAISE(auto out_buffer, AllocateBuffer(in_buffer->size()));
+     auto out_data = reinterpret_cast<T*>(out_buffer->mutable_data());
+-    for (int64_t i = 0; i < length + extra_size; i++) {
+-#if ARROW_LITTLE_ENDIAN
+-      out_data[i] = BitUtil::FromBigEndian(in_data[i]);
+-#else
+-      out_data[i] = BitUtil::FromLittleEndian(in_data[i]);
+-#endif
++    for (int64_t i = 0; i < length; i++) {
++      out_data[i] = BitUtil::ByteSwap(in_data[i]);
+     }
++    assert(0 <= in_buffer->size() - length * sizeof(T));
++    std::memset(out_data + length, 0, in_buffer->size() - length * sizeof(T));
+     return std::move(out_buffer);
+   }
+ 
+   template <typename VALUE_TYPE>
+-  Status SwapOffset(int index) {
++  Status SwapOffsets(int index, int offset_length) {
+     if (data_->buffers[index] == nullptr || data_->buffers[index]->size() == 0) {
+-      (*out_)->buffers[index] = data_->buffers[index];
++      out_->buffers[index] = data_->buffers[index];
+       return Status::OK();
+     }
+-    // offset has one more element rather than data->length
+-    ARROW_ASSIGN_OR_RAISE((*out_)->buffers[index],
+-                          ByteSwapBuffer<VALUE_TYPE>(data_->buffers[index], length_, 1));
++    // Except union, offset has one more element rather than data->length
++    ARROW_ASSIGN_OR_RAISE(
++        out_->buffers[index],
++        ByteSwapBuffer<VALUE_TYPE>(data_->buffers[index], length_ + offset_length));
+     return Status::OK();
+   }
+ 
+-  Status SwapSmallOffset(int index = 1) { return SwapOffset<int32_t>(index); }
+-
+-  Status SwapLargeOffset() { return SwapOffset<int64_t>(1); }
+-
+   template <typename T>
+   enable_if_t<std::is_base_of<FixedWidthType, T>::value &&
+                   !std::is_base_of<FixedSizeBinaryType, T>::value &&
+@@ -137,8 +137,8 @@ class ArrayDataEndianSwapper {
+               Status>
+   Visit(const T& type) {
+     using value_type = typename T::c_type;
+-    ARROW_ASSIGN_OR_RAISE((*out_)->buffers[1],
+-                          ByteSwapBuffer<value_type>(data_->buffers[1], length_, 0));
++    ARROW_ASSIGN_OR_RAISE(out_->buffers[1],
++                          ByteSwapBuffer<value_type>(data_->buffers[1], length_));
+     return Status::OK();
+   }
+ 
+@@ -160,7 +160,9 @@ class ArrayDataEndianSwapper {
+       new_data[idx + 1] = tmp;
+ #endif
+     }
+-    (*out_)->buffers[1] = std::move(new_buffer);
++    assert(0 <= data_->buffers[1]->size() - length * 16);
++    std::memset(new_data + length * 2, 0, data_->buffers[1]->size() - length * 16);
++    out_->buffers[1] = std::move(new_buffer);
+     return Status::OK();
+   }
+ 
+@@ -190,36 +192,34 @@ class ArrayDataEndianSwapper {
+       new_data[idx + 3] = tmp0;
+ #endif
+     }
+-    (*out_)->buffers[1] = std::move(new_buffer);
++    assert(0 <= data_->buffers[1]->size() - length * 32);
++    std::memset(new_data + length * 4, 0, data_->buffers[1]->size() - length * 32);
++    out_->buffers[1] = std::move(new_buffer);
+     return Status::OK();
+   }
+ 
+   Status Visit(const DayTimeIntervalType& type) {
+-    ARROW_ASSIGN_OR_RAISE((*out_)->buffers[1],
+-                          ByteSwapBuffer<uint32_t>(data_->buffers[1], length_ * 2, 0));
++    ARROW_ASSIGN_OR_RAISE(out_->buffers[1],
++                          ByteSwapBuffer<uint32_t>(data_->buffers[1], length_ * 2));
+     return Status::OK();
+   }
+ 
+-  Status CopyDataBuffer() {
+-    if (data_->buffers[1]->data() == nullptr) {
+-      return Status::OK();
+-    }
+-    ARROW_ASSIGN_OR_RAISE((*out_)->buffers[1],
+-                          data_->buffers[1]->CopySlice(0, data_->buffers[1]->size()));
++  Status ReuseDataBuffer() {
++    out_->buffers[1] = data_->buffers[1];
+     return Status::OK();
+   }
+ 
+   Status Visit(const NullType& type) { return Status::OK(); }
+-  Status Visit(const BooleanType& type) { return CopyDataBuffer(); }
+-  Status Visit(const Int8Type& type) { return CopyDataBuffer(); }
+-  Status Visit(const UInt8Type& type) { return CopyDataBuffer(); }
+-  Status Visit(const FixedSizeBinaryType& type) { return CopyDataBuffer(); }
++  Status Visit(const BooleanType& type) { return ReuseDataBuffer(); }
++  Status Visit(const Int8Type& type) { return ReuseDataBuffer(); }
++  Status Visit(const UInt8Type& type) { return ReuseDataBuffer(); }
++  Status Visit(const FixedSizeBinaryType& type) { return ReuseDataBuffer(); }
+   Status Visit(const FixedSizeListType& type) { return Status::OK(); }
+   Status Visit(const StructType& type) { return Status::OK(); }
+   Status Visit(const UnionType& type) {
+-    (*out_)->buffers[1] = data_->buffers[1];
++    out_->buffers[1] = data_->buffers[1];
+     if (type.mode() == UnionMode::DENSE) {
+-      RETURN_NOT_OK(SwapSmallOffset(2));
++      RETURN_NOT_OK(SwapOffsets<int32_t>(2, 0));
+     }
+     return Status::OK();
+   }
+@@ -228,8 +228,8 @@ class ArrayDataEndianSwapper {
+   enable_if_t<std::is_same<BinaryType, T>::value || std::is_same<StringType, T>::value,
+               Status>
+   Visit(const T& type) {
+-    RETURN_NOT_OK(SwapSmallOffset());
+-    (*out_)->buffers[2] = data_->buffers[2];
++    RETURN_NOT_OK(SwapOffsets<int32_t>(1, 1));
++    out_->buffers[2] = data_->buffers[2];
+     return Status::OK();
+   }
+ 
+@@ -238,51 +238,51 @@ class ArrayDataEndianSwapper {
+                   std::is_same<LargeStringType, T>::value,
+               Status>
+   Visit(const T& type) {
+-    RETURN_NOT_OK(SwapLargeOffset());
+-    (*out_)->buffers[2] = data_->buffers[2];
++    RETURN_NOT_OK(SwapOffsets<int64_t>(1, 1));
++    out_->buffers[2] = data_->buffers[2];
+     return Status::OK();
+   }
+ 
+   Status Visit(const ListType& type) {
+-    RETURN_NOT_OK(SwapSmallOffset());
++    RETURN_NOT_OK(SwapOffsets<int32_t>(1, 1));
+     return Status::OK();
+   }
+   Status Visit(const LargeListType& type) {
+-    RETURN_NOT_OK(SwapLargeOffset());
+-    return Status::OK();
+-  }
+-
+-  Status Visit(const MapType& type) {
+-    RETURN_NOT_OK(SwapSmallOffset());
++    RETURN_NOT_OK(SwapOffsets<int64_t>(1, 1));
+     return Status::OK();
+   }
+ 
+   Status Visit(const DictionaryType& type) {
+     RETURN_NOT_OK(SwapType(*type.index_type()));
+-    (*out_)->dictionary = data_->dictionary;
++    out_->dictionary = data_->dictionary;
+     return Status::OK();
+   }
+ 
+   Status Visit(const ExtensionType& type) {
+     RETURN_NOT_OK(SwapType(*type.storage_type()));
+-    (*out_)->dictionary = data_->dictionary;
++    out_->dictionary = data_->dictionary;
+     return Status::OK();
+   }
+ 
+-  std::shared_ptr<ArrayData>& data_;
++  const std::shared_ptr<ArrayData>& data_;
+   int64_t length_;
+-  std::shared_ptr<ArrayData>* out_;
++  std::shared_ptr<ArrayData> out_;
+ };
+ 
++}  // namespace
++
++namespace internal {
++
+ Result<std::shared_ptr<ArrayData>> SwapEndianArrayData(
+-    std::shared_ptr<ArrayData>& data, const std::shared_ptr<DataType>& type) {
+-  std::vector<std::shared_ptr<Buffer>> buffers(data->buffers.size(), nullptr);
+-  std::vector<std::shared_ptr<ArrayData>> child_data(data->child_data.size(), nullptr);
+-  std::shared_ptr<ArrayData> out =
+-      ArrayData::Make(type, data->length, buffers, child_data, data->null_count, 0);
+-  internal::ArrayDataEndianSwapper swapper_visitor(data, data->length, &out);
++    const std::shared_ptr<ArrayData>& data) {
++  if (data->offset != 0) {
++    return Status::Invalid("Unsupported data format: data.offset != 0");
++  }
++  const std::shared_ptr<DataType>& type = data->type;
++  ArrayDataEndianSwapper swapper_visitor(data, data->length);
+   DCHECK_OK(VisitTypeInline(*type, &swapper_visitor));
+   DCHECK_OK(swapper_visitor.SwapChildren((*type).fields()));
++  std::shared_ptr<ArrayData> out = std::move(swapper_visitor.out_);
+   // copy null_bitmap
+   out->buffers[0] = data->buffers[0];
+   DCHECK(out);
+@@ -293,7 +293,7 @@ Result<std::shared_ptr<ArrayData>> SwapEndianArrayData(
+ 
+ std::shared_ptr<Array> MakeArray(const std::shared_ptr<ArrayData>& data) {
+   std::shared_ptr<Array> out;
+-  internal::ArrayDataWrapper wrapper_visitor(data, &out);
++  ArrayDataWrapper wrapper_visitor(data, &out);
+   DCHECK_OK(VisitTypeInline(*data->type, &wrapper_visitor));
+   DCHECK(out);
+   return out;
+diff --git a/cpp/src/arrow/array/util.h b/cpp/src/arrow/array/util.h
+index 7a4e811ac2f7..14b18573481a 100644
+--- a/cpp/src/arrow/array/util.h
++++ b/cpp/src/arrow/array/util.h
+@@ -58,11 +58,10 @@ namespace internal {
+ 
+ /// \brief Swap endian of each element in a generic ArrayData
+ /// \param[in] data the array contents
+-/// \param[in] type the array type
+ /// \return the resulting Array instance whose elements were swapped
+ ARROW_EXPORT
+ Result<std::shared_ptr<ArrayData>> SwapEndianArrayData(
+-    std::shared_ptr<ArrayData>& data, const std::shared_ptr<DataType>& type);
++    const std::shared_ptr<ArrayData>& data);
+ 
+ /// Given a number of ArrayVectors, treat each ArrayVector as the
+ /// chunks of a chunked array.  Then rechunk each ArrayVector such that
+diff --git a/cpp/src/arrow/ipc/reader.cc b/cpp/src/arrow/ipc/reader.cc
+index a1593d40031a..9092152fa31d 100644
+--- a/cpp/src/arrow/ipc/reader.cc
++++ b/cpp/src/arrow/ipc/reader.cc
+@@ -505,8 +505,7 @@ Result<std::shared_ptr<RecordBatch>> LoadRecordBatchSubset(
+   if (context.swap_endian) {
+     for (int i = 0; i < static_cast<int>(filtered_columns.size()); ++i) {
+       ARROW_ASSIGN_OR_RAISE(filtered_columns[i],
+-                            arrow::internal::SwapEndianArrayData(
+-                                filtered_columns[i], filtered_columns[i]->type));
++                            arrow::internal::SwapEndianArrayData(filtered_columns[i]));
+     }
+   }
+   return RecordBatch::Make(filtered_schema, metadata->length(),
+@@ -670,11 +669,11 @@ Status UnpackSchemaMessage(const void* opaque_schema, const IpcReadOptions& opti
+   // for fast lookups
+   RETURN_NOT_OK(GetInclusionMaskAndOutSchema(*schema, options.included_fields,
+                                              field_inclusion_mask, out_schema));
+-  *swap_endian = options.ensure_native_endian && !out_schema->get()->IsNativeEndianness();
++  *swap_endian = options.ensure_native_endian && !out_schema->get()->is_native_endian();
+   if (*swap_endian) {
+     // create a new schema with native endianness before swapping endian in ArrayData
+-    *schema = schema->get()->WithNativeEndianness();
+-    *out_schema = out_schema->get()->WithNativeEndianness();
++    *schema = schema->get()->WithEndianness(Endianness::Native);
++    *out_schema = out_schema->get()->WithEndianness(Endianness::Native);
+   }
+   return Status::OK();
+ }
+@@ -748,8 +747,7 @@ Status ReadDictionary(const Buffer& metadata, const IpcReadContext& context,
+ 
+   // swap endian in dict_data if necessary (swap_endian == true)
+   if (context.swap_endian) {
+-    ARROW_ASSIGN_OR_RAISE(
+-        dict_data, ::arrow::internal::SwapEndianArrayData(dict_data, dict_data->type));
++    ARROW_ASSIGN_OR_RAISE(dict_data, ::arrow::internal::SwapEndianArrayData(dict_data));
+   }
+ 
+   if (dictionary_batch->isDelta()) {
+@@ -925,6 +923,8 @@ class RecordBatchStreamReaderImpl : public RecordBatchStreamReader {
+ 
+   DictionaryMemo dictionary_memo_;
+   std::shared_ptr<Schema> schema_, out_schema_;
++
++  bool swap_endian_;
+ };
+ 
+ // ----------------------------------------------------------------------
+@@ -1137,6 +1137,8 @@ class RecordBatchFileReaderImpl : public RecordBatchFileReader {
+   std::shared_ptr<Schema> out_schema_;
+ 
+   ReadStats stats_;
++
++  bool swap_endian_;
+ };
+ 
+ Result<std::shared_ptr<RecordBatchFileReader>> RecordBatchFileReader::Open(
+diff --git a/cpp/src/arrow/ipc/reader.h b/cpp/src/arrow/ipc/reader.h
+index 3d4f0a31a478..fe9a3b72e167 100644
+--- a/cpp/src/arrow/ipc/reader.h
++++ b/cpp/src/arrow/ipc/reader.h
+@@ -96,9 +96,6 @@ class ARROW_EXPORT RecordBatchStreamReader : public RecordBatchReader {
+ 
+   /// \brief Return current read statistics
+   virtual ReadStats stats() const = 0;
+-
+- protected:
+-  bool swap_endian_;
+ };
+ 
+ /// \brief Reads the record batch file format
+@@ -172,9 +169,6 @@ class ARROW_EXPORT RecordBatchFileReader {
+ 
+   /// \brief Return current read statistics
+   virtual ReadStats stats() const = 0;
+-
+- protected:
+-  bool swap_endian_;
+ };
+ 
+ /// \brief A general listener class to receive events.
+diff --git a/cpp/src/arrow/type.cc b/cpp/src/arrow/type.cc
+index d5e5bd7a65d6..a5f1cfae402e 100644
+--- a/cpp/src/arrow/type.cc
++++ b/cpp/src/arrow/type.cc
+@@ -1321,22 +1321,20 @@ Schema::Schema(std::vector<std::shared_ptr<Field>> fields, Endianness endianness
+ Schema::Schema(std::vector<std::shared_ptr<Field>> fields,
+                std::shared_ptr<const KeyValueMetadata> metadata)
+     : detail::Fingerprintable(),
+-      impl_(new Impl(std::move(fields), Endianness::NATIVE, std::move(metadata))) {}
++      impl_(new Impl(std::move(fields), Endianness::Native, std::move(metadata))) {}
+ 
+ Schema::Schema(const Schema& schema)
+     : detail::Fingerprintable(), impl_(new Impl(*schema.impl_)) {}
+ 
+ Schema::~Schema() = default;
+ 
+-std::shared_ptr<Schema> Schema::WithNativeEndianness() const {
+-  return std::make_shared<Schema>(impl_->fields_, impl_->metadata_);
++std::shared_ptr<Schema> Schema::WithEndianness(Endianness endianness) const {
++  return std::make_shared<Schema>(impl_->fields_, endianness, impl_->metadata_);
+ }
+ 
+ Endianness Schema::endianness() const { return impl_->endianness_; }
+ 
+-bool Schema::IsNativeEndianness() const {
+-  return impl_->endianness_ == Endianness::NATIVE;
+-}
++bool Schema::is_native_endian() const { return impl_->endianness_ == Endianness::Native; }
+ 
+ int Schema::num_fields() const { return static_cast<int>(impl_->fields_.size()); }
+ 
+@@ -1847,6 +1845,7 @@ std::string Schema::ComputeFingerprint() const {
+     }
+     ss << field_fingerprint << ";";
+   }
++  ss << (endianness() == Endianness::Little ? "L" : "B");
+   ss << "}";
+   return ss.str();
+ }
+diff --git a/cpp/src/arrow/type.h b/cpp/src/arrow/type.h
+index 2bc37b4b1164..e5c3ba51694f 100644
+--- a/cpp/src/arrow/type.h
++++ b/cpp/src/arrow/type.h
+@@ -1606,12 +1606,12 @@ class ARROW_EXPORT FieldRef {
+ // Schema
+ 
+ enum class Endianness {
+-  LITTLE = 0,
+-  BIG = 1,
++  Little = 0,
++  Big = 1,
+ #if ARROW_LITTLE_ENDIAN
+-  NATIVE = LITTLE
++  Native = Little
+ #else
+-  NATIVE = BIG
++  Native = Big
+ #endif
+ };
+ 
+@@ -1636,16 +1636,16 @@ class ARROW_EXPORT Schema : public detail::Fingerprintable,
+   bool Equals(const Schema& other, bool check_metadata = false) const;
+   bool Equals(const std::shared_ptr<Schema>& other, bool check_metadata = false) const;
+ 
+-  /// \brief Replace endianness with platform-native endianness in the schema
++  /// \brief Set endianness in the schema
+   ///
+   /// \return new Schema
+-  std::shared_ptr<Schema> WithNativeEndianness() const;
++  std::shared_ptr<Schema> WithEndianness(Endianness endianness) const;
+ 
+   /// \brief Return endianness in the schema
+   Endianness endianness() const;
+ 
+   /// \brief Indicate if endianness is equal to platform-native endianness
+-  bool IsNativeEndianness() const;
++  bool is_native_endian() const;
+ 
+   /// \brief Return the number of fields (columns) in the schema
+   int num_fields() const;
+diff --git a/cpp/src/arrow/type_test.cc b/cpp/src/arrow/type_test.cc
+index 81a0315d6d17..06b092921c5f 100644
+--- a/cpp/src/arrow/type_test.cc
++++ b/cpp/src/arrow/type_test.cc
+@@ -475,6 +475,16 @@ TEST_F(TestSchema, Basics) {
+ 
+   ASSERT_EQ(schema->fingerprint(), schema2->fingerprint());
+   ASSERT_NE(schema->fingerprint(), schema3->fingerprint());
++
++  auto schema4 = ::arrow::schema({f0}, Endianness::Little);
++  auto schema5 = ::arrow::schema({f0}, Endianness::Little);
++  auto schema6 = ::arrow::schema({f0}, Endianness::Big);
++
++  AssertSchemaEqual(schema4, schema5);
++  AssertSchemaNotEqual(schema4, schema6);
++
++  ASSERT_EQ(schema4->fingerprint(), schema5->fingerprint());
++  ASSERT_NE(schema4->fingerprint(), schema6->fingerprint());
+ }
+ 
+ TEST_F(TestSchema, ToString) {

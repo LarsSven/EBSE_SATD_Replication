@@ -1,0 +1,2982 @@
+diff --git a/.rat-excludes b/.rat-excludes
+index 08fba6d351d6a..7262c960ed6bb 100644
+--- a/.rat-excludes
++++ b/.rat-excludes
+@@ -82,4 +82,5 @@ INDEX
+ gen-java.*
+ .*avpr
+ org.apache.spark.sql.sources.DataSourceRegister
++org.apache.spark.scheduler.SparkHistoryListenerFactory
+ .*parquet
+diff --git a/R/pkg/R/client.R b/R/pkg/R/client.R
+index c811d1dac3bd5..25e99390a9c89 100644
+--- a/R/pkg/R/client.R
++++ b/R/pkg/R/client.R
+@@ -44,12 +44,16 @@ determineSparkSubmitBin <- function() {
+ }
+ 
+ generateSparkSubmitArgs <- function(args, sparkHome, jars, sparkSubmitOpts, packages) {
++  jars <- paste0(jars, collapse = ",")
+   if (jars != "") {
+-    jars <- paste("--jars", jars)
++    # construct the jars argument with a space between --jars and comma-separated values
++    jars <- paste0("--jars ", jars)
+   }
+ 
+-  if (!identical(packages, "")) {
+-    packages <- paste("--packages", packages)
++  packages <- paste0(packages, collapse = ",")
++  if (packages != "") {
++    # construct the packages argument with a space between --packages and comma-separated values
++    packages <- paste0("--packages ", packages)
+   }
+ 
+   combinedArgs <- paste(jars, packages, sparkSubmitOpts, args, sep = " ")
+diff --git a/R/pkg/R/sparkR.R b/R/pkg/R/sparkR.R
+index 7ff3fa628b9ca..d2bfad553104f 100644
+--- a/R/pkg/R/sparkR.R
++++ b/R/pkg/R/sparkR.R
+@@ -86,13 +86,13 @@ sparkR.stop <- function() {
+ #' and use SparkR, refer to SparkR programming guide at
+ #' \url{http://spark.apache.org/docs/latest/sparkr.html#starting-up-sparkcontext-sqlcontext}.
+ #'
+-#' @param master The Spark master URL.
++#' @param master The Spark master URL
+ #' @param appName Application name to register with cluster manager
+ #' @param sparkHome Spark Home directory
+-#' @param sparkEnvir Named list of environment variables to set on worker nodes.
+-#' @param sparkExecutorEnv Named list of environment variables to be used when launching executors.
+-#' @param sparkJars Character string vector of jar files to pass to the worker nodes.
+-#' @param sparkPackages Character string vector of packages from spark-packages.org
++#' @param sparkEnvir Named list of environment variables to set on worker nodes
++#' @param sparkExecutorEnv Named list of environment variables to be used when launching executors
++#' @param sparkJars Character vector of jar files to pass to the worker nodes
++#' @param sparkPackages Character vector of packages from spark-packages.org
+ #' @export
+ #' @examples
+ #'\dontrun{
+@@ -102,7 +102,9 @@ sparkR.stop <- function() {
+ #' sc <- sparkR.init("yarn-client", "SparkR", "/home/spark",
+ #'                  list(spark.executor.memory="4g"),
+ #'                  list(LD_LIBRARY_PATH="/directory of JVM libraries (libjvm.so) on workers/"),
+-#'                  c("jarfile1.jar","jarfile2.jar"))
++#'                  c("one.jar", "two.jar", "three.jar"),
++#'                  c("com.databricks:spark-avro_2.10:2.0.1",
++#'                    "com.databricks:spark-csv_2.10:1.3.0"))
+ #'}
+ 
+ sparkR.init <- function(
+@@ -120,15 +122,8 @@ sparkR.init <- function(
+     return(get(".sparkRjsc", envir = .sparkREnv))
+   }
+ 
+-  jars <- suppressWarnings(normalizePath(as.character(sparkJars)))
+-
+-  # Classpath separator is ";" on Windows
+-  # URI needs four /// as from http://stackoverflow.com/a/18522792
+-  if (.Platform$OS.type == "unix") {
+-    uriSep <- "//"
+-  } else {
+-    uriSep <- "////"
+-  }
++  jars <- processSparkJars(sparkJars)
++  packages <- processSparkPackages(sparkPackages)
+ 
+   sparkEnvirMap <- convertNamedListToEnv(sparkEnvir)
+ 
+@@ -145,7 +140,7 @@ sparkR.init <- function(
+         sparkHome = sparkHome,
+         jars = jars,
+         sparkSubmitOpts = submitOps,
+-        packages = sparkPackages)
++        packages = packages)
+     # wait atmost 100 seconds for JVM to launch
+     wait <- 0.1
+     for (i in 1:25) {
+@@ -195,8 +190,14 @@ sparkR.init <- function(
+       paste0("$LD_LIBRARY_PATH:",Sys.getenv("LD_LIBRARY_PATH"))
+   }
+ 
+-  nonEmptyJars <- Filter(function(x) { x != "" }, jars)
+-  localJarPaths <- lapply(nonEmptyJars,
++  # Classpath separator is ";" on Windows
++  # URI needs four /// as from http://stackoverflow.com/a/18522792
++  if (.Platform$OS.type == "unix") {
++    uriSep <- "//"
++  } else {
++    uriSep <- "////"
++  }
++  localJarPaths <- lapply(jars,
+                           function(j) { utils::URLencode(paste("file:", uriSep, j, sep = "")) })
+ 
+   # Set the start time to identify jobjs
+@@ -366,3 +367,22 @@ getClientModeSparkSubmitOpts <- function(submitOps, sparkEnvirMap) {
+   # --option must be before the application class "sparkr-shell" in submitOps
+   paste0(paste0(envirToOps, collapse = ""), submitOps)
+ }
++
++# Utility function that handles sparkJars argument, and normalize paths
++processSparkJars <- function(jars) {
++  splittedJars <- splitString(jars)
++  if (length(splittedJars) > length(jars)) {
++    warning("sparkJars as a comma-separated string is deprecated, use character vector instead")
++  }
++  normalized <- suppressWarnings(normalizePath(splittedJars))
++  normalized
++}
++
++# Utility function that handles sparkPackages argument
++processSparkPackages <- function(packages) {
++  splittedPackages <- splitString(packages)
++  if (length(splittedPackages) > length(packages)) {
++    warning("sparkPackages as a comma-separated string is deprecated, use character vector instead")
++  }
++  splittedPackages
++}
+diff --git a/R/pkg/R/utils.R b/R/pkg/R/utils.R
+index 45c77a86c9582..43105aaa38424 100644
+--- a/R/pkg/R/utils.R
++++ b/R/pkg/R/utils.R
+@@ -636,3 +636,8 @@ assignNewEnv <- function(data) {
+   }
+   env
+ }
++
++# Utility function to split by ',' and whitespace, remove empty tokens
++splitString <- function(input) {
++  Filter(nzchar, unlist(strsplit(input, ",|\\s")))
++}
+diff --git a/R/pkg/inst/tests/test_client.R b/R/pkg/inst/tests/test_client.R
+index 8a20991f89af8..a0664f32f31c1 100644
+--- a/R/pkg/inst/tests/test_client.R
++++ b/R/pkg/inst/tests/test_client.R
+@@ -34,3 +34,12 @@ test_that("no package specified doesn't add packages flag", {
+ test_that("multiple packages don't produce a warning", {
+   expect_that(generateSparkSubmitArgs("", "", "", "", c("A", "B")), not(gives_warning()))
+ })
++
++test_that("sparkJars sparkPackages as character vectors", {
++  args <- generateSparkSubmitArgs("", "", c("one.jar", "two.jar", "three.jar"), "",
++                                  c("com.databricks:spark-avro_2.10:2.0.1",
++                                    "com.databricks:spark-csv_2.10:1.3.0"))
++  expect_match(args, "--jars one.jar,two.jar,three.jar")
++  expect_match(args,
++    "--packages com.databricks:spark-avro_2.10:2.0.1,com.databricks:spark-csv_2.10:1.3.0")
++})
+diff --git a/R/pkg/inst/tests/test_context.R b/R/pkg/inst/tests/test_context.R
+index 80c1b89a4c627..1707e314beff5 100644
+--- a/R/pkg/inst/tests/test_context.R
++++ b/R/pkg/inst/tests/test_context.R
+@@ -92,3 +92,23 @@ test_that("getClientModeSparkSubmitOpts() returns spark-submit args from whiteli
+                       " --driver-memory 4g sparkr-shell2"))
+   # nolint end
+ })
++
++test_that("sparkJars sparkPackages as comma-separated strings", {
++  expect_warning(processSparkJars(" a, b "))
++  jars <- suppressWarnings(processSparkJars(" a, b "))
++  expect_equal(jars, c("a", "b"))
++
++  jars <- suppressWarnings(processSparkJars(" abc ,, def "))
++  expect_equal(jars, c("abc", "def"))
++
++  jars <- suppressWarnings(processSparkJars(c(" abc ,, def ", "", "xyz", " ", "a,b")))
++  expect_equal(jars, c("abc", "def", "xyz", "a", "b"))
++
++  p <- processSparkPackages(c("ghi", "lmn"))
++  expect_equal(p, c("ghi", "lmn"))
++
++  # check normalizePath
++  f <- dir()[[1]]
++  expect_that(processSparkJars(f), not(gives_warning()))
++  expect_match(processSparkJars(f), f)
++})
+diff --git a/core/src/main/java/org/apache/spark/JavaSparkListener.java b/core/src/main/java/org/apache/spark/JavaSparkListener.java
+index fa9acf0a15b88..23bc9a2e81727 100644
+--- a/core/src/main/java/org/apache/spark/JavaSparkListener.java
++++ b/core/src/main/java/org/apache/spark/JavaSparkListener.java
+@@ -82,4 +82,7 @@ public void onExecutorRemoved(SparkListenerExecutorRemoved executorRemoved) { }
+   @Override
+   public void onBlockUpdated(SparkListenerBlockUpdated blockUpdated) { }
+ 
++  @Override
++  public void onOtherEvent(SparkListenerEvent event) { }
++
+ }
+diff --git a/core/src/main/java/org/apache/spark/SparkFirehoseListener.java b/core/src/main/java/org/apache/spark/SparkFirehoseListener.java
+index 1214d05ba6063..e6b24afd88ad4 100644
+--- a/core/src/main/java/org/apache/spark/SparkFirehoseListener.java
++++ b/core/src/main/java/org/apache/spark/SparkFirehoseListener.java
+@@ -118,4 +118,8 @@ public void onBlockUpdated(SparkListenerBlockUpdated blockUpdated) {
+         onEvent(blockUpdated);
+     }
+ 
++    @Override
++    public void onOtherEvent(SparkListenerEvent event) {
++        onEvent(event);
++    }
+ }
+diff --git a/core/src/main/scala/org/apache/spark/deploy/client/AppClient.scala b/core/src/main/scala/org/apache/spark/deploy/client/AppClient.scala
+index df6ba7d669ce9..1e2f469214b84 100644
+--- a/core/src/main/scala/org/apache/spark/deploy/client/AppClient.scala
++++ b/core/src/main/scala/org/apache/spark/deploy/client/AppClient.scala
+@@ -68,12 +68,10 @@ private[spark] class AppClient(
+     // A thread pool for registering with masters. Because registering with a master is a blocking
+     // action, this thread pool must be able to create "masterRpcAddresses.size" threads at the same
+     // time so that we can register with all masters.
+-    private val registerMasterThreadPool = new ThreadPoolExecutor(
+-      0,
+-      masterRpcAddresses.length, // Make sure we can register with all masters at the same time
+-      60L, TimeUnit.SECONDS,
+-      new SynchronousQueue[Runnable](),
+-      ThreadUtils.namedThreadFactory("appclient-register-master-threadpool"))
++    private val registerMasterThreadPool = ThreadUtils.newDaemonCachedThreadPool(
++      "appclient-register-master-threadpool",
++      masterRpcAddresses.length // Make sure we can register with all masters at the same time
++    )
+ 
+     // A scheduled executor for scheduling the registration actions
+     private val registrationRetryThread =
+diff --git a/core/src/main/scala/org/apache/spark/deploy/master/Master.scala b/core/src/main/scala/org/apache/spark/deploy/master/Master.scala
+index 1355e1ad1b523..04b20e0d6ab9c 100644
+--- a/core/src/main/scala/org/apache/spark/deploy/master/Master.scala
++++ b/core/src/main/scala/org/apache/spark/deploy/master/Master.scala
+@@ -257,8 +257,9 @@ private[deploy] class Master(
+           exec.state = state
+ 
+           if (state == ExecutorState.RUNNING) {
+-            assert(oldState == ExecutorState.LAUNCHING,
+-              s"executor $execId state transfer from $oldState to RUNNING is illegal")
++            if (oldState != ExecutorState.LAUNCHING) {
++              logWarning(s"Executor $execId state transfer from $oldState to RUNNING is unexpected")
++            }
+             appInfo.resetRetryCount()
+           }
+ 
+diff --git a/core/src/main/scala/org/apache/spark/deploy/worker/Worker.scala b/core/src/main/scala/org/apache/spark/deploy/worker/Worker.scala
+index 418faf8fc967f..1afc1ff59f2f9 100755
+--- a/core/src/main/scala/org/apache/spark/deploy/worker/Worker.scala
++++ b/core/src/main/scala/org/apache/spark/deploy/worker/Worker.scala
+@@ -146,12 +146,10 @@ private[deploy] class Worker(
+   // A thread pool for registering with masters. Because registering with a master is a blocking
+   // action, this thread pool must be able to create "masterRpcAddresses.size" threads at the same
+   // time so that we can register with all masters.
+-  private val registerMasterThreadPool = new ThreadPoolExecutor(
+-    0,
+-    masterRpcAddresses.size, // Make sure we can register with all masters at the same time
+-    60L, TimeUnit.SECONDS,
+-    new SynchronousQueue[Runnable](),
+-    ThreadUtils.namedThreadFactory("worker-register-master-threadpool"))
++  private val registerMasterThreadPool = ThreadUtils.newDaemonCachedThreadPool(
++    "worker-register-master-threadpool",
++    masterRpcAddresses.size // Make sure we can register with all masters at the same time
++  )
+ 
+   var coresUsed = 0
+   var memoryUsed = 0
+diff --git a/core/src/main/scala/org/apache/spark/rdd/NewHadoopRDD.scala b/core/src/main/scala/org/apache/spark/rdd/NewHadoopRDD.scala
+index d1960990da0fe..86f38ae836b2b 100644
+--- a/core/src/main/scala/org/apache/spark/rdd/NewHadoopRDD.scala
++++ b/core/src/main/scala/org/apache/spark/rdd/NewHadoopRDD.scala
+@@ -138,14 +138,14 @@ class NewHadoopRDD[K, V](
+       }
+       inputMetrics.setBytesReadCallback(bytesReadCallback)
+ 
+-      val attemptId = newTaskAttemptID(jobTrackerId, id, isMap = true, split.index, 0)
+-      val hadoopAttemptContext = newTaskAttemptContext(conf, attemptId)
+       val format = inputFormatClass.newInstance
+       format match {
+         case configurable: Configurable =>
+           configurable.setConf(conf)
+         case _ =>
+       }
++      val attemptId = newTaskAttemptID(jobTrackerId, id, isMap = true, split.index, 0)
++      val hadoopAttemptContext = newTaskAttemptContext(conf, attemptId)
+       private var reader = format.createRecordReader(
+         split.serializableHadoopSplit.value, hadoopAttemptContext)
+       reader.initialize(split.serializableHadoopSplit.value, hadoopAttemptContext)
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/EventLoggingListener.scala b/core/src/main/scala/org/apache/spark/scheduler/EventLoggingListener.scala
+index 000a021a528cf..eaa07acc5132e 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/EventLoggingListener.scala
++++ b/core/src/main/scala/org/apache/spark/scheduler/EventLoggingListener.scala
+@@ -207,6 +207,10 @@ private[spark] class EventLoggingListener(
+   // No-op because logging every update would be overkill
+   override def onExecutorMetricsUpdate(event: SparkListenerExecutorMetricsUpdate): Unit = { }
+ 
++  override def onOtherEvent(event: SparkListenerEvent): Unit = {
++    logEvent(event, flushLogger = true)
++  }
++
+   /**
+    * Stop logging events. The event log file will be renamed so that it loses the
+    * ".inprogress" suffix.
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/SparkListener.scala b/core/src/main/scala/org/apache/spark/scheduler/SparkListener.scala
+index 896f1743332f1..075a7f13172de 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/SparkListener.scala
++++ b/core/src/main/scala/org/apache/spark/scheduler/SparkListener.scala
+@@ -22,15 +22,19 @@ import java.util.Properties
+ import scala.collection.Map
+ import scala.collection.mutable
+ 
+-import org.apache.spark.{Logging, TaskEndReason}
++import com.fasterxml.jackson.annotation.JsonTypeInfo
++
++import org.apache.spark.{Logging, SparkConf, TaskEndReason}
+ import org.apache.spark.annotation.DeveloperApi
+ import org.apache.spark.executor.TaskMetrics
+ import org.apache.spark.scheduler.cluster.ExecutorInfo
+ import org.apache.spark.storage.{BlockManagerId, BlockUpdatedInfo}
+ import org.apache.spark.util.{Distribution, Utils}
++import org.apache.spark.ui.SparkUI
+ 
+ @DeveloperApi
+-sealed trait SparkListenerEvent
++@JsonTypeInfo(use = JsonTypeInfo.Id.CLASS, include = JsonTypeInfo.As.PROPERTY, property = "Event")
++trait SparkListenerEvent
+ 
+ @DeveloperApi
+ case class SparkListenerStageSubmitted(stageInfo: StageInfo, properties: Properties = null)
+@@ -130,6 +134,17 @@ case class SparkListenerApplicationEnd(time: Long) extends SparkListenerEvent
+  */
+ private[spark] case class SparkListenerLogStart(sparkVersion: String) extends SparkListenerEvent
+ 
++/**
++ * Interface for creating history listeners defined in other modules like SQL, which are used to
++ * rebuild the history UI.
++ */
++private[spark] trait SparkHistoryListenerFactory {
++  /**
++   * Create listeners used to rebuild the history UI.
++   */
++  def createListeners(conf: SparkConf, sparkUI: SparkUI): Seq[SparkListener]
++}
++
+ /**
+  * :: DeveloperApi ::
+  * Interface for listening to events from the Spark scheduler. Note that this is an internal
+@@ -223,6 +238,11 @@ trait SparkListener {
+    * Called when the driver receives a block update info.
+    */
+   def onBlockUpdated(blockUpdated: SparkListenerBlockUpdated) { }
++
++  /**
++   * Called when other events like SQL-specific events are posted.
++   */
++  def onOtherEvent(event: SparkListenerEvent) { }
+ }
+ 
+ /**
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/SparkListenerBus.scala b/core/src/main/scala/org/apache/spark/scheduler/SparkListenerBus.scala
+index 04afde33f5aad..95722a07144ec 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/SparkListenerBus.scala
++++ b/core/src/main/scala/org/apache/spark/scheduler/SparkListenerBus.scala
+@@ -61,6 +61,7 @@ private[spark] trait SparkListenerBus extends ListenerBus[SparkListener, SparkLi
+       case blockUpdated: SparkListenerBlockUpdated =>
+         listener.onBlockUpdated(blockUpdated)
+       case logStart: SparkListenerLogStart => // ignore event log metadata
++      case _ => listener.onOtherEvent(event)
+     }
+   }
+ 
+diff --git a/core/src/main/scala/org/apache/spark/storage/RDDInfo.scala b/core/src/main/scala/org/apache/spark/storage/RDDInfo.scala
+index 87c1b981e7e13..94e8559bd2e91 100644
+--- a/core/src/main/scala/org/apache/spark/storage/RDDInfo.scala
++++ b/core/src/main/scala/org/apache/spark/storage/RDDInfo.scala
+@@ -28,7 +28,7 @@ class RDDInfo(
+     val numPartitions: Int,
+     var storageLevel: StorageLevel,
+     val parentIds: Seq[Int],
+-    val callSite: CallSite = CallSite.empty,
++    val callSite: String = "",
+     val scope: Option[RDDOperationScope] = None)
+   extends Ordered[RDDInfo] {
+ 
+@@ -58,6 +58,6 @@ private[spark] object RDDInfo {
+     val rddName = Option(rdd.name).getOrElse(Utils.getFormattedClassName(rdd))
+     val parentIds = rdd.dependencies.map(_.rdd.id)
+     new RDDInfo(rdd.id, rddName, rdd.partitions.length,
+-      rdd.getStorageLevel, parentIds, rdd.creationSite, rdd.scope)
++      rdd.getStorageLevel, parentIds, rdd.creationSite.shortForm, rdd.scope)
+   }
+ }
+diff --git a/core/src/main/scala/org/apache/spark/ui/SparkUI.scala b/core/src/main/scala/org/apache/spark/ui/SparkUI.scala
+index 4608bce202ec8..8da6884a38535 100644
+--- a/core/src/main/scala/org/apache/spark/ui/SparkUI.scala
++++ b/core/src/main/scala/org/apache/spark/ui/SparkUI.scala
+@@ -17,10 +17,13 @@
+ 
+ package org.apache.spark.ui
+ 
+-import java.util.Date
++import java.util.{Date, ServiceLoader}
++
++import scala.collection.JavaConverters._
+ 
+ import org.apache.spark.status.api.v1.{ApiRootResource, ApplicationAttemptInfo, ApplicationInfo,
+   UIRoot}
++import org.apache.spark.util.Utils
+ import org.apache.spark.{Logging, SecurityManager, SparkConf, SparkContext}
+ import org.apache.spark.scheduler._
+ import org.apache.spark.storage.StorageStatusListener
+@@ -154,7 +157,16 @@ private[spark] object SparkUI {
+       appName: String,
+       basePath: String,
+       startTime: Long): SparkUI = {
+-    create(None, conf, listenerBus, securityManager, appName, basePath, startTime = startTime)
++    val sparkUI = create(
++      None, conf, listenerBus, securityManager, appName, basePath, startTime = startTime)
++
++    val listenerFactories = ServiceLoader.load(classOf[SparkHistoryListenerFactory],
++      Utils.getContextOrSparkClassLoader).asScala
++    listenerFactories.foreach { listenerFactory =>
++      val listeners = listenerFactory.createListeners(conf, sparkUI)
++      listeners.foreach(listenerBus.addListener)
++    }
++    sparkUI
+   }
+ 
+   /**
+diff --git a/core/src/main/scala/org/apache/spark/ui/scope/RDDOperationGraph.scala b/core/src/main/scala/org/apache/spark/ui/scope/RDDOperationGraph.scala
+index 24274562657b3..e9c8a8e299cd7 100644
+--- a/core/src/main/scala/org/apache/spark/ui/scope/RDDOperationGraph.scala
++++ b/core/src/main/scala/org/apache/spark/ui/scope/RDDOperationGraph.scala
+@@ -39,7 +39,7 @@ private[ui] case class RDDOperationGraph(
+     rootCluster: RDDOperationCluster)
+ 
+ /** A node in an RDDOperationGraph. This represents an RDD. */
+-private[ui] case class RDDOperationNode(id: Int, name: String, cached: Boolean, callsite: CallSite)
++private[ui] case class RDDOperationNode(id: Int, name: String, cached: Boolean, callsite: String)
+ 
+ /**
+  * A directed edge connecting two nodes in an RDDOperationGraph.
+@@ -178,7 +178,7 @@ private[ui] object RDDOperationGraph extends Logging {
+ 
+   /** Return the dot representation of a node in an RDDOperationGraph. */
+   private def makeDotNode(node: RDDOperationNode): String = {
+-    val label = s"${node.name} [${node.id}]\n${node.callsite.shortForm}"
++    val label = s"${node.name} [${node.id}]\n${node.callsite}"
+     s"""${node.id} [label="$label"]"""
+   }
+ 
+diff --git a/core/src/main/scala/org/apache/spark/util/JsonProtocol.scala b/core/src/main/scala/org/apache/spark/util/JsonProtocol.scala
+index c9beeb25e05af..cb0f1bf79f3d5 100644
+--- a/core/src/main/scala/org/apache/spark/util/JsonProtocol.scala
++++ b/core/src/main/scala/org/apache/spark/util/JsonProtocol.scala
+@@ -19,19 +19,21 @@ package org.apache.spark.util
+ 
+ import java.util.{Properties, UUID}
+ 
+-import org.apache.spark.scheduler.cluster.ExecutorInfo
+-
+ import scala.collection.JavaConverters._
+ import scala.collection.Map
+ 
++import com.fasterxml.jackson.databind.ObjectMapper
++import com.fasterxml.jackson.module.scala.DefaultScalaModule
+ import org.json4s.DefaultFormats
+ import org.json4s.JsonDSL._
+ import org.json4s.JsonAST._
++import org.json4s.jackson.JsonMethods._
+ 
+ import org.apache.spark._
+ import org.apache.spark.executor._
+ import org.apache.spark.rdd.RDDOperationScope
+ import org.apache.spark.scheduler._
++import org.apache.spark.scheduler.cluster.ExecutorInfo
+ import org.apache.spark.storage._
+ 
+ /**
+@@ -54,6 +56,8 @@ private[spark] object JsonProtocol {
+ 
+   private implicit val format = DefaultFormats
+ 
++  private val mapper = new ObjectMapper().registerModule(DefaultScalaModule)
++
+   /** ------------------------------------------------- *
+    * JSON serialization methods for SparkListenerEvents |
+    * -------------------------------------------------- */
+@@ -96,6 +100,7 @@ private[spark] object JsonProtocol {
+         executorMetricsUpdateToJson(metricsUpdate)
+       case blockUpdated: SparkListenerBlockUpdated =>
+         throw new MatchError(blockUpdated)  // TODO(ekl) implement this
++      case _ => parse(mapper.writeValueAsString(event))
+     }
+   }
+ 
+@@ -398,7 +403,7 @@ private[spark] object JsonProtocol {
+     ("RDD ID" -> rddInfo.id) ~
+     ("Name" -> rddInfo.name) ~
+     ("Scope" -> rddInfo.scope.map(_.toJson)) ~
+-    ("Callsite" -> callsiteToJson(rddInfo.callSite)) ~
++    ("Callsite" -> rddInfo.callSite) ~
+     ("Parent IDs" -> parentIds) ~
+     ("Storage Level" -> storageLevel) ~
+     ("Number of Partitions" -> rddInfo.numPartitions) ~
+@@ -408,11 +413,6 @@ private[spark] object JsonProtocol {
+     ("Disk Size" -> rddInfo.diskSize)
+   }
+ 
+-  def callsiteToJson(callsite: CallSite): JValue = {
+-    ("Short Form" -> callsite.shortForm) ~
+-    ("Long Form" -> callsite.longForm)
+-  }
+-
+   def storageLevelToJson(storageLevel: StorageLevel): JValue = {
+     ("Use Disk" -> storageLevel.useDisk) ~
+     ("Use Memory" -> storageLevel.useMemory) ~
+@@ -511,6 +511,8 @@ private[spark] object JsonProtocol {
+       case `executorRemoved` => executorRemovedFromJson(json)
+       case `logStart` => logStartFromJson(json)
+       case `metricsUpdate` => executorMetricsUpdateFromJson(json)
++      case other => mapper.readValue(compact(render(json)), Utils.classForName(other))
++        .asInstanceOf[SparkListenerEvent]
+     }
+   }
+ 
+@@ -857,9 +859,7 @@ private[spark] object JsonProtocol {
+     val scope = Utils.jsonOption(json \ "Scope")
+       .map(_.extract[String])
+       .map(RDDOperationScope.fromJson)
+-    val callsite = Utils.jsonOption(json \ "Callsite")
+-      .map(callsiteFromJson)
+-      .getOrElse(CallSite.empty)
++    val callsite = Utils.jsonOption(json \ "Callsite").map(_.extract[String]).getOrElse("")
+     val parentIds = Utils.jsonOption(json \ "Parent IDs")
+       .map { l => l.extract[List[JValue]].map(_.extract[Int]) }
+       .getOrElse(Seq.empty)
+@@ -880,12 +880,6 @@ private[spark] object JsonProtocol {
+     rddInfo
+   }
+ 
+-  def callsiteFromJson(json: JValue): CallSite = {
+-    val shortForm = (json \ "Short Form").extract[String]
+-    val longForm = (json \ "Long Form").extract[String]
+-    CallSite(shortForm, longForm)
+-  }
+-
+   def storageLevelFromJson(json: JValue): StorageLevel = {
+     val useDisk = (json \ "Use Disk").extract[Boolean]
+     val useMemory = (json \ "Use Memory").extract[Boolean]
+diff --git a/core/src/test/scala/org/apache/spark/network/netty/NettyBlockTransferSecuritySuite.scala b/core/src/test/scala/org/apache/spark/network/netty/NettyBlockTransferSecuritySuite.scala
+index 3940527fb874e..98da94139f7f8 100644
+--- a/core/src/test/scala/org/apache/spark/network/netty/NettyBlockTransferSecuritySuite.scala
++++ b/core/src/test/scala/org/apache/spark/network/netty/NettyBlockTransferSecuritySuite.scala
+@@ -148,7 +148,7 @@ class NettyBlockTransferSecuritySuite extends SparkFunSuite with MockitoSugar wi
+         }
+       })
+ 
+-    Await.ready(promise.future, FiniteDuration(1000, TimeUnit.MILLISECONDS))
++    Await.ready(promise.future, FiniteDuration(10, TimeUnit.SECONDS))
+     promise.future.value.get
+   }
+ }
+diff --git a/core/src/test/scala/org/apache/spark/util/JsonProtocolSuite.scala b/core/src/test/scala/org/apache/spark/util/JsonProtocolSuite.scala
+index 3f94ef7041914..1939ce5c743b0 100644
+--- a/core/src/test/scala/org/apache/spark/util/JsonProtocolSuite.scala
++++ b/core/src/test/scala/org/apache/spark/util/JsonProtocolSuite.scala
+@@ -111,7 +111,6 @@ class JsonProtocolSuite extends SparkFunSuite {
+   test("Dependent Classes") {
+     val logUrlMap = Map("stderr" -> "mystderr", "stdout" -> "mystdout").toMap
+     testRDDInfo(makeRddInfo(2, 3, 4, 5L, 6L))
+-    testCallsite(CallSite("happy", "birthday"))
+     testStageInfo(makeStageInfo(10, 20, 30, 40L, 50L))
+     testTaskInfo(makeTaskInfo(999L, 888, 55, 777L, false))
+     testTaskMetrics(makeTaskMetrics(
+@@ -343,13 +342,13 @@ class JsonProtocolSuite extends SparkFunSuite {
+     // "Scope" and "Parent IDs" were introduced in Spark 1.4.0
+     // "Callsite" was introduced in Spark 1.6.0
+     val rddInfo = new RDDInfo(1, "one", 100, StorageLevel.NONE, Seq(1, 6, 8),
+-      CallSite("short", "long"), Some(new RDDOperationScope("fable")))
++      "callsite", Some(new RDDOperationScope("fable")))
+     val oldRddInfoJson = JsonProtocol.rddInfoToJson(rddInfo)
+       .removeField({ _._1 == "Parent IDs"})
+       .removeField({ _._1 == "Scope"})
+       .removeField({ _._1 == "Callsite"})
+     val expectedRddInfo = new RDDInfo(
+-      1, "one", 100, StorageLevel.NONE, Seq.empty, CallSite.empty, scope = None)
++      1, "one", 100, StorageLevel.NONE, Seq.empty, "", scope = None)
+     assertEquals(expectedRddInfo, JsonProtocol.rddInfoFromJson(oldRddInfoJson))
+   }
+ 
+@@ -397,11 +396,6 @@ class JsonProtocolSuite extends SparkFunSuite {
+     assertEquals(info, newInfo)
+   }
+ 
+-  private def testCallsite(callsite: CallSite): Unit = {
+-    val newCallsite = JsonProtocol.callsiteFromJson(JsonProtocol.callsiteToJson(callsite))
+-    assert(callsite === newCallsite)
+-  }
+-
+   private def testStageInfo(info: StageInfo) {
+     val newInfo = JsonProtocol.stageInfoFromJson(JsonProtocol.stageInfoToJson(info))
+     assertEquals(info, newInfo)
+@@ -726,8 +720,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+   }
+ 
+   private def makeRddInfo(a: Int, b: Int, c: Int, d: Long, e: Long) = {
+-    val r = new RDDInfo(a, "mayor", b, StorageLevel.MEMORY_AND_DISK,
+-      Seq(1, 4, 7), CallSite(a.toString, b.toString))
++    val r = new RDDInfo(a, "mayor", b, StorageLevel.MEMORY_AND_DISK, Seq(1, 4, 7), a.toString)
+     r.numCachedPartitions = c
+     r.memSize = d
+     r.diskSize = e
+@@ -870,7 +863,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |      {
+       |        "RDD ID": 101,
+       |        "Name": "mayor",
+-      |        "Callsite": {"Short Form": "101", "Long Form": "201"},
++      |        "Callsite": "101",
+       |        "Parent IDs": [1, 4, 7],
+       |        "Storage Level": {
+       |          "Use Disk": true,
+@@ -1273,7 +1266,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 1,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "1", "Long Form": "200"},
++      |          "Callsite": "1",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1317,7 +1310,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 2,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "2", "Long Form": "400"},
++      |          "Callsite": "2",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1335,7 +1328,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 3,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "3", "Long Form": "401"},
++      |          "Callsite": "3",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1379,7 +1372,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 3,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "3", "Long Form": "600"},
++      |          "Callsite": "3",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1397,7 +1390,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 4,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "4", "Long Form": "601"},
++      |          "Callsite": "4",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1415,7 +1408,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 5,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "5", "Long Form": "602"},
++      |          "Callsite": "5",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1459,7 +1452,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 4,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "4", "Long Form": "800"},
++      |          "Callsite": "4",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1477,7 +1470,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 5,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "5", "Long Form": "801"},
++      |          "Callsite": "5",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1495,7 +1488,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 6,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "6", "Long Form": "802"},
++      |          "Callsite": "6",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+@@ -1513,7 +1506,7 @@ class JsonProtocolSuite extends SparkFunSuite {
+       |        {
+       |          "RDD ID": 7,
+       |          "Name": "mayor",
+-      |          "Callsite": {"Short Form": "7", "Long Form": "803"},
++      |          "Callsite": "7",
+       |          "Parent IDs": [1, 4, 7],
+       |          "Storage Level": {
+       |            "Use Disk": true,
+diff --git a/dev/lint-java b/dev/lint-java
+index 55b6b0c348416..fe8ab83d562d1 100755
+--- a/dev/lint-java
++++ b/dev/lint-java
+@@ -20,11 +20,7 @@
+ SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+ SPARK_ROOT_DIR="$(dirname $SCRIPT_DIR)"
+ 
+-$SCRIPT_DIR/../build/mvn -Pkinesis-asl -Phive -Phive-thriftserver checkstyle:check > checkstyle.txt
+-$SCRIPT_DIR/../build/mvn -Pkinesis-asl -Pyarn -Phadoop-2.2 checkstyle:check >> checkstyle.txt
+-
+-ERRORS=$(grep ERROR checkstyle.txt)
+-rm checkstyle.txt
++ERRORS=$($SCRIPT_DIR/../build/mvn -Pkinesis-asl -Pyarn -Phive -Phive-thriftserver checkstyle:check | grep ERROR)
+ 
+ if test ! -z "$ERRORS"; then
+     echo -e "Checkstyle checks failed at following occurrences:\n$ERRORS"
+diff --git a/docs/ml-features.md b/docs/ml-features.md
+index 5f888775553f2..05c2c96c5ec5a 100644
+--- a/docs/ml-features.md
++++ b/docs/ml-features.md
+@@ -1232,7 +1232,7 @@ lInfNormData = normalizer.transform(dataFrame, {normalizer.p: float("inf")})
+ * `withStd`: True by default. Scales the data to unit standard deviation.
+ * `withMean`: False by default. Centers the data with mean before scaling. It will build a dense output, so this does not work on sparse input and will raise an exception.
+ 
+-`StandardScaler` is a `Model` which can be `fit` on a dataset to produce a `StandardScalerModel`; this amounts to computing summary statistics.  The model can then transform a `Vector` column in a dataset to have unit standard deviation and/or zero mean features.
++`StandardScaler` is an `Estimator` which can be `fit` on a dataset to produce a `StandardScalerModel`; this amounts to computing summary statistics.  The model can then transform a `Vector` column in a dataset to have unit standard deviation and/or zero mean features.
+ 
+ Note that if the standard deviation of a feature is zero, it will return default `0.0` value in the `Vector` for that feature.
+ 
+diff --git a/docs/sparkr.md b/docs/sparkr.md
+index cfb9b41350f45..01148786b79d7 100644
+--- a/docs/sparkr.md
++++ b/docs/sparkr.md
+@@ -384,5 +384,6 @@ The following functions are masked by the SparkR package:
+   </tr>
+ </table>
+ 
++Since part of SparkR is modeled on the `dplyr` package, certain functions in SparkR share the same names with those in `dplyr`. Depending on the load order of the two packages, some functions from the package loaded first are masked by those in the package loaded after. In such case, prefix such calls with the package name, for instance, `SparkR::cume_dist(x)` or `dplyr::cume_dist(x)`.
++  
+ You can inspect the search path in R with [`search()`](https://stat.ethz.ch/R-manual/R-devel/library/base/html/search.html)
+-
+diff --git a/ec2/spark_ec2.py b/ec2/spark_ec2.py
+index 84a950c9f6529..19d5980560fef 100755
+--- a/ec2/spark_ec2.py
++++ b/ec2/spark_ec2.py
+@@ -51,7 +51,7 @@
+     raw_input = input
+     xrange = range
+ 
+-SPARK_EC2_VERSION = "1.5.0"
++SPARK_EC2_VERSION = "1.6.0"
+ SPARK_EC2_DIR = os.path.dirname(os.path.realpath(__file__))
+ 
+ VALID_SPARK_VERSIONS = set([
+@@ -72,7 +72,10 @@
+     "1.3.1",
+     "1.4.0",
+     "1.4.1",
+-    "1.5.0"
++    "1.5.0",
++    "1.5.1",
++    "1.5.2",
++    "1.6.0",
+ ])
+ 
+ SPARK_TACHYON_MAP = {
+@@ -87,7 +90,10 @@
+     "1.3.1": "0.5.0",
+     "1.4.0": "0.6.4",
+     "1.4.1": "0.6.4",
+-    "1.5.0": "0.7.1"
++    "1.5.0": "0.7.1",
++    "1.5.1": "0.7.1",
++    "1.5.2": "0.7.1",
++    "1.6.0": "0.8.2",
+ }
+ 
+ DEFAULT_SPARK_VERSION = SPARK_EC2_VERSION
+diff --git a/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/KafkaTestUtils.scala b/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/KafkaTestUtils.scala
+index 86394ea8a685e..45a6982b9afe5 100644
+--- a/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/KafkaTestUtils.scala
++++ b/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/KafkaTestUtils.scala
+@@ -151,7 +151,7 @@ private[kafka] class KafkaTestUtils extends Logging {
+     }
+   }
+ 
+-  /** Create a Kafka topic and wait until it propagated to the whole cluster */
++  /** Create a Kafka topic and wait until it is propagated to the whole cluster */
+   def createTopic(topic: String): Unit = {
+     AdminUtils.createTopic(zkClient, topic, 1, 1)
+     // wait until metadata is propagated
+diff --git a/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/OffsetRange.scala b/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/OffsetRange.scala
+index 8a5f371494511..d9b856e4697a0 100644
+--- a/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/OffsetRange.scala
++++ b/external/kafka/src/main/scala/org/apache/spark/streaming/kafka/OffsetRange.scala
+@@ -20,7 +20,7 @@ package org.apache.spark.streaming.kafka
+ import kafka.common.TopicAndPartition
+ 
+ /**
+- * Represents any object that has a collection of [[OffsetRange]]s. This can be used access the
++ * Represents any object that has a collection of [[OffsetRange]]s. This can be used to access the
+  * offset ranges in RDDs generated by the direct Kafka DStream (see
+  * [[KafkaUtils.createDirectStream()]]).
+  * {{{
+diff --git a/mllib/src/main/scala/org/apache/spark/ml/tuning/CrossValidator.scala b/mllib/src/main/scala/org/apache/spark/ml/tuning/CrossValidator.scala
+index 83a9048374267..5c09f1aaff80d 100644
+--- a/mllib/src/main/scala/org/apache/spark/ml/tuning/CrossValidator.scala
++++ b/mllib/src/main/scala/org/apache/spark/ml/tuning/CrossValidator.scala
+@@ -19,18 +19,18 @@ package org.apache.spark.ml.tuning
+ 
+ import com.github.fommil.netlib.F2jBLAS
+ import org.apache.hadoop.fs.Path
+-import org.json4s.{JObject, DefaultFormats}
+ import org.json4s.jackson.JsonMethods._
++import org.json4s.{DefaultFormats, JObject}
+ 
+-import org.apache.spark.ml.classification.OneVsRestParams
+-import org.apache.spark.ml.feature.RFormulaModel
+-import org.apache.spark.{SparkContext, Logging}
++import org.apache.spark.{Logging, SparkContext}
+ import org.apache.spark.annotation.{Experimental, Since}
+ import org.apache.spark.ml._
++import org.apache.spark.ml.classification.OneVsRestParams
+ import org.apache.spark.ml.evaluation.Evaluator
++import org.apache.spark.ml.feature.RFormulaModel
+ import org.apache.spark.ml.param._
+-import org.apache.spark.ml.util._
+ import org.apache.spark.ml.util.DefaultParamsReader.Metadata
++import org.apache.spark.ml.util._
+ import org.apache.spark.mllib.util.MLUtils
+ import org.apache.spark.sql.DataFrame
+ import org.apache.spark.sql.types.StructType
+@@ -58,26 +58,34 @@ private[ml] trait CrossValidatorParams extends ValidatorParams {
+  * :: Experimental ::
+  * K-fold cross validation.
+  */
++@Since("1.2.0")
+ @Experimental
+-class CrossValidator(override val uid: String) extends Estimator[CrossValidatorModel]
++class CrossValidator @Since("1.2.0") (@Since("1.4.0") override val uid: String)
++  extends Estimator[CrossValidatorModel]
+   with CrossValidatorParams with MLWritable with Logging {
+ 
++  @Since("1.2.0")
+   def this() = this(Identifiable.randomUID("cv"))
+ 
+   private val f2jBLAS = new F2jBLAS
+ 
+   /** @group setParam */
++  @Since("1.2.0")
+   def setEstimator(value: Estimator[_]): this.type = set(estimator, value)
+ 
+   /** @group setParam */
++  @Since("1.2.0")
+   def setEstimatorParamMaps(value: Array[ParamMap]): this.type = set(estimatorParamMaps, value)
+ 
+   /** @group setParam */
++  @Since("1.2.0")
+   def setEvaluator(value: Evaluator): this.type = set(evaluator, value)
+ 
+   /** @group setParam */
++  @Since("1.2.0")
+   def setNumFolds(value: Int): this.type = set(numFolds, value)
+ 
++  @Since("1.4.0")
+   override def fit(dataset: DataFrame): CrossValidatorModel = {
+     val schema = dataset.schema
+     transformSchema(schema, logging = true)
+@@ -116,10 +124,12 @@ class CrossValidator(override val uid: String) extends Estimator[CrossValidatorM
+     copyValues(new CrossValidatorModel(uid, bestModel, metrics).setParent(this))
+   }
+ 
++  @Since("1.4.0")
+   override def transformSchema(schema: StructType): StructType = {
+     $(estimator).transformSchema(schema)
+   }
+ 
++  @Since("1.4.0")
+   override def validateParams(): Unit = {
+     super.validateParams()
+     val est = $(estimator)
+@@ -128,6 +138,7 @@ class CrossValidator(override val uid: String) extends Estimator[CrossValidatorM
+     }
+   }
+ 
++  @Since("1.4.0")
+   override def copy(extra: ParamMap): CrossValidator = {
+     val copied = defaultCopy(extra).asInstanceOf[CrossValidator]
+     if (copied.isDefined(estimator)) {
+@@ -308,26 +319,31 @@ object CrossValidator extends MLReadable[CrossValidator] {
+  * @param avgMetrics Average cross-validation metrics for each paramMap in
+  *                   [[CrossValidator.estimatorParamMaps]], in the corresponding order.
+  */
++@Since("1.2.0")
+ @Experimental
+ class CrossValidatorModel private[ml] (
+-    override val uid: String,
+-    val bestModel: Model[_],
+-    val avgMetrics: Array[Double])
++    @Since("1.4.0") override val uid: String,
++    @Since("1.2.0") val bestModel: Model[_],
++    @Since("1.5.0") val avgMetrics: Array[Double])
+   extends Model[CrossValidatorModel] with CrossValidatorParams with MLWritable {
+ 
++  @Since("1.4.0")
+   override def validateParams(): Unit = {
+     bestModel.validateParams()
+   }
+ 
++  @Since("1.4.0")
+   override def transform(dataset: DataFrame): DataFrame = {
+     transformSchema(dataset.schema, logging = true)
+     bestModel.transform(dataset)
+   }
+ 
++  @Since("1.4.0")
+   override def transformSchema(schema: StructType): StructType = {
+     bestModel.transformSchema(schema)
+   }
+ 
++  @Since("1.4.0")
+   override def copy(extra: ParamMap): CrossValidatorModel = {
+     val copied = new CrossValidatorModel(
+       uid,
+diff --git a/mllib/src/main/scala/org/apache/spark/ml/tuning/ParamGridBuilder.scala b/mllib/src/main/scala/org/apache/spark/ml/tuning/ParamGridBuilder.scala
+index 98a8f0330ca45..b836d2a2340e6 100644
+--- a/mllib/src/main/scala/org/apache/spark/ml/tuning/ParamGridBuilder.scala
++++ b/mllib/src/main/scala/org/apache/spark/ml/tuning/ParamGridBuilder.scala
+@@ -20,21 +20,23 @@ package org.apache.spark.ml.tuning
+ import scala.annotation.varargs
+ import scala.collection.mutable
+ 
+-import org.apache.spark.annotation.Experimental
++import org.apache.spark.annotation.{Experimental, Since}
+ import org.apache.spark.ml.param._
+ 
+ /**
+  * :: Experimental ::
+  * Builder for a param grid used in grid search-based model selection.
+  */
++@Since("1.2.0")
+ @Experimental
+-class ParamGridBuilder {
++class ParamGridBuilder @Since("1.2.0") {
+ 
+   private val paramGrid = mutable.Map.empty[Param[_], Iterable[_]]
+ 
+   /**
+    * Sets the given parameters in this grid to fixed values.
+    */
++  @Since("1.2.0")
+   def baseOn(paramMap: ParamMap): this.type = {
+     baseOn(paramMap.toSeq: _*)
+     this
+@@ -43,6 +45,7 @@ class ParamGridBuilder {
+   /**
+    * Sets the given parameters in this grid to fixed values.
+    */
++  @Since("1.2.0")
+   @varargs
+   def baseOn(paramPairs: ParamPair[_]*): this.type = {
+     paramPairs.foreach { p =>
+@@ -54,6 +57,7 @@ class ParamGridBuilder {
+   /**
+    * Adds a param with multiple values (overwrites if the input param exists).
+    */
++  @Since("1.2.0")
+   def addGrid[T](param: Param[T], values: Iterable[T]): this.type = {
+     paramGrid.put(param, values)
+     this
+@@ -64,6 +68,7 @@ class ParamGridBuilder {
+   /**
+    * Adds a double param with multiple values.
+    */
++  @Since("1.2.0")
+   def addGrid(param: DoubleParam, values: Array[Double]): this.type = {
+     addGrid[Double](param, values)
+   }
+@@ -71,6 +76,7 @@ class ParamGridBuilder {
+   /**
+    * Adds a int param with multiple values.
+    */
++  @Since("1.2.0")
+   def addGrid(param: IntParam, values: Array[Int]): this.type = {
+     addGrid[Int](param, values)
+   }
+@@ -78,6 +84,7 @@ class ParamGridBuilder {
+   /**
+    * Adds a float param with multiple values.
+    */
++  @Since("1.2.0")
+   def addGrid(param: FloatParam, values: Array[Float]): this.type = {
+     addGrid[Float](param, values)
+   }
+@@ -85,6 +92,7 @@ class ParamGridBuilder {
+   /**
+    * Adds a long param with multiple values.
+    */
++  @Since("1.2.0")
+   def addGrid(param: LongParam, values: Array[Long]): this.type = {
+     addGrid[Long](param, values)
+   }
+@@ -92,6 +100,7 @@ class ParamGridBuilder {
+   /**
+    * Adds a boolean param with true and false.
+    */
++  @Since("1.2.0")
+   def addGrid(param: BooleanParam): this.type = {
+     addGrid[Boolean](param, Array(true, false))
+   }
+@@ -99,6 +108,7 @@ class ParamGridBuilder {
+   /**
+    * Builds and returns all combinations of parameters specified by the param grid.
+    */
++  @Since("1.2.0")
+   def build(): Array[ParamMap] = {
+     var paramMaps = Array(new ParamMap)
+     paramGrid.foreach { case (param, values) =>
+diff --git a/mllib/src/main/scala/org/apache/spark/ml/tuning/TrainValidationSplit.scala b/mllib/src/main/scala/org/apache/spark/ml/tuning/TrainValidationSplit.scala
+index 73a14b8310157..adf06302047a7 100644
+--- a/mllib/src/main/scala/org/apache/spark/ml/tuning/TrainValidationSplit.scala
++++ b/mllib/src/main/scala/org/apache/spark/ml/tuning/TrainValidationSplit.scala
+@@ -18,7 +18,7 @@
+ package org.apache.spark.ml.tuning
+ 
+ import org.apache.spark.Logging
+-import org.apache.spark.annotation.Experimental
++import org.apache.spark.annotation.{Experimental, Since}
+ import org.apache.spark.ml.evaluation.Evaluator
+ import org.apache.spark.ml.{Estimator, Model}
+ import org.apache.spark.ml.param.{DoubleParam, ParamMap, ParamValidators}
+@@ -51,24 +51,32 @@ private[ml] trait TrainValidationSplitParams extends ValidatorParams {
+  * and uses evaluation metric on the validation set to select the best model.
+  * Similar to [[CrossValidator]], but only splits the set once.
+  */
++@Since("1.5.0")
+ @Experimental
+-class TrainValidationSplit(override val uid: String) extends Estimator[TrainValidationSplitModel]
++class TrainValidationSplit @Since("1.5.0") (@Since("1.5.0") override val uid: String)
++  extends Estimator[TrainValidationSplitModel]
+   with TrainValidationSplitParams with Logging {
+ 
++  @Since("1.5.0")
+   def this() = this(Identifiable.randomUID("tvs"))
+ 
+   /** @group setParam */
++  @Since("1.5.0")
+   def setEstimator(value: Estimator[_]): this.type = set(estimator, value)
+ 
+   /** @group setParam */
++  @Since("1.5.0")
+   def setEstimatorParamMaps(value: Array[ParamMap]): this.type = set(estimatorParamMaps, value)
+ 
+   /** @group setParam */
++  @Since("1.5.0")
+   def setEvaluator(value: Evaluator): this.type = set(evaluator, value)
+ 
+   /** @group setParam */
++  @Since("1.5.0")
+   def setTrainRatio(value: Double): this.type = set(trainRatio, value)
+ 
++  @Since("1.5.0")
+   override def fit(dataset: DataFrame): TrainValidationSplitModel = {
+     val schema = dataset.schema
+     transformSchema(schema, logging = true)
+@@ -108,10 +116,12 @@ class TrainValidationSplit(override val uid: String) extends Estimator[TrainVali
+     copyValues(new TrainValidationSplitModel(uid, bestModel, metrics).setParent(this))
+   }
+ 
++  @Since("1.5.0")
+   override def transformSchema(schema: StructType): StructType = {
+     $(estimator).transformSchema(schema)
+   }
+ 
++  @Since("1.5.0")
+   override def validateParams(): Unit = {
+     super.validateParams()
+     val est = $(estimator)
+@@ -120,6 +130,7 @@ class TrainValidationSplit(override val uid: String) extends Estimator[TrainVali
+     }
+   }
+ 
++  @Since("1.5.0")
+   override def copy(extra: ParamMap): TrainValidationSplit = {
+     val copied = defaultCopy(extra).asInstanceOf[TrainValidationSplit]
+     if (copied.isDefined(estimator)) {
+@@ -140,26 +151,31 @@ class TrainValidationSplit(override val uid: String) extends Estimator[TrainVali
+  * @param bestModel Estimator determined best model.
+  * @param validationMetrics Evaluated validation metrics.
+  */
++@Since("1.5.0")
+ @Experimental
+ class TrainValidationSplitModel private[ml] (
+-    override val uid: String,
+-    val bestModel: Model[_],
+-    val validationMetrics: Array[Double])
++    @Since("1.5.0") override val uid: String,
++    @Since("1.5.0") val bestModel: Model[_],
++    @Since("1.5.0") val validationMetrics: Array[Double])
+   extends Model[TrainValidationSplitModel] with TrainValidationSplitParams {
+ 
++  @Since("1.5.0")
+   override def validateParams(): Unit = {
+     bestModel.validateParams()
+   }
+ 
++  @Since("1.5.0")
+   override def transform(dataset: DataFrame): DataFrame = {
+     transformSchema(dataset.schema, logging = true)
+     bestModel.transform(dataset)
+   }
+ 
++  @Since("1.5.0")
+   override def transformSchema(schema: StructType): StructType = {
+     bestModel.transformSchema(schema)
+   }
+ 
++  @Since("1.5.0")
+   override def copy(extra: ParamMap): TrainValidationSplitModel = {
+     val copied = new TrainValidationSplitModel (
+       uid,
+diff --git a/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeans.scala b/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeans.scala
+index 29a7aa0bb63f2..82adfa6ffd596 100644
+--- a/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeans.scala
++++ b/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeans.scala
+@@ -214,7 +214,7 @@ class BisectingKMeans private (
+   }
+ 
+   /**
+-   * Java-friendly version of [[run(RDD[Vector])*]]
++   * Java-friendly version of [[run()]].
+    */
+   def run(data: JavaRDD[Vector]): BisectingKMeansModel = run(data.rdd)
+ }
+diff --git a/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeansModel.scala b/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeansModel.scala
+index 5015f1540d920..f942e5613ffaf 100644
+--- a/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeansModel.scala
++++ b/mllib/src/main/scala/org/apache/spark/mllib/clustering/BisectingKMeansModel.scala
+@@ -64,7 +64,7 @@ class BisectingKMeansModel @Since("1.6.0") (
+   }
+ 
+   /**
+-   * Java-friendly version of [[predict(RDD[Vector])*]]
++   * Java-friendly version of [[predict()]].
+    */
+   @Since("1.6.0")
+   def predict(points: JavaRDD[Vector]): JavaRDD[java.lang.Integer] =
+@@ -88,7 +88,7 @@ class BisectingKMeansModel @Since("1.6.0") (
+   }
+ 
+   /**
+-   * Java-friendly version of [[computeCost(RDD[Vector])*]].
++   * Java-friendly version of [[computeCost()]].
+    */
+   @Since("1.6.0")
+   def computeCost(data: JavaRDD[Vector]): Double = this.computeCost(data.rdd)
+diff --git a/python/pyspark/ml/classification.py b/python/pyspark/ml/classification.py
+index 4a2982e2047ff..5599b8f3ecd88 100644
+--- a/python/pyspark/ml/classification.py
++++ b/python/pyspark/ml/classification.py
+@@ -49,7 +49,7 @@ class LogisticRegression(JavaEstimator, HasFeaturesCol, HasLabelCol, HasPredicti
+     ...     Row(label=0.0, weight=2.0, features=Vectors.sparse(1, [], []))]).toDF()
+     >>> lr = LogisticRegression(maxIter=5, regParam=0.01, weightCol="weight")
+     >>> model = lr.fit(df)
+-    >>> model.weights
++    >>> model.coefficients
+     DenseVector([5.5...])
+     >>> model.intercept
+     -2.68...
+diff --git a/python/pyspark/ml/regression.py b/python/pyspark/ml/regression.py
+index 944e648ec8801..a0bb8ceed8861 100644
+--- a/python/pyspark/ml/regression.py
++++ b/python/pyspark/ml/regression.py
+@@ -40,7 +40,7 @@ class LinearRegression(JavaEstimator, HasFeaturesCol, HasLabelCol, HasPrediction
+     Linear regression.
+ 
+     The learning objective is to minimize the squared error, with regularization.
+-    The specific squared error loss function used is: L = 1/2n ||A weights - y||^2^
++    The specific squared error loss function used is: L = 1/2n ||A coefficients - y||^2^
+ 
+     This support multiple types of regularization:
+      - none (a.k.a. ordinary least squares)
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/Expression.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/Expression.scala
+index 4ee6542455a6c..614f0c075fd23 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/Expression.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/Expression.scala
+@@ -207,12 +207,13 @@ abstract class Expression extends TreeNode[Expression] {
+     }.toString
+   }
+ 
+-
+   private def flatArguments = productIterator.flatMap {
+     case t: Traversable[_] => t
+     case single => single :: Nil
+   }
+ 
++  override def simpleString: String = toString
++
+   override def toString: String = prettyName + flatArguments.mkString("(", ",", ")")
+ 
+   /**
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/windowExpressions.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/windowExpressions.scala
+index 09ec0e333aa44..1680aa8252ecb 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/windowExpressions.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/windowExpressions.scala
+@@ -71,9 +71,6 @@ case class WindowSpecDefinition(
+     childrenResolved && checkInputDataTypes().isSuccess &&
+       frameSpecification.isInstanceOf[SpecifiedWindowFrame]
+ 
+-
+-  override def toString: String = simpleString
+-
+   override def nullable: Boolean = true
+   override def foldable: Boolean = false
+   override def dataType: DataType = throw new UnsupportedOperationException
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/trees/TreeNode.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/trees/TreeNode.scala
+index ad2bd78430a68..d838d845d20fd 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/trees/TreeNode.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/trees/TreeNode.scala
+@@ -380,7 +380,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
+   /** Returns a string representing the arguments to this node, minus any children */
+   def argString: String = productIterator.flatMap {
+     case tn: TreeNode[_] if containsChild(tn) => Nil
+-    case tn: TreeNode[_] => s"(${tn.simpleString})" :: Nil
++    case tn: TreeNode[_] => s"${tn.simpleString}" :: Nil
+     case seq: Seq[BaseType] if seq.toSet.subsetOf(children.toSet) => Nil
+     case seq: Seq[_] => seq.mkString("[", ",", "]") :: Nil
+     case set: Set[_] => set.mkString("{", ",", "}") :: Nil
+@@ -393,7 +393,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
+   override def toString: String = treeString
+ 
+   /** Returns a string representation of the nodes in this tree */
+-  def treeString: String = generateTreeString(0, new StringBuilder).toString
++  def treeString: String = generateTreeString(0, Nil, new StringBuilder).toString
+ 
+   /**
+    * Returns a string representation of the nodes in this tree, where each operator is numbered.
+@@ -419,12 +419,33 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]] extends Product {
+     }
+   }
+ 
+-  /** Appends the string represent of this node and its children to the given StringBuilder. */
+-  protected def generateTreeString(depth: Int, builder: StringBuilder): StringBuilder = {
+-    builder.append(" " * depth)
++  /**
++   * Appends the string represent of this node and its children to the given StringBuilder.
++   *
++   * The `i`-th element in `lastChildren` indicates whether the ancestor of the current node at
++   * depth `i + 1` is the last child of its own parent node.  The depth of the root node is 0, and
++   * `lastChildren` for the root node should be empty.
++   */
++  protected def generateTreeString(
++      depth: Int, lastChildren: Seq[Boolean], builder: StringBuilder): StringBuilder = {
++    if (depth > 0) {
++      lastChildren.init.foreach { isLast =>
++        val prefixFragment = if (isLast) "   " else ":  "
++        builder.append(prefixFragment)
++      }
++
++      val branch = if (lastChildren.last) "+- " else ":- "
++      builder.append(branch)
++    }
++
+     builder.append(simpleString)
+     builder.append("\n")
+-    children.foreach(_.generateTreeString(depth + 1, builder))
++
++    if (children.nonEmpty) {
++      children.init.foreach(_.generateTreeString(depth + 1, lastChildren :+ false, builder))
++      children.last.generateTreeString(depth + 1, lastChildren :+ true, builder)
++    }
++
+     builder
+   }
+ 
+diff --git a/sql/core/src/main/resources/META-INF/services/org.apache.spark.scheduler.SparkHistoryListenerFactory b/sql/core/src/main/resources/META-INF/services/org.apache.spark.scheduler.SparkHistoryListenerFactory
+new file mode 100644
+index 0000000000000..507100be90967
+--- /dev/null
++++ b/sql/core/src/main/resources/META-INF/services/org.apache.spark.scheduler.SparkHistoryListenerFactory
+@@ -0,0 +1 @@
++org.apache.spark.sql.execution.ui.SQLHistoryListenerFactory
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/SQLContext.scala b/sql/core/src/main/scala/org/apache/spark/sql/SQLContext.scala
+index 4e26250868374..db286ea8700b6 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/SQLContext.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/SQLContext.scala
+@@ -1245,6 +1245,7 @@ class SQLContext private[sql](
+   sparkContext.addSparkListener(new SparkListener {
+     override def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit = {
+       SQLContext.clearInstantiatedContext()
++      SQLContext.clearSqlListener()
+     }
+   })
+ 
+@@ -1272,6 +1273,8 @@ object SQLContext {
+    */
+   @transient private val instantiatedContext = new AtomicReference[SQLContext]()
+ 
++  @transient private val sqlListener = new AtomicReference[SQLListener]()
++
+   /**
+    * Get the singleton SQLContext if it exists or create a new one using the given SparkContext.
+    *
+@@ -1316,6 +1319,10 @@ object SQLContext {
+     Option(instantiatedContext.get())
+   }
+ 
++  private[sql] def clearSqlListener(): Unit = {
++    sqlListener.set(null)
++  }
++
+   /**
+    * Changes the SQLContext that will be returned in this thread and its children when
+    * SQLContext.getOrCreate() is called. This can be used to ensure that a given thread receives
+@@ -1364,9 +1371,13 @@ object SQLContext {
+    * Create a SQLListener then add it into SparkContext, and create an SQLTab if there is SparkUI.
+    */
+   private[sql] def createListenerAndUI(sc: SparkContext): SQLListener = {
+-    val listener = new SQLListener(sc.conf)
+-    sc.addSparkListener(listener)
+-    sc.ui.foreach(new SQLTab(listener, _))
+-    listener
++    if (sqlListener.get() == null) {
++      val listener = new SQLListener(sc.conf)
++      if (sqlListener.compareAndSet(null, listener)) {
++        sc.addSparkListener(listener)
++        sc.ui.foreach(new SQLTab(listener, _))
++      }
++    }
++    sqlListener.get()
+   }
+ }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SQLExecution.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SQLExecution.scala
+index 1422e15549c94..34971986261c2 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SQLExecution.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SQLExecution.scala
+@@ -21,7 +21,8 @@ import java.util.concurrent.atomic.AtomicLong
+ 
+ import org.apache.spark.SparkContext
+ import org.apache.spark.sql.SQLContext
+-import org.apache.spark.sql.execution.ui.SparkPlanGraph
++import org.apache.spark.sql.execution.ui.{SparkListenerSQLExecutionStart,
++  SparkListenerSQLExecutionEnd}
+ import org.apache.spark.util.Utils
+ 
+ private[sql] object SQLExecution {
+@@ -45,25 +46,14 @@ private[sql] object SQLExecution {
+       sc.setLocalProperty(EXECUTION_ID_KEY, executionId.toString)
+       val r = try {
+         val callSite = Utils.getCallSite()
+-        sqlContext.listener.onExecutionStart(
+-          executionId,
+-          callSite.shortForm,
+-          callSite.longForm,
+-          queryExecution.toString,
+-          SparkPlanGraph(queryExecution.executedPlan),
+-          System.currentTimeMillis())
++        sqlContext.sparkContext.listenerBus.post(SparkListenerSQLExecutionStart(
++          executionId, callSite.shortForm, callSite.longForm, queryExecution.toString,
++          SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan), System.currentTimeMillis()))
+         try {
+           body
+         } finally {
+-          // Ideally, we need to make sure onExecutionEnd happens after onJobStart and onJobEnd.
+-          // However, onJobStart and onJobEnd run in the listener thread. Because we cannot add new
+-          // SQL event types to SparkListener since it's a public API, we cannot guarantee that.
+-          //
+-          // SQLListener should handle the case that onExecutionEnd happens before onJobEnd.
+-          //
+-          // The worst case is onExecutionEnd may happen before onJobStart when the listener thread
+-          // is very busy. If so, we cannot track the jobs for the execution. It seems acceptable.
+-          sqlContext.listener.onExecutionEnd(executionId, System.currentTimeMillis())
++          sqlContext.sparkContext.listenerBus.post(SparkListenerSQLExecutionEnd(
++            executionId, System.currentTimeMillis()))
+         }
+       } finally {
+         sc.setLocalProperty(EXECUTION_ID_KEY, null)
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanInfo.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanInfo.scala
+new file mode 100644
+index 0000000000000..486ce34064e43
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanInfo.scala
+@@ -0,0 +1,46 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution
++
++import org.apache.spark.annotation.DeveloperApi
++import org.apache.spark.sql.execution.metric.SQLMetricInfo
++import org.apache.spark.util.Utils
++
++/**
++ * :: DeveloperApi ::
++ * Stores information about a SQL SparkPlan.
++ */
++@DeveloperApi
++class SparkPlanInfo(
++    val nodeName: String,
++    val simpleString: String,
++    val children: Seq[SparkPlanInfo],
++    val metrics: Seq[SQLMetricInfo])
++
++private[sql] object SparkPlanInfo {
++
++  def fromSparkPlan(plan: SparkPlan): SparkPlanInfo = {
++    val metrics = plan.metrics.toSeq.map { case (key, metric) =>
++      new SQLMetricInfo(metric.name.getOrElse(key), metric.id,
++        Utils.getFormattedClassName(metric.param))
++    }
++    val children = plan.children.map(fromSparkPlan)
++
++    new SparkPlanInfo(plan.nodeName, plan.simpleString, children, metrics)
++  }
++}
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DDLParser.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DDLParser.scala
+index 6969b423d01b9..f22508b21090c 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DDLParser.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DDLParser.scala
+@@ -66,15 +66,15 @@ class DDLParser(parseQuery: String => LogicalPlan)
+   protected def start: Parser[LogicalPlan] = ddl
+ 
+   /**
+-   * `CREATE [TEMPORARY] TABLE avroTable [IF NOT EXISTS]
++   * `CREATE [TEMPORARY] TABLE [IF NOT EXISTS] avroTable
+    * USING org.apache.spark.sql.avro
+    * OPTIONS (path "../hive/src/test/resources/data/files/episodes.avro")`
+    * or
+-   * `CREATE [TEMPORARY] TABLE avroTable(intField int, stringField string...) [IF NOT EXISTS]
++   * `CREATE [TEMPORARY] TABLE [IF NOT EXISTS] avroTable(intField int, stringField string...)
+    * USING org.apache.spark.sql.avro
+    * OPTIONS (path "../hive/src/test/resources/data/files/episodes.avro")`
+    * or
+-   * `CREATE [TEMPORARY] TABLE avroTable [IF NOT EXISTS]
++   * `CREATE [TEMPORARY] TABLE [IF NOT EXISTS] avroTable
+    * USING org.apache.spark.sql.avro
+    * OPTIONS (path "../hive/src/test/resources/data/files/episodes.avro")`
+    * AS SELECT ...
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/jdbc/JDBCRDD.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/jdbc/JDBCRDD.scala
+index 392d3ed58e3ce..b9dd7f6b4099b 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/jdbc/JDBCRDD.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/jdbc/JDBCRDD.scala
+@@ -498,7 +498,7 @@ private[sql] class JDBCRDD(
+       }
+       try {
+         if (null != conn) {
+-          if (!conn.getAutoCommit && !conn.isClosed) {
++          if (!conn.isClosed && !conn.getAutoCommit) {
+             try {
+               conn.commit()
+             } catch {
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/metric/SQLMetricInfo.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/metric/SQLMetricInfo.scala
+new file mode 100644
+index 0000000000000..2708219ad3485
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/metric/SQLMetricInfo.scala
+@@ -0,0 +1,30 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.metric
++
++import org.apache.spark.annotation.DeveloperApi
++
++/**
++ * :: DeveloperApi ::
++ * Stores information about a SQL Metric.
++ */
++@DeveloperApi
++class SQLMetricInfo(
++    val name: String,
++    val accumulatorId: Long,
++    val metricParam: String)
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/metric/SQLMetrics.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/metric/SQLMetrics.scala
+index 1c253e3942e95..6c0f6f8a52dc5 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/metric/SQLMetrics.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/metric/SQLMetrics.scala
+@@ -104,21 +104,39 @@ private class LongSQLMetricParam(val stringValue: Seq[Long] => String, initialVa
+   override def zero: LongSQLMetricValue = new LongSQLMetricValue(initialValue)
+ }
+ 
++private object LongSQLMetricParam extends LongSQLMetricParam(_.sum.toString, 0L)
++
++private object StaticsLongSQLMetricParam extends LongSQLMetricParam(
++  (values: Seq[Long]) => {
++    // This is a workaround for SPARK-11013.
++    // We use -1 as initial value of the accumulator, if the accumulator is valid, we will update
++    // it at the end of task and the value will be at least 0.
++    val validValues = values.filter(_ >= 0)
++    val Seq(sum, min, med, max) = {
++      val metric = if (validValues.length == 0) {
++        Seq.fill(4)(0L)
++      } else {
++        val sorted = validValues.sorted
++        Seq(sorted.sum, sorted(0), sorted(validValues.length / 2), sorted(validValues.length - 1))
++      }
++      metric.map(Utils.bytesToString)
++    }
++    s"\n$sum ($min, $med, $max)"
++  }, -1L)
++
+ private[sql] object SQLMetrics {
+ 
+   private def createLongMetric(
+       sc: SparkContext,
+       name: String,
+-      stringValue: Seq[Long] => String,
+-      initialValue: Long): LongSQLMetric = {
+-    val param = new LongSQLMetricParam(stringValue, initialValue)
++      param: LongSQLMetricParam): LongSQLMetric = {
+     val acc = new LongSQLMetric(name, param)
+     sc.cleaner.foreach(_.registerAccumulatorForCleanup(acc))
+     acc
+   }
+ 
+   def createLongMetric(sc: SparkContext, name: String): LongSQLMetric = {
+-    createLongMetric(sc, name, _.sum.toString, 0L)
++    createLongMetric(sc, name, LongSQLMetricParam)
+   }
+ 
+   /**
+@@ -126,31 +144,25 @@ private[sql] object SQLMetrics {
+    * spill size, etc.
+    */
+   def createSizeMetric(sc: SparkContext, name: String): LongSQLMetric = {
+-    val stringValue = (values: Seq[Long]) => {
+-      // This is a workaround for SPARK-11013.
+-      // We use -1 as initial value of the accumulator, if the accumulator is valid, we will update
+-      // it at the end of task and the value will be at least 0.
+-      val validValues = values.filter(_ >= 0)
+-      val Seq(sum, min, med, max) = {
+-        val metric = if (validValues.length == 0) {
+-          Seq.fill(4)(0L)
+-        } else {
+-          val sorted = validValues.sorted
+-          Seq(sorted.sum, sorted(0), sorted(validValues.length / 2), sorted(validValues.length - 1))
+-        }
+-        metric.map(Utils.bytesToString)
+-      }
+-      s"\n$sum ($min, $med, $max)"
+-    }
+     // The final result of this metric in physical operator UI may looks like:
+     // data size total (min, med, max):
+     // 100GB (100MB, 1GB, 10GB)
+-    createLongMetric(sc, s"$name total (min, med, max)", stringValue, -1L)
++    createLongMetric(sc, s"$name total (min, med, max)", StaticsLongSQLMetricParam)
++  }
++
++  def getMetricParam(metricParamName: String): SQLMetricParam[SQLMetricValue[Any], Any] = {
++    val longSQLMetricParam = Utils.getFormattedClassName(LongSQLMetricParam)
++    val staticsSQLMetricParam = Utils.getFormattedClassName(StaticsLongSQLMetricParam)
++    val metricParam = metricParamName match {
++      case `longSQLMetricParam` => LongSQLMetricParam
++      case `staticsSQLMetricParam` => StaticsLongSQLMetricParam
++    }
++    metricParam.asInstanceOf[SQLMetricParam[SQLMetricValue[Any], Any]]
+   }
+ 
+   /**
+    * A metric that its value will be ignored. Use this one when we need a metric parameter but don't
+    * care about the value.
+    */
+-  val nullLongMetric = new LongSQLMetric("null", new LongSQLMetricParam(_.sum.toString, 0L))
++  val nullLongMetric = new LongSQLMetric("null", LongSQLMetricParam)
+ }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/ExecutionPage.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/ExecutionPage.scala
+index e74d6fb396e1c..c74ad40406992 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/ExecutionPage.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/ExecutionPage.scala
+@@ -19,9 +19,7 @@ package org.apache.spark.sql.execution.ui
+ 
+ import javax.servlet.http.HttpServletRequest
+ 
+-import scala.xml.{Node, Unparsed}
+-
+-import org.apache.commons.lang3.StringEscapeUtils
++import scala.xml.Node
+ 
+ import org.apache.spark.Logging
+ import org.apache.spark.ui.{UIUtils, WebUIPage}
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLListener.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLListener.scala
+index 5a072de400b6a..e19a1e3e5851f 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLListener.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLListener.scala
+@@ -19,11 +19,34 @@ package org.apache.spark.sql.execution.ui
+ 
+ import scala.collection.mutable
+ 
+-import org.apache.spark.executor.TaskMetrics
++import org.apache.spark.annotation.DeveloperApi
+ import org.apache.spark.scheduler._
+ import org.apache.spark.sql.execution.SQLExecution
+-import org.apache.spark.sql.execution.metric.{SQLMetricParam, SQLMetricValue}
++import org.apache.spark.sql.execution.SparkPlanInfo
++import org.apache.spark.sql.execution.metric.{LongSQLMetricValue, SQLMetricValue, SQLMetricParam}
+ import org.apache.spark.{JobExecutionStatus, Logging, SparkConf}
++import org.apache.spark.ui.SparkUI
++
++@DeveloperApi
++case class SparkListenerSQLExecutionStart(
++    executionId: Long,
++    description: String,
++    details: String,
++    physicalPlanDescription: String,
++    sparkPlanInfo: SparkPlanInfo,
++    time: Long)
++  extends SparkListenerEvent
++
++@DeveloperApi
++case class SparkListenerSQLExecutionEnd(executionId: Long, time: Long)
++  extends SparkListenerEvent
++
++private[sql] class SQLHistoryListenerFactory extends SparkHistoryListenerFactory {
++
++  override def createListeners(conf: SparkConf, sparkUI: SparkUI): Seq[SparkListener] = {
++    List(new SQLHistoryListener(conf, sparkUI))
++  }
++}
+ 
+ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Logging {
+ 
+@@ -118,7 +141,8 @@ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Loggi
+   override def onExecutorMetricsUpdate(
+       executorMetricsUpdate: SparkListenerExecutorMetricsUpdate): Unit = synchronized {
+     for ((taskId, stageId, stageAttemptID, metrics) <- executorMetricsUpdate.taskMetrics) {
+-      updateTaskAccumulatorValues(taskId, stageId, stageAttemptID, metrics, finishTask = false)
++      updateTaskAccumulatorValues(taskId, stageId, stageAttemptID, metrics.accumulatorUpdates(),
++        finishTask = false)
+     }
+   }
+ 
+@@ -140,7 +164,7 @@ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Loggi
+       taskEnd.taskInfo.taskId,
+       taskEnd.stageId,
+       taskEnd.stageAttemptId,
+-      taskEnd.taskMetrics,
++      taskEnd.taskMetrics.accumulatorUpdates(),
+       finishTask = true)
+   }
+ 
+@@ -148,15 +172,12 @@ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Loggi
+    * Update the accumulator values of a task with the latest metrics for this task. This is called
+    * every time we receive an executor heartbeat or when a task finishes.
+    */
+-  private def updateTaskAccumulatorValues(
++  protected def updateTaskAccumulatorValues(
+       taskId: Long,
+       stageId: Int,
+       stageAttemptID: Int,
+-      metrics: TaskMetrics,
++      accumulatorUpdates: Map[Long, Any],
+       finishTask: Boolean): Unit = {
+-    if (metrics == null) {
+-      return
+-    }
+ 
+     _stageIdToStageMetrics.get(stageId) match {
+       case Some(stageMetrics) =>
+@@ -174,9 +195,9 @@ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Loggi
+             case Some(taskMetrics) =>
+               if (finishTask) {
+                 taskMetrics.finished = true
+-                taskMetrics.accumulatorUpdates = metrics.accumulatorUpdates()
++                taskMetrics.accumulatorUpdates = accumulatorUpdates
+               } else if (!taskMetrics.finished) {
+-                taskMetrics.accumulatorUpdates = metrics.accumulatorUpdates()
++                taskMetrics.accumulatorUpdates = accumulatorUpdates
+               } else {
+                 // If a task is finished, we should not override with accumulator updates from
+                 // heartbeat reports
+@@ -185,7 +206,7 @@ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Loggi
+               // TODO Now just set attemptId to 0. Should fix here when we can get the attempt
+               // id from SparkListenerExecutorMetricsUpdate
+               stageMetrics.taskIdToMetricUpdates(taskId) = new SQLTaskMetrics(
+-                  attemptId = 0, finished = finishTask, metrics.accumulatorUpdates())
++                  attemptId = 0, finished = finishTask, accumulatorUpdates)
+           }
+         }
+       case None =>
+@@ -193,38 +214,40 @@ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Loggi
+     }
+   }
+ 
+-  def onExecutionStart(
+-      executionId: Long,
+-      description: String,
+-      details: String,
+-      physicalPlanDescription: String,
+-      physicalPlanGraph: SparkPlanGraph,
+-      time: Long): Unit = {
+-    val sqlPlanMetrics = physicalPlanGraph.nodes.flatMap { node =>
+-      node.metrics.map(metric => metric.accumulatorId -> metric)
+-    }
+-
+-    val executionUIData = new SQLExecutionUIData(executionId, description, details,
+-      physicalPlanDescription, physicalPlanGraph, sqlPlanMetrics.toMap, time)
+-    synchronized {
+-      activeExecutions(executionId) = executionUIData
+-      _executionIdToData(executionId) = executionUIData
+-    }
+-  }
+-
+-  def onExecutionEnd(executionId: Long, time: Long): Unit = synchronized {
+-    _executionIdToData.get(executionId).foreach { executionUIData =>
+-      executionUIData.completionTime = Some(time)
+-      if (!executionUIData.hasRunningJobs) {
+-        // onExecutionEnd happens after all "onJobEnd"s
+-        // So we should update the execution lists.
+-        markExecutionFinished(executionId)
+-      } else {
+-        // There are some running jobs, onExecutionEnd happens before some "onJobEnd"s.
+-        // Then we don't if the execution is successful, so let the last onJobEnd updates the
+-        // execution lists.
++  override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
++    case SparkListenerSQLExecutionStart(executionId, description, details,
++      physicalPlanDescription, sparkPlanInfo, time) =>
++      val physicalPlanGraph = SparkPlanGraph(sparkPlanInfo)
++      val sqlPlanMetrics = physicalPlanGraph.nodes.flatMap { node =>
++        node.metrics.map(metric => metric.accumulatorId -> metric)
++      }
++      val executionUIData = new SQLExecutionUIData(
++        executionId,
++        description,
++        details,
++        physicalPlanDescription,
++        physicalPlanGraph,
++        sqlPlanMetrics.toMap,
++        time)
++      synchronized {
++        activeExecutions(executionId) = executionUIData
++        _executionIdToData(executionId) = executionUIData
++      }
++    case SparkListenerSQLExecutionEnd(executionId, time) => synchronized {
++      _executionIdToData.get(executionId).foreach { executionUIData =>
++        executionUIData.completionTime = Some(time)
++        if (!executionUIData.hasRunningJobs) {
++          // onExecutionEnd happens after all "onJobEnd"s
++          // So we should update the execution lists.
++          markExecutionFinished(executionId)
++        } else {
++          // There are some running jobs, onExecutionEnd happens before some "onJobEnd"s.
++          // Then we don't if the execution is successful, so let the last onJobEnd updates the
++          // execution lists.
++        }
+       }
+     }
++    case _ => // Ignore
+   }
+ 
+   private def markExecutionFinished(executionId: Long): Unit = {
+@@ -289,6 +312,38 @@ private[sql] class SQLListener(conf: SparkConf) extends SparkListener with Loggi
+ 
+ }
+ 
++private[spark] class SQLHistoryListener(conf: SparkConf, sparkUI: SparkUI)
++  extends SQLListener(conf) {
++
++  private var sqlTabAttached = false
++
++  override def onExecutorMetricsUpdate(
++      executorMetricsUpdate: SparkListenerExecutorMetricsUpdate): Unit = synchronized {
++    // Do nothing
++  }
++
++  override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = synchronized {
++    updateTaskAccumulatorValues(
++      taskEnd.taskInfo.taskId,
++      taskEnd.stageId,
++      taskEnd.stageAttemptId,
++      taskEnd.taskInfo.accumulables.map { acc =>
++        (acc.id, new LongSQLMetricValue(acc.update.getOrElse("0").toLong))
++      }.toMap,
++      finishTask = true)
++  }
++
++  override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
++    case _: SparkListenerSQLExecutionStart =>
++      if (!sqlTabAttached) {
++        new SQLTab(this, sparkUI)
++        sqlTabAttached = true
++      }
++      super.onOtherEvent(event)
++    case _ => super.onOtherEvent(event)
++  }
++}
++
+ /**
+  * Represent all necessary data for an execution that will be used in Web UI.
+  */
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLTab.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLTab.scala
+index 9c27944d42fc6..4f50b2ecdc8f8 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLTab.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SQLTab.scala
+@@ -17,13 +17,11 @@
+ 
+ package org.apache.spark.sql.execution.ui
+ 
+-import java.util.concurrent.atomic.AtomicInteger
+-
+ import org.apache.spark.Logging
+ import org.apache.spark.ui.{SparkUI, SparkUITab}
+ 
+ private[sql] class SQLTab(val listener: SQLListener, sparkUI: SparkUI)
+-  extends SparkUITab(sparkUI, SQLTab.nextTabName) with Logging {
++  extends SparkUITab(sparkUI, "SQL") with Logging {
+ 
+   val parent = sparkUI
+ 
+@@ -35,13 +33,5 @@ private[sql] class SQLTab(val listener: SQLListener, sparkUI: SparkUI)
+ }
+ 
+ private[sql] object SQLTab {
+-
+   private val STATIC_RESOURCE_DIR = "org/apache/spark/sql/execution/ui/static"
+-
+-  private val nextTabId = new AtomicInteger(0)
+-
+-  private def nextTabName: String = {
+-    val nextId = nextTabId.getAndIncrement()
+-    if (nextId == 0) "SQL" else s"SQL$nextId"
+-  }
+ }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SparkPlanGraph.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SparkPlanGraph.scala
+index f1fce5478a3fe..7af0ff09c5c6d 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SparkPlanGraph.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/ui/SparkPlanGraph.scala
+@@ -21,8 +21,8 @@ import java.util.concurrent.atomic.AtomicLong
+ 
+ import scala.collection.mutable
+ 
+-import org.apache.spark.sql.execution.SparkPlan
+-import org.apache.spark.sql.execution.metric.{SQLMetricParam, SQLMetricValue}
++import org.apache.spark.sql.execution.SparkPlanInfo
++import org.apache.spark.sql.execution.metric.SQLMetrics
+ 
+ /**
+  * A graph used for storing information of an executionPlan of DataFrame.
+@@ -48,27 +48,27 @@ private[sql] object SparkPlanGraph {
+   /**
+    * Build a SparkPlanGraph from the root of a SparkPlan tree.
+    */
+-  def apply(plan: SparkPlan): SparkPlanGraph = {
++  def apply(planInfo: SparkPlanInfo): SparkPlanGraph = {
+     val nodeIdGenerator = new AtomicLong(0)
+     val nodes = mutable.ArrayBuffer[SparkPlanGraphNode]()
+     val edges = mutable.ArrayBuffer[SparkPlanGraphEdge]()
+-    buildSparkPlanGraphNode(plan, nodeIdGenerator, nodes, edges)
++    buildSparkPlanGraphNode(planInfo, nodeIdGenerator, nodes, edges)
+     new SparkPlanGraph(nodes, edges)
+   }
+ 
+   private def buildSparkPlanGraphNode(
+-      plan: SparkPlan,
++      planInfo: SparkPlanInfo,
+       nodeIdGenerator: AtomicLong,
+       nodes: mutable.ArrayBuffer[SparkPlanGraphNode],
+       edges: mutable.ArrayBuffer[SparkPlanGraphEdge]): SparkPlanGraphNode = {
+-    val metrics = plan.metrics.toSeq.map { case (key, metric) =>
+-      SQLPlanMetric(metric.name.getOrElse(key), metric.id,
+-        metric.param.asInstanceOf[SQLMetricParam[SQLMetricValue[Any], Any]])
++    val metrics = planInfo.metrics.map { metric =>
++      SQLPlanMetric(metric.name, metric.accumulatorId,
++        SQLMetrics.getMetricParam(metric.metricParam))
+     }
+     val node = SparkPlanGraphNode(
+-      nodeIdGenerator.getAndIncrement(), plan.nodeName, plan.simpleString, metrics)
++      nodeIdGenerator.getAndIncrement(), planInfo.nodeName, planInfo.simpleString, metrics)
+     nodes += node
+-    val childrenNodes = plan.children.map(
++    val childrenNodes = planInfo.children.map(
+       child => buildSparkPlanGraphNode(child, nodeIdGenerator, nodes, edges))
+     for (child <- childrenNodes) {
+       edges += SparkPlanGraphEdge(child.id, node.id)
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/metric/SQLMetricsSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/metric/SQLMetricsSuite.scala
+index 82867ab4967bb..4f2cad19bfb6b 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/metric/SQLMetricsSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/metric/SQLMetricsSuite.scala
+@@ -26,6 +26,7 @@ import org.apache.xbean.asm5.Opcodes._
+ 
+ import org.apache.spark.SparkFunSuite
+ import org.apache.spark.sql._
++import org.apache.spark.sql.execution.SparkPlanInfo
+ import org.apache.spark.sql.execution.ui.SparkPlanGraph
+ import org.apache.spark.sql.functions._
+ import org.apache.spark.sql.test.SharedSQLContext
+@@ -82,7 +83,8 @@ class SQLMetricsSuite extends SparkFunSuite with SharedSQLContext {
+     if (jobs.size == expectedNumOfJobs) {
+       // If we can track all jobs, check the metric values
+       val metricValues = sqlContext.listener.getExecutionMetrics(executionId)
+-      val actualMetrics = SparkPlanGraph(df.queryExecution.executedPlan).nodes.filter { node =>
++      val actualMetrics = SparkPlanGraph(SparkPlanInfo.fromSparkPlan(
++        df.queryExecution.executedPlan)).nodes.filter { node =>
+         expectedMetrics.contains(node.id)
+       }.map { node =>
+         val nodeMetrics = node.metrics.map { metric =>
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/ui/SQLListenerSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/ui/SQLListenerSuite.scala
+index c15aac775096c..12a4e1356fed0 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/ui/SQLListenerSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/ui/SQLListenerSuite.scala
+@@ -21,10 +21,10 @@ import java.util.Properties
+ 
+ import org.apache.spark.{SparkException, SparkContext, SparkConf, SparkFunSuite}
+ import org.apache.spark.executor.TaskMetrics
+-import org.apache.spark.sql.execution.metric.LongSQLMetricValue
+ import org.apache.spark.scheduler._
+ import org.apache.spark.sql.{DataFrame, SQLContext}
+-import org.apache.spark.sql.execution.SQLExecution
++import org.apache.spark.sql.execution.{SparkPlanInfo, SQLExecution}
++import org.apache.spark.sql.execution.metric.LongSQLMetricValue
+ import org.apache.spark.sql.test.SharedSQLContext
+ 
+ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+@@ -82,7 +82,8 @@ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+     val executionId = 0
+     val df = createTestDataFrame
+     val accumulatorIds =
+-      SparkPlanGraph(df.queryExecution.executedPlan).nodes.flatMap(_.metrics.map(_.accumulatorId))
++      SparkPlanGraph(SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan))
++        .nodes.flatMap(_.metrics.map(_.accumulatorId))
+     // Assume all accumulators are long
+     var accumulatorValue = 0L
+     val accumulatorUpdates = accumulatorIds.map { id =>
+@@ -90,13 +91,13 @@ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+       (id, accumulatorValue)
+     }.toMap
+ 
+-    listener.onExecutionStart(
++    listener.onOtherEvent(SparkListenerSQLExecutionStart(
+       executionId,
+       "test",
+       "test",
+       df.queryExecution.toString,
+-      SparkPlanGraph(df.queryExecution.executedPlan),
+-      System.currentTimeMillis())
++      SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan),
++      System.currentTimeMillis()))
+ 
+     val executionUIData = listener.executionIdToData(0)
+ 
+@@ -206,7 +207,8 @@ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+       time = System.currentTimeMillis(),
+       JobSucceeded
+     ))
+-    listener.onExecutionEnd(executionId, System.currentTimeMillis())
++    listener.onOtherEvent(SparkListenerSQLExecutionEnd(
++      executionId, System.currentTimeMillis()))
+ 
+     assert(executionUIData.runningJobs.isEmpty)
+     assert(executionUIData.succeededJobs === Seq(0))
+@@ -219,19 +221,20 @@ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+     val listener = new SQLListener(sqlContext.sparkContext.conf)
+     val executionId = 0
+     val df = createTestDataFrame
+-    listener.onExecutionStart(
++    listener.onOtherEvent(SparkListenerSQLExecutionStart(
+       executionId,
+       "test",
+       "test",
+       df.queryExecution.toString,
+-      SparkPlanGraph(df.queryExecution.executedPlan),
+-      System.currentTimeMillis())
++      SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan),
++      System.currentTimeMillis()))
+     listener.onJobStart(SparkListenerJobStart(
+       jobId = 0,
+       time = System.currentTimeMillis(),
+       stageInfos = Nil,
+       createProperties(executionId)))
+-    listener.onExecutionEnd(executionId, System.currentTimeMillis())
++    listener.onOtherEvent(SparkListenerSQLExecutionEnd(
++      executionId, System.currentTimeMillis()))
+     listener.onJobEnd(SparkListenerJobEnd(
+       jobId = 0,
+       time = System.currentTimeMillis(),
+@@ -248,13 +251,13 @@ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+     val listener = new SQLListener(sqlContext.sparkContext.conf)
+     val executionId = 0
+     val df = createTestDataFrame
+-    listener.onExecutionStart(
++    listener.onOtherEvent(SparkListenerSQLExecutionStart(
+       executionId,
+       "test",
+       "test",
+       df.queryExecution.toString,
+-      SparkPlanGraph(df.queryExecution.executedPlan),
+-      System.currentTimeMillis())
++      SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan),
++      System.currentTimeMillis()))
+     listener.onJobStart(SparkListenerJobStart(
+       jobId = 0,
+       time = System.currentTimeMillis(),
+@@ -271,7 +274,8 @@ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+       time = System.currentTimeMillis(),
+       stageInfos = Nil,
+       createProperties(executionId)))
+-    listener.onExecutionEnd(executionId, System.currentTimeMillis())
++    listener.onOtherEvent(SparkListenerSQLExecutionEnd(
++      executionId, System.currentTimeMillis()))
+     listener.onJobEnd(SparkListenerJobEnd(
+       jobId = 1,
+       time = System.currentTimeMillis(),
+@@ -288,19 +292,20 @@ class SQLListenerSuite extends SparkFunSuite with SharedSQLContext {
+     val listener = new SQLListener(sqlContext.sparkContext.conf)
+     val executionId = 0
+     val df = createTestDataFrame
+-    listener.onExecutionStart(
++    listener.onOtherEvent(SparkListenerSQLExecutionStart(
+       executionId,
+       "test",
+       "test",
+       df.queryExecution.toString,
+-      SparkPlanGraph(df.queryExecution.executedPlan),
+-      System.currentTimeMillis())
++      SparkPlanInfo.fromSparkPlan(df.queryExecution.executedPlan),
++      System.currentTimeMillis()))
+     listener.onJobStart(SparkListenerJobStart(
+       jobId = 0,
+       time = System.currentTimeMillis(),
+       stageInfos = Seq.empty,
+       createProperties(executionId)))
+-    listener.onExecutionEnd(executionId, System.currentTimeMillis())
++    listener.onOtherEvent(SparkListenerSQLExecutionEnd(
++      executionId, System.currentTimeMillis()))
+     listener.onJobEnd(SparkListenerJobEnd(
+       jobId = 0,
+       time = System.currentTimeMillis(),
+@@ -338,6 +343,7 @@ class SQLListenerMemoryLeakSuite extends SparkFunSuite {
+       .set("spark.sql.ui.retainedExecutions", "50") // Set it to 50 to run this test quickly
+     val sc = new SparkContext(conf)
+     try {
++      SQLContext.clearSqlListener()
+       val sqlContext = new SQLContext(sc)
+       import sqlContext.implicits._
+       // Run 100 successful executions and 100 failed executions.
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/test/SharedSQLContext.scala b/sql/core/src/test/scala/org/apache/spark/sql/test/SharedSQLContext.scala
+index 963d10eed62ed..e7b376548787c 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/test/SharedSQLContext.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/test/SharedSQLContext.scala
+@@ -42,6 +42,7 @@ trait SharedSQLContext extends SQLTestUtils {
+    * Initialize the [[TestSQLContext]].
+    */
+   protected override def beforeAll(): Unit = {
++    SQLContext.clearSqlListener()
+     if (_ctx == null) {
+       _ctx = new TestSQLContext
+     }
+diff --git a/streaming/src/main/scala/org/apache/spark/streaming/StreamingContext.scala b/streaming/src/main/scala/org/apache/spark/streaming/StreamingContext.scala
+index 6fb8ad38abcec..cf843e3e8b8ee 100644
+--- a/streaming/src/main/scala/org/apache/spark/streaming/StreamingContext.scala
++++ b/streaming/src/main/scala/org/apache/spark/streaming/StreamingContext.scala
+@@ -699,28 +699,33 @@ class StreamingContext private[streaming] (
+         " AsynchronousListenerBus")
+     }
+     synchronized {
+-      try {
+-        state match {
+-          case INITIALIZED =>
+-            logWarning("StreamingContext has not been started yet")
+-          case STOPPED =>
+-            logWarning("StreamingContext has already been stopped")
+-          case ACTIVE =>
+-            scheduler.stop(stopGracefully)
+-            // Removing the streamingSource to de-register the metrics on stop()
+-            env.metricsSystem.removeSource(streamingSource)
+-            uiTab.foreach(_.detach())
+-            StreamingContext.setActiveContext(null)
+-            waiter.notifyStop()
+-            if (shutdownHookRef != null) {
+-              shutdownHookRefToRemove = shutdownHookRef
+-              shutdownHookRef = null
+-            }
+-            logInfo("StreamingContext stopped successfully")
+-        }
+-      } finally {
+-        // The state should always be Stopped after calling `stop()`, even if we haven't started yet
+-        state = STOPPED
++      // The state should always be Stopped after calling `stop()`, even if we haven't started yet
++      state match {
++        case INITIALIZED =>
++          logWarning("StreamingContext has not been started yet")
++          state = STOPPED
++        case STOPPED =>
++          logWarning("StreamingContext has already been stopped")
++          state = STOPPED
++        case ACTIVE =>
++          // It's important that we don't set state = STOPPED until the very end of this case,
++          // since we need to ensure that we're still able to call `stop()` to recover from
++          // a partially-stopped StreamingContext which resulted from this `stop()` call being
++          // interrupted. See SPARK-12001 for more details. Because the body of this case can be
++          // executed twice in the case of a partial stop, all methods called here need to be
++          // idempotent.
++          scheduler.stop(stopGracefully)
++          // Removing the streamingSource to de-register the metrics on stop()
++          env.metricsSystem.removeSource(streamingSource)
++          uiTab.foreach(_.detach())
++          StreamingContext.setActiveContext(null)
++          waiter.notifyStop()
++          if (shutdownHookRef != null) {
++            shutdownHookRefToRemove = shutdownHookRef
++            shutdownHookRef = null
++          }
++          logInfo("StreamingContext stopped successfully")
++          state = STOPPED
+       }
+     }
+     if (shutdownHookRefToRemove != null) {
+diff --git a/streaming/src/test/scala/org/apache/spark/streaming/InputStreamsSuite.scala b/streaming/src/test/scala/org/apache/spark/streaming/InputStreamsSuite.scala
+index 047e38ef90998..3a3176b91b1ee 100644
+--- a/streaming/src/test/scala/org/apache/spark/streaming/InputStreamsSuite.scala
++++ b/streaming/src/test/scala/org/apache/spark/streaming/InputStreamsSuite.scala
+@@ -206,28 +206,28 @@ class InputStreamsSuite extends TestSuiteBase with BeforeAndAfter {
+     val numTotalRecords = numThreads * numRecordsPerThread
+     val testReceiver = new MultiThreadTestReceiver(numThreads, numRecordsPerThread)
+     MultiThreadTestReceiver.haveAllThreadsFinished = false
+-
+-    // set up the network stream using the test receiver
+-    val ssc = new StreamingContext(conf, batchDuration)
+-    val networkStream = ssc.receiverStream[Int](testReceiver)
+-    val countStream = networkStream.count
+     val outputBuffer = new ArrayBuffer[Seq[Long]] with SynchronizedBuffer[Seq[Long]]
+-    val outputStream = new TestOutputStream(countStream, outputBuffer)
+     def output: ArrayBuffer[Long] = outputBuffer.flatMap(x => x)
+-    outputStream.register()
+-    ssc.start()
+-
+-    // Let the data from the receiver be received
+-    val clock = ssc.scheduler.clock.asInstanceOf[ManualClock]
+-    val startTime = System.currentTimeMillis()
+-    while((!MultiThreadTestReceiver.haveAllThreadsFinished || output.sum < numTotalRecords) &&
+-      System.currentTimeMillis() - startTime < 5000) {
+-      Thread.sleep(100)
+-      clock.advance(batchDuration.milliseconds)
++
++    // set up the network stream using the test receiver
++    withStreamingContext(new StreamingContext(conf, batchDuration)) { ssc =>
++      val networkStream = ssc.receiverStream[Int](testReceiver)
++      val countStream = networkStream.count
++
++      val outputStream = new TestOutputStream(countStream, outputBuffer)
++      outputStream.register()
++      ssc.start()
++
++      // Let the data from the receiver be received
++      val clock = ssc.scheduler.clock.asInstanceOf[ManualClock]
++      val startTime = System.currentTimeMillis()
++      while ((!MultiThreadTestReceiver.haveAllThreadsFinished || output.sum < numTotalRecords) &&
++        System.currentTimeMillis() - startTime < 5000) {
++        Thread.sleep(100)
++        clock.advance(batchDuration.milliseconds)
++      }
++      Thread.sleep(1000)
+     }
+-    Thread.sleep(1000)
+-    logInfo("Stopping context")
+-    ssc.stop()
+ 
+     // Verify whether data received was as expected
+     logInfo("--------------------------------")
+@@ -239,30 +239,30 @@ class InputStreamsSuite extends TestSuiteBase with BeforeAndAfter {
+   }
+ 
+   test("queue input stream - oneAtATime = true") {
+-    // Set up the streaming context and input streams
+-    val ssc = new StreamingContext(conf, batchDuration)
+-    val queue = new SynchronizedQueue[RDD[String]]()
+-    val queueStream = ssc.queueStream(queue, oneAtATime = true)
+-    val outputBuffer = new ArrayBuffer[Seq[String]] with SynchronizedBuffer[Seq[String]]
+-    val outputStream = new TestOutputStream(queueStream, outputBuffer)
+-    def output: ArrayBuffer[Seq[String]] = outputBuffer.filter(_.size > 0)
+-    outputStream.register()
+-    ssc.start()
+-
+-    // Setup data queued into the stream
+-    val clock = ssc.scheduler.clock.asInstanceOf[ManualClock]
+     val input = Seq("1", "2", "3", "4", "5")
+     val expectedOutput = input.map(Seq(_))
++    val outputBuffer = new ArrayBuffer[Seq[String]] with SynchronizedBuffer[Seq[String]]
++    def output: ArrayBuffer[Seq[String]] = outputBuffer.filter(_.size > 0)
+ 
+-    val inputIterator = input.toIterator
+-    for (i <- 0 until input.size) {
+-      // Enqueue more than 1 item per tick but they should dequeue one at a time
+-      inputIterator.take(2).foreach(i => queue += ssc.sparkContext.makeRDD(Seq(i)))
+-      clock.advance(batchDuration.milliseconds)
++    // Set up the streaming context and input streams
++    withStreamingContext(new StreamingContext(conf, batchDuration)) { ssc =>
++      val queue = new SynchronizedQueue[RDD[String]]()
++      val queueStream = ssc.queueStream(queue, oneAtATime = true)
++      val outputStream = new TestOutputStream(queueStream, outputBuffer)
++      outputStream.register()
++      ssc.start()
++
++      // Setup data queued into the stream
++      val clock = ssc.scheduler.clock.asInstanceOf[ManualClock]
++
++      val inputIterator = input.toIterator
++      for (i <- 0 until input.size) {
++        // Enqueue more than 1 item per tick but they should dequeue one at a time
++        inputIterator.take(2).foreach(i => queue += ssc.sparkContext.makeRDD(Seq(i)))
++        clock.advance(batchDuration.milliseconds)
++      }
++      Thread.sleep(1000)
+     }
+-    Thread.sleep(1000)
+-    logInfo("Stopping context")
+-    ssc.stop()
+ 
+     // Verify whether data received was as expected
+     logInfo("--------------------------------")
+@@ -282,33 +282,33 @@ class InputStreamsSuite extends TestSuiteBase with BeforeAndAfter {
+   }
+ 
+   test("queue input stream - oneAtATime = false") {
+-    // Set up the streaming context and input streams
+-    val ssc = new StreamingContext(conf, batchDuration)
+-    val queue = new SynchronizedQueue[RDD[String]]()
+-    val queueStream = ssc.queueStream(queue, oneAtATime = false)
+     val outputBuffer = new ArrayBuffer[Seq[String]] with SynchronizedBuffer[Seq[String]]
+-    val outputStream = new TestOutputStream(queueStream, outputBuffer)
+     def output: ArrayBuffer[Seq[String]] = outputBuffer.filter(_.size > 0)
+-    outputStream.register()
+-    ssc.start()
+-
+-    // Setup data queued into the stream
+-    val clock = ssc.scheduler.clock.asInstanceOf[ManualClock]
+     val input = Seq("1", "2", "3", "4", "5")
+     val expectedOutput = Seq(Seq("1", "2", "3"), Seq("4", "5"))
+ 
+-    // Enqueue the first 3 items (one by one), they should be merged in the next batch
+-    val inputIterator = input.toIterator
+-    inputIterator.take(3).foreach(i => queue += ssc.sparkContext.makeRDD(Seq(i)))
+-    clock.advance(batchDuration.milliseconds)
+-    Thread.sleep(1000)
+-
+-    // Enqueue the remaining items (again one by one), merged in the final batch
+-    inputIterator.foreach(i => queue += ssc.sparkContext.makeRDD(Seq(i)))
+-    clock.advance(batchDuration.milliseconds)
+-    Thread.sleep(1000)
+-    logInfo("Stopping context")
+-    ssc.stop()
++    // Set up the streaming context and input streams
++    withStreamingContext(new StreamingContext(conf, batchDuration)) { ssc =>
++      val queue = new SynchronizedQueue[RDD[String]]()
++      val queueStream = ssc.queueStream(queue, oneAtATime = false)
++      val outputStream = new TestOutputStream(queueStream, outputBuffer)
++      outputStream.register()
++      ssc.start()
++
++      // Setup data queued into the stream
++      val clock = ssc.scheduler.clock.asInstanceOf[ManualClock]
++
++      // Enqueue the first 3 items (one by one), they should be merged in the next batch
++      val inputIterator = input.toIterator
++      inputIterator.take(3).foreach(i => queue += ssc.sparkContext.makeRDD(Seq(i)))
++      clock.advance(batchDuration.milliseconds)
++      Thread.sleep(1000)
++
++      // Enqueue the remaining items (again one by one), merged in the final batch
++      inputIterator.foreach(i => queue += ssc.sparkContext.makeRDD(Seq(i)))
++      clock.advance(batchDuration.milliseconds)
++      Thread.sleep(1000)
++    }
+ 
+     // Verify whether data received was as expected
+     logInfo("--------------------------------")
+diff --git a/yarn/src/main/scala/org/apache/spark/deploy/yarn/ApplicationMaster.scala b/yarn/src/main/scala/org/apache/spark/deploy/yarn/ApplicationMaster.scala
+index 50ae7ffeec4c5..13ef4dfd64165 100644
+--- a/yarn/src/main/scala/org/apache/spark/deploy/yarn/ApplicationMaster.scala
++++ b/yarn/src/main/scala/org/apache/spark/deploy/yarn/ApplicationMaster.scala
+@@ -117,6 +117,10 @@ private[spark] class ApplicationMaster(
+ 
+   private var delegationTokenRenewerOption: Option[AMDelegationTokenRenewer] = None
+ 
++  def getAttemptId(): ApplicationAttemptId = {
++    client.getAttemptId()
++  }
++
+   final def run(): Int = {
+     try {
+       val appAttemptId = client.getAttemptId()
+@@ -662,6 +666,10 @@ object ApplicationMaster extends Logging {
+     master.sparkContextStopped(sc)
+   }
+ 
++  private[spark] def getAttemptId(): ApplicationAttemptId = {
++    master.getAttemptId
++  }
++
+ }
+ 
+ /**
+diff --git a/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala b/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala
+index 73cd9031f0250..4e044aa4788da 100644
+--- a/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala
++++ b/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala
+@@ -25,8 +25,6 @@ import scala.collection.mutable
+ import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
+ import scala.collection.JavaConverters._
+ 
+-import com.google.common.util.concurrent.ThreadFactoryBuilder
+-
+ import org.apache.hadoop.conf.Configuration
+ import org.apache.hadoop.yarn.api.records._
+ import org.apache.hadoop.yarn.client.api.AMRMClient
+@@ -40,7 +38,7 @@ import org.apache.spark.deploy.yarn.YarnSparkHadoopUtil._
+ import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef}
+ import org.apache.spark.scheduler.{ExecutorExited, ExecutorLossReason}
+ import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RemoveExecutor
+-import org.apache.spark.util.Utils
++import org.apache.spark.util.ThreadUtils
+ 
+ /**
+  * YarnAllocator is charged with requesting containers from the YARN ResourceManager and deciding
+@@ -117,13 +115,9 @@ private[yarn] class YarnAllocator(
+   // Resource capability requested for each executors
+   private[yarn] val resource = Resource.newInstance(executorMemory + memoryOverhead, executorCores)
+ 
+-  private val launcherPool = new ThreadPoolExecutor(
+-    // max pool size of Integer.MAX_VALUE is ignored because we use an unbounded queue
+-    sparkConf.getInt("spark.yarn.containerLauncherMaxThreads", 25), Integer.MAX_VALUE,
+-    1, TimeUnit.MINUTES,
+-    new LinkedBlockingQueue[Runnable](),
+-    new ThreadFactoryBuilder().setNameFormat("ContainerLauncher #%d").setDaemon(true).build())
+-  launcherPool.allowCoreThreadTimeOut(true)
++  private val launcherPool = ThreadUtils.newDaemonCachedThreadPool(
++    "ContainerLauncher",
++    sparkConf.getInt("spark.yarn.containerLauncherMaxThreads", 25))
+ 
+   // For testing
+   private val launchContainers = sparkConf.getBoolean("spark.yarn.launchContainers", true)
+diff --git a/yarn/src/main/scala/org/apache/spark/scheduler/cluster/SchedulerExtensionService.scala b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/SchedulerExtensionService.scala
+new file mode 100644
+index 0000000000000..c064521845399
+--- /dev/null
++++ b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/SchedulerExtensionService.scala
+@@ -0,0 +1,154 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.scheduler.cluster
++
++import java.util.concurrent.atomic.AtomicBoolean
++
++import org.apache.hadoop.yarn.api.records.{ApplicationAttemptId, ApplicationId}
++
++import org.apache.spark.{Logging, SparkContext}
++import org.apache.spark.util.Utils
++
++/**
++ * An extension service that can be loaded into a Spark YARN scheduler.
++ * A Service that can be started and stopped.
++ *
++ * 1. For implementations to be loadable by `SchedulerExtensionServices`,
++ * they must provide an empty constructor.
++ * 2. The `stop()` operation MUST be idempotent, and succeed even if `start()` was
++ * never invoked.
++ */
++trait SchedulerExtensionService {
++
++  /**
++   * Start the extension service. This should be a no-op if
++   * called more than once.
++   * @param binding binding to the spark application and YARN
++   */
++  def start(binding: SchedulerExtensionServiceBinding): Unit
++
++  /**
++   * Stop the service
++   * The `stop()` operation MUST be idempotent, and succeed even if `start()` was
++   * never invoked.
++   */
++  def stop(): Unit
++}
++
++/**
++ * Binding information for a [[SchedulerExtensionService]].
++ *
++ * The attempt ID will be set if the service is started within a YARN application master;
++ * there is then a different attempt ID for every time that AM is restarted.
++ * When the service binding is instantiated in client mode, there's no attempt ID, as it lacks
++ * this information.
++ * @param sparkContext current spark context
++ * @param applicationId YARN application ID
++ * @param attemptId YARN attemptID. This will always be unset in client mode, and always set in
++ *                  cluster mode.
++ */
++case class SchedulerExtensionServiceBinding(
++    sparkContext: SparkContext,
++    applicationId: ApplicationId,
++    attemptId: Option[ApplicationAttemptId] = None)
++
++/**
++ * Container for [[SchedulerExtensionService]] instances.
++ *
++ * Loads Extension Services from the configuration property
++ * `"spark.yarn.services"`, instantiates and starts them.
++ * When stopped, it stops all child entries.
++ *
++ * The order in which child extension services are started and stopped
++ * is undefined.
++ */
++private[spark] class SchedulerExtensionServices extends SchedulerExtensionService
++    with Logging {
++  private var serviceOption: Option[String] = None
++  private var services: List[SchedulerExtensionService] = Nil
++  private val started = new AtomicBoolean(false)
++  private var binding: SchedulerExtensionServiceBinding = _
++
++  /**
++   * Binding operation will load the named services and call bind on them too; the
++   * entire set of services are then ready for `init()` and `start()` calls.
++   *
++   * @param binding binding to the spark application and YARN
++   */
++  def start(binding: SchedulerExtensionServiceBinding): Unit = {
++    if (started.getAndSet(true)) {
++      logWarning("Ignoring re-entrant start operation")
++      return
++    }
++    require(binding.sparkContext != null, "Null context parameter")
++    require(binding.applicationId != null, "Null appId parameter")
++    this.binding = binding
++    val sparkContext = binding.sparkContext
++    val appId = binding.applicationId
++    val attemptId = binding.attemptId
++    logInfo(s"Starting Yarn extension services with app $appId and attemptId $attemptId")
++
++    serviceOption = sparkContext.getConf.getOption(SchedulerExtensionServices.SPARK_YARN_SERVICES)
++    services = serviceOption
++      .map { s =>
++        s.split(",").map(_.trim()).filter(!_.isEmpty)
++          .map { sClass =>
++            val instance = Utils.classForName(sClass)
++              .newInstance()
++              .asInstanceOf[SchedulerExtensionService]
++            // bind this service
++            instance.start(binding)
++            logInfo(s"Service $sClass started")
++            instance
++          }.toList
++      }.getOrElse(Nil)
++  }
++
++  /**
++   * Get the list of services.
++   *
++   * @return a list of services; Nil until the service is started
++   */
++  def getServices: List[SchedulerExtensionService] = services
++
++  /**
++   * Stop the services; idempotent.
++   *
++   */
++  override def stop(): Unit = {
++    if (started.getAndSet(false)) {
++      logInfo(s"Stopping $this")
++      services.foreach { s =>
++        Utils.tryLogNonFatalError(s.stop())
++      }
++    }
++  }
++
++  override def toString(): String = s"""SchedulerExtensionServices
++    |(serviceOption=$serviceOption,
++    | services=$services,
++    | started=$started)""".stripMargin
++}
++
++private[spark] object SchedulerExtensionServices {
++
++  /**
++   * A list of comma separated services to instantiate in the scheduler
++   */
++  val SPARK_YARN_SERVICES = "spark.yarn.services"
++}
+diff --git a/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClientSchedulerBackend.scala b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClientSchedulerBackend.scala
+index 20771f655473c..0e27a2665e939 100644
+--- a/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClientSchedulerBackend.scala
++++ b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClientSchedulerBackend.scala
+@@ -19,7 +19,7 @@ package org.apache.spark.scheduler.cluster
+ 
+ import scala.collection.mutable.ArrayBuffer
+ 
+-import org.apache.hadoop.yarn.api.records.{ApplicationId, YarnApplicationState}
++import org.apache.hadoop.yarn.api.records.YarnApplicationState
+ 
+ import org.apache.spark.{SparkException, Logging, SparkContext}
+ import org.apache.spark.deploy.yarn.{Client, ClientArguments, YarnSparkHadoopUtil}
+@@ -33,7 +33,6 @@ private[spark] class YarnClientSchedulerBackend(
+   with Logging {
+ 
+   private var client: Client = null
+-  private var appId: ApplicationId = null
+   private var monitorThread: MonitorThread = null
+ 
+   /**
+@@ -54,13 +53,12 @@ private[spark] class YarnClientSchedulerBackend(
+     val args = new ClientArguments(argsArrayBuf.toArray, conf)
+     totalExpectedExecutors = args.numExecutors
+     client = new Client(args, conf)
+-    appId = client.submitApplication()
++    bindToYarn(client.submitApplication(), None)
+ 
+     // SPARK-8687: Ensure all necessary properties have already been set before
+     // we initialize our driver scheduler backend, which serves these properties
+     // to the executors
+     super.start()
+-
+     waitForApplication()
+ 
+     // SPARK-8851: In yarn-client mode, the AM still does the credentials refresh. The driver
+@@ -116,8 +114,8 @@ private[spark] class YarnClientSchedulerBackend(
+    * This assumes both `client` and `appId` have already been set.
+    */
+   private def waitForApplication(): Unit = {
+-    assert(client != null && appId != null, "Application has not been submitted yet!")
+-    val (state, _) = client.monitorApplication(appId, returnOnRunning = true) // blocking
++    assert(client != null && appId.isDefined, "Application has not been submitted yet!")
++    val (state, _) = client.monitorApplication(appId.get, returnOnRunning = true) // blocking
+     if (state == YarnApplicationState.FINISHED ||
+       state == YarnApplicationState.FAILED ||
+       state == YarnApplicationState.KILLED) {
+@@ -125,7 +123,7 @@ private[spark] class YarnClientSchedulerBackend(
+         "It might have been killed or unable to launch application master.")
+     }
+     if (state == YarnApplicationState.RUNNING) {
+-      logInfo(s"Application $appId has started running.")
++      logInfo(s"Application ${appId.get} has started running.")
+     }
+   }
+ 
+@@ -141,7 +139,7 @@ private[spark] class YarnClientSchedulerBackend(
+ 
+     override def run() {
+       try {
+-        val (state, _) = client.monitorApplication(appId, logApplicationReport = false)
++        val (state, _) = client.monitorApplication(appId.get, logApplicationReport = false)
+         logError(s"Yarn application has already exited with state $state!")
+         allowInterrupt = false
+         sc.stop()
+@@ -163,7 +161,7 @@ private[spark] class YarnClientSchedulerBackend(
+    * This assumes both `client` and `appId` have already been set.
+    */
+   private def asyncMonitorApplication(): MonitorThread = {
+-    assert(client != null && appId != null, "Application has not been submitted yet!")
++    assert(client != null && appId.isDefined, "Application has not been submitted yet!")
+     val t = new MonitorThread
+     t.setName("Yarn application state monitor")
+     t.setDaemon(true)
+@@ -193,10 +191,4 @@ private[spark] class YarnClientSchedulerBackend(
+     logInfo("Stopped")
+   }
+ 
+-  override def applicationId(): String = {
+-    Option(appId).map(_.toString).getOrElse {
+-      logWarning("Application ID is not initialized yet.")
+-      super.applicationId
+-    }
+-  }
+ }
+diff --git a/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClusterSchedulerBackend.scala b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClusterSchedulerBackend.scala
+index 50b699f11b21c..ced597bed36d9 100644
+--- a/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClusterSchedulerBackend.scala
++++ b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnClusterSchedulerBackend.scala
+@@ -21,7 +21,7 @@ import org.apache.hadoop.yarn.api.ApplicationConstants.Environment
+ import org.apache.hadoop.yarn.conf.YarnConfiguration
+ 
+ import org.apache.spark.SparkContext
+-import org.apache.spark.deploy.yarn.YarnSparkHadoopUtil
++import org.apache.spark.deploy.yarn.{ApplicationMaster, YarnSparkHadoopUtil}
+ import org.apache.spark.scheduler.TaskSchedulerImpl
+ import org.apache.spark.util.Utils
+ 
+@@ -31,26 +31,12 @@ private[spark] class YarnClusterSchedulerBackend(
+   extends YarnSchedulerBackend(scheduler, sc) {
+ 
+   override def start() {
++    val attemptId = ApplicationMaster.getAttemptId
++    bindToYarn(attemptId.getApplicationId(), Some(attemptId))
+     super.start()
+     totalExpectedExecutors = YarnSparkHadoopUtil.getInitialTargetExecutorNumber(sc.conf)
+   }
+ 
+-  override def applicationId(): String =
+-    // In YARN Cluster mode, the application ID is expected to be set, so log an error if it's
+-    // not found.
+-    sc.getConf.getOption("spark.yarn.app.id").getOrElse {
+-      logError("Application ID is not set.")
+-      super.applicationId
+-    }
+-
+-  override def applicationAttemptId(): Option[String] =
+-    // In YARN Cluster mode, the attempt ID is expected to be set, so log an error if it's
+-    // not found.
+-    sc.getConf.getOption("spark.yarn.app.attemptId").orElse {
+-      logError("Application attempt ID is not set.")
+-      super.applicationAttemptId
+-    }
+-
+   override def getDriverLogUrls: Option[Map[String, String]] = {
+     var driverLogs: Option[Map[String, String]] = None
+     try {
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/cluster/YarnSchedulerBackend.scala b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnSchedulerBackend.scala
+similarity index 81%
+rename from core/src/main/scala/org/apache/spark/scheduler/cluster/YarnSchedulerBackend.scala
+rename to yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnSchedulerBackend.scala
+index 80da37b09b590..e3dd87798f018 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/cluster/YarnSchedulerBackend.scala
++++ b/yarn/src/main/scala/org/apache/spark/scheduler/cluster/YarnSchedulerBackend.scala
+@@ -17,17 +17,17 @@
+ 
+ package org.apache.spark.scheduler.cluster
+ 
+-import scala.collection.mutable.ArrayBuffer
+-import scala.concurrent.{Future, ExecutionContext}
++import scala.concurrent.{ExecutionContext, Future}
++import scala.util.control.NonFatal
++
++import org.apache.hadoop.yarn.api.records.{ApplicationAttemptId, ApplicationId}
+ 
+ import org.apache.spark.{Logging, SparkContext}
+ import org.apache.spark.rpc._
+-import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
+ import org.apache.spark.scheduler._
++import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
+ import org.apache.spark.ui.JettyUtils
+-import org.apache.spark.util.{ThreadUtils, RpcUtils}
+-
+-import scala.util.control.NonFatal
++import org.apache.spark.util.{RpcUtils, ThreadUtils}
+ 
+ /**
+  * Abstract Yarn scheduler backend that contains common logic
+@@ -51,6 +51,64 @@ private[spark] abstract class YarnSchedulerBackend(
+ 
+   private implicit val askTimeout = RpcUtils.askRpcTimeout(sc.conf)
+ 
++  /** Application ID. */
++  protected var appId: Option[ApplicationId] = None
++
++  /** Attempt ID. This is unset for client-mode schedulers */
++  private var attemptId: Option[ApplicationAttemptId] = None
++
++  /** Scheduler extension services. */
++  private val services: SchedulerExtensionServices = new SchedulerExtensionServices()
++
++  /**
++   * Bind to YARN. This *must* be done before calling [[start()]].
++   *
++   * @param appId YARN application ID
++   * @param attemptId Optional YARN attempt ID
++   */
++  protected def bindToYarn(appId: ApplicationId, attemptId: Option[ApplicationAttemptId]): Unit = {
++    this.appId = Some(appId)
++    this.attemptId = attemptId
++  }
++
++  override def start() {
++    require(appId.isDefined, "application ID unset")
++    val binding = SchedulerExtensionServiceBinding(sc, appId.get, attemptId)
++    services.start(binding)
++    super.start()
++  }
++
++  override def stop(): Unit = {
++    try {
++      super.stop()
++    } finally {
++      services.stop()
++    }
++  }
++
++  /**
++   * Get the attempt ID for this run, if the cluster manager supports multiple
++   * attempts. Applications run in client mode will not have attempt IDs.
++   *
++   * @return The application attempt id, if available.
++   */
++  override def applicationAttemptId(): Option[String] = {
++    attemptId.map(_.toString)
++  }
++
++  /**
++   * Get an application ID associated with the job.
++   * This returns the string value of [[appId]] if set, otherwise
++   * the locally-generated ID from the superclass.
++   * @return The application ID
++   */
++  override def applicationId(): String = {
++    appId.map(_.toString).getOrElse {
++      logWarning("Application ID is not initialized yet.")
++      super.applicationId
++    }
++  }
++
+   /**
+    * Request executors from the ApplicationMaster by specifying the total number desired.
+    * This includes executors already pending or running.
+diff --git a/yarn/src/test/scala/org/apache/spark/scheduler/cluster/ExtensionServiceIntegrationSuite.scala b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/ExtensionServiceIntegrationSuite.scala
+new file mode 100644
+index 0000000000000..b4d1b0a3d22a7
+--- /dev/null
++++ b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/ExtensionServiceIntegrationSuite.scala
+@@ -0,0 +1,71 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.scheduler.cluster
++
++import org.scalatest.BeforeAndAfter
++
++import org.apache.spark.{LocalSparkContext, Logging, SparkConf, SparkContext, SparkFunSuite}
++
++/**
++ * Test the integration with [[SchedulerExtensionServices]]
++ */
++class ExtensionServiceIntegrationSuite extends SparkFunSuite
++  with LocalSparkContext with BeforeAndAfter
++  with Logging {
++
++  val applicationId = new StubApplicationId(0, 1111L)
++  val attemptId = new StubApplicationAttemptId(applicationId, 1)
++
++  /*
++   * Setup phase creates the spark context
++   */
++  before {
++    val sparkConf = new SparkConf()
++    sparkConf.set(SchedulerExtensionServices.SPARK_YARN_SERVICES,
++      classOf[SimpleExtensionService].getName())
++    sparkConf.setMaster("local").setAppName("ExtensionServiceIntegrationSuite")
++    sc = new SparkContext(sparkConf)
++  }
++
++  test("Instantiate") {
++    val services = new SchedulerExtensionServices()
++    assertResult(Nil, "non-nil service list") {
++      services.getServices
++    }
++    services.start(SchedulerExtensionServiceBinding(sc, applicationId))
++    services.stop()
++  }
++
++  test("Contains SimpleExtensionService Service") {
++    val services = new SchedulerExtensionServices()
++    try {
++      services.start(SchedulerExtensionServiceBinding(sc, applicationId))
++      val serviceList = services.getServices
++      assert(serviceList.nonEmpty, "empty service list")
++      val (service :: Nil) = serviceList
++      val simpleService = service.asInstanceOf[SimpleExtensionService]
++      assert(simpleService.started.get, "service not started")
++      services.stop()
++      assert(!simpleService.started.get, "service not stopped")
++    } finally {
++      services.stop()
++    }
++  }
++}
++
++
+diff --git a/yarn/src/test/scala/org/apache/spark/scheduler/cluster/SimpleExtensionService.scala b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/SimpleExtensionService.scala
+new file mode 100644
+index 0000000000000..9b8c98cda8da8
+--- /dev/null
++++ b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/SimpleExtensionService.scala
+@@ -0,0 +1,34 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.scheduler.cluster
++
++import java.util.concurrent.atomic.AtomicBoolean
++
++private[spark] class SimpleExtensionService extends SchedulerExtensionService {
++
++  /** started flag; set in the `start()` call, stopped in `stop()`. */
++  val started = new AtomicBoolean(false)
++
++  override def start(binding: SchedulerExtensionServiceBinding): Unit = {
++    started.set(true)
++  }
++
++  override def stop(): Unit = {
++    started.set(false)
++  }
++}
+diff --git a/yarn/src/test/scala/org/apache/spark/scheduler/cluster/StubApplicationAttemptId.scala b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/StubApplicationAttemptId.scala
+new file mode 100644
+index 0000000000000..4b57b9509a655
+--- /dev/null
++++ b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/StubApplicationAttemptId.scala
+@@ -0,0 +1,48 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.scheduler.cluster
++
++import org.apache.hadoop.yarn.api.records.{ApplicationAttemptId, ApplicationId}
++
++/**
++ * A stub application ID; can be set in constructor and/or updated later.
++ * @param applicationId application ID
++ * @param attempt an attempt counter
++ */
++class StubApplicationAttemptId(var applicationId: ApplicationId, var attempt: Int)
++    extends ApplicationAttemptId {
++
++  override def setApplicationId(appID: ApplicationId): Unit = {
++    applicationId = appID
++  }
++
++  override def getAttemptId: Int = {
++    attempt
++  }
++
++  override def setAttemptId(attemptId: Int): Unit = {
++    attempt = attemptId
++  }
++
++  override def getApplicationId: ApplicationId = {
++    applicationId
++  }
++
++  override def build(): Unit = {
++  }
++}
+diff --git a/yarn/src/test/scala/org/apache/spark/scheduler/cluster/StubApplicationId.scala b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/StubApplicationId.scala
+new file mode 100644
+index 0000000000000..bffa0e09befd2
+--- /dev/null
++++ b/yarn/src/test/scala/org/apache/spark/scheduler/cluster/StubApplicationId.scala
+@@ -0,0 +1,42 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.scheduler.cluster
++
++import org.apache.hadoop.yarn.api.records.ApplicationId
++
++/**
++ * Simple Testing Application Id; ID and cluster timestamp are set in constructor
++ * and cannot be updated.
++ * @param id app id
++ * @param clusterTimestamp timestamp
++ */
++private[spark] class StubApplicationId(id: Int, clusterTimestamp: Long) extends ApplicationId {
++  override def getId: Int = {
++    id
++  }
++
++  override def getClusterTimestamp: Long = {
++    clusterTimestamp
++  }
++
++  override def setId(id: Int): Unit = {}
++
++  override def setClusterTimestamp(clusterTimestamp: Long): Unit = {}
++
++  override def build(): Unit = {}
++}

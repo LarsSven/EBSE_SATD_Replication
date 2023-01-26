@@ -1,0 +1,98 @@
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousRateStreamSource.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousRateStreamSource.scala
+index d55f71c7be830..e3c8484d82732 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousRateStreamSource.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousRateStreamSource.scala
+@@ -17,6 +17,8 @@
+ 
+ package org.apache.spark.sql.execution.streaming.continuous
+ 
++import java.util.concurrent.atomic.AtomicLong
++
+ import org.json4s.DefaultFormats
+ import org.json4s.jackson.Serialization
+ 
+@@ -36,6 +38,8 @@ class RateStreamContinuousStream(rowsPerSecond: Long, numPartitions: Int) extend
+ 
+   val perPartitionRate = rowsPerSecond.toDouble / numPartitions.toDouble
+ 
++  val highestCommittedValue = new AtomicLong(Long.MinValue)
++
+   override def mergeOffsets(offsets: Array[PartitionOffset]): Offset = {
+     assert(offsets.length == numPartitions)
+     val tuples = offsets.map {
+@@ -82,7 +86,15 @@ class RateStreamContinuousStream(rowsPerSecond: Long, numPartitions: Int) extend
+     RateStreamContinuousReaderFactory
+   }
+ 
+-  override def commit(end: Offset): Unit = {}
++  override def commit(end: Offset): Unit = {
++    end.asInstanceOf[RateStreamOffset].partitionToValueAndRunTimeMs.foreach {
++      case (_, ValueRunTimeMsPair(value, _)) =>
++        if (highestCommittedValue.get() < value) {
++          highestCommittedValue.set(value)
++        }
++    }
++  }
++
+   override def stop(): Unit = {}
+ 
+   private def createInitialOffset(numPartitions: Int, creationTimeMs: Long) = {
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/streaming/continuous/ContinuousSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/streaming/continuous/ContinuousSuite.scala
+index 56274e8381655..db1be4cf28628 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/streaming/continuous/ContinuousSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/streaming/continuous/ContinuousSuite.scala
+@@ -45,18 +45,35 @@ class ContinuousSuiteBase extends StreamTest {
+           case ContinuousScanExec(_, _, r: RateStreamContinuousStream, _) => r
+         }.get
+ 
+-        // Adding 3s in case of slow initialization of partition reader - rows will be committed
+-        // on epoch which they're written.
+-        // Since previous epochs should be committed before to commit the epoch which output rows
+-        // are written, slow initialization of partition reader and tiny trigger interval leads
+-        // output rows to wait long time to be committed.
+-        val deltaMs = numTriggers * 1000 + 3000
++        val deltaMs = numTriggers * 1000 + 300
+         while (System.currentTimeMillis < reader.creationTime + deltaMs) {
+           Thread.sleep(reader.creationTime + deltaMs - System.currentTimeMillis)
+         }
+     }
+   }
+ 
++  protected def waitForRateSourceCommittedValue(
++      query: StreamExecution,
++      desiredValue: Long,
++      maxWaitTimeMs: Long): Unit = {
++    query match {
++      case s: ContinuousExecution =>
++        val reader = s.lastExecution.executedPlan.collectFirst {
++          case ContinuousScanExec(_, _, r: RateStreamContinuousStream, _) => r
++        }.get
++
++        val startTime = System.currentTimeMillis()
++        while (System.currentTimeMillis() < (startTime + maxWaitTimeMs) &&
++          reader.highestCommittedValue.get() < desiredValue) {
++          Thread.sleep(100)
++        }
++        if (System.currentTimeMillis() > (startTime + maxWaitTimeMs)) {
++          logWarning(s"Couldn't reach desired value in $maxWaitTimeMs milliseconds!" +
++            s"Current highest committed value is ${reader.highestCommittedValue}")
++        }
++    }
++  }
++
+   // A continuous trigger that will only fire the initial time for the duration of a test.
+   // This allows clean testing with manual epoch advancement.
+   protected val longContinuousTrigger = Trigger.Continuous("1 hour")
+@@ -221,10 +238,9 @@ class ContinuousSuite extends ContinuousSuiteBase {
+       .queryName("noharness")
+       .trigger(Trigger.Continuous(100))
+       .start()
+-    val continuousExecution =
++    val ce =
+       query.asInstanceOf[StreamingQueryWrapper].streamingQuery.asInstanceOf[ContinuousExecution]
+-    continuousExecution.awaitEpoch(0)
+-    waitForRateSourceTriggers(continuousExecution, 2)
++    waitForRateSourceCommittedValue(ce, 3, 20 * 1000)
+     query.stop()
+ 
+     val results = spark.read.table("noharness").collect()

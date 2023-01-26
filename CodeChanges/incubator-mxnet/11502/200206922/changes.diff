@@ -1,0 +1,94 @@
+diff --git a/src/operator/contrib/sync_batch_norm-inl.h b/src/operator/contrib/sync_batch_norm-inl.h
+index c2be8b4da492..1f548dbc7e5e 100644
+--- a/src/operator/contrib/sync_batch_norm-inl.h
++++ b/src/operator/contrib/sync_batch_norm-inl.h
+@@ -95,7 +95,7 @@ class SharedND {
+   }
+ 
+   ~SharedND() {
+-    mshadow::FreeSpace(&mean_);
++    if (data_inited_) mshadow::FreeSpace(&mean_);
+     delete [] flag_;
+     delete [] data_;
+   }
+@@ -112,6 +112,7 @@ class SharedND {
+   }
+ 
+   T* Retrieve(mshadow::Shape<1> shape, int index) {
++    // Retrieve a pointer for copying values
+     if (!data_inited_) {
+       Init(shape);
+     }
+@@ -123,6 +124,7 @@ class SharedND {
+   }
+ 
+   bool SetReady(int index) {
++    // Set data ready after copying
+     if (flag_[index] == false) {
+       flag_[index] = true;
+       return true;
+@@ -132,6 +134,7 @@ class SharedND {
+   }
+ 
+   T Pop(int index) {
++    // Pop the mean value after suming up
+     std::lock_guard<std::mutex> lock(mutex_);
+     while (!MeanReady()) {}
+     flag_[index] = false;
+@@ -384,7 +387,6 @@ class SyncBatchNorm : public Operator {
+           mshadow::Shape2(5, mean.shape_[0]), s);
+       Tensor<xpu, 1> gmean = workspace[0];
+       Tensor<xpu, 1> gvar = workspace[1];
+-      // Tensor<xpu, 1> tmp = workspace[2];
+ 
+       moving_mean = moving_mean * param_.momentum + mean * (1 - param_.momentum);
+       moving_var = moving_var * param_.momentum + var * (1 - param_.momentum);
+diff --git a/tests/python/gpu/test_operator_gpu.py b/tests/python/gpu/test_operator_gpu.py
+index cf3defb1cc2b..46ff92dfcc22 100644
+--- a/tests/python/gpu/test_operator_gpu.py
++++ b/tests/python/gpu/test_operator_gpu.py
+@@ -1911,12 +1911,6 @@ def test_context_num_gpus():
+ 
+ def _check_batchnorm_result(input, num_devices=1, cuda=False):
+     from mxnet.gluon.utils import split_and_load
+-    def _assert_tensor_close(a, b, atol=1e-3, rtol=1e-3):
+-        npa, npb = a.asnumpy(), b.asnumpy()
+-        assert np.allclose(npa, npb, rtol=rtol, atol=atol), \
+-            'Tensor close check failed\n{}\n{}\nadiff={}, rdiff={}'.format(
+-                a, b, np.abs(npa - npb).max(), np.abs((npa - npb) / np.fmax(npa, 1e-5)).max())
+-
+     def _find_bn(module):
+         if isinstance(module, (mx.gluon.nn.BatchNorm, mx.gluon.contrib.nn.SyncBatchNorm)):
+             return module
+@@ -1951,7 +1945,6 @@ def _syncParameters(bn1, bn2, ctx):
+     # using the same values for gamma and beta
+     #_syncParameters(_find_bn(bn1), _find_bn(bn2), ctx_list[0])
+ 
+-
+     input1.attach_grad()
+     inputs2 = split_and_load(input2, ctx_list, batch_axis=0)
+     for xi in inputs2:
+@@ -1967,16 +1960,14 @@ def _syncParameters(bn1, bn2, ctx):
+ 
+     output2 = mx.nd.concat(*[output.as_in_context(input.context) for output in output2], dim=0)
+     # assert forwarding
+-    _assert_tensor_close(input1, input2)
+-    _assert_tensor_close(output1, output2)
+-    _assert_tensor_close(_find_bn(bn1).running_mean.data(ctx_list[0]),
+-                         _find_bn(bn2).running_mean.data(ctx_list[0]))
+-    _assert_tensor_close(_find_bn(bn1).running_var.data(ctx_list[0]),
+-                         _find_bn(bn2).running_var.data(ctx_list[0]))
++    assert_almost_equal(input1, input2, atol=1e-3, rtol=1e-3)
++    assert_almost_equal(output1, output2, atol=1e-3, rtol=1e-3)
++    assert_almost_equal(_find_bn(bn1).running_mean.data(ctx_list[0], atol=1e-3, rtol=1e-3),
++                         _find_bn(bn2).running_mean.data(ctx_list[0]), atol=1e-3, rtol=1e-3)
++    assert_almost_equal(_find_bn(bn1).running_var.data(ctx_list[0]),
++                         _find_bn(bn2).running_var.data(ctx_list[0]), atol=1e-3, rtol=1e-3)
+     input2grad = mx.nd.concat(*[output.grad.as_in_context(input.context) for output in inputs2], dim=0)
+-    #print('input1.grad', input1.grad)
+-    #print('input2grad', input2grad)
+-    _assert_tensor_close(input1.grad, input2grad)
++    assert_almost_equal(input1.grad, input2grad, atol=1e-3, rtol=1e-3)
+ 
+ def test_sync_batchnorm():
+     def get_num_devices():

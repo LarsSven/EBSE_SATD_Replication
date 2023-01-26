@@ -1,0 +1,472 @@
+diff --git a/core/src/main/scala/kafka/cluster/Partition.scala b/core/src/main/scala/kafka/cluster/Partition.scala
+index 1e218630328..7490009795b 100755
+--- a/core/src/main/scala/kafka/cluster/Partition.scala
++++ b/core/src/main/scala/kafka/cluster/Partition.scala
+@@ -133,7 +133,6 @@ object Partition extends KafkaMetricsGroup {
+       replicaManager.delayedFetchPurgatory,
+       replicaManager.delayedDeleteRecordsPurgatory)
+ 
+-
+     new Partition(topicPartition,
+       replicaLagTimeMaxMs = replicaManager.config.replicaLagTimeMaxMs,
+       interBrokerProtocolVersion = replicaManager.config.interBrokerProtocolVersion,
+@@ -226,6 +225,7 @@ class Partition(val topicPartition: TopicPartition,
+ 
+   // This optional set has a dual purpose. When it is None, we know there is not an AlterIsr request in-flight. When
+   // not None, there is an AlterIsr request in flight and values of the Set include a "maximal" or "effective" ISR.
++  // Updates to set should always be protected by the leaderIsrUpdateLock lock
+   @volatile var pendingInSyncReplicaIds: Option[Set[Int]] = None
+ 
+   // Logs belonging to this partition. Majority of time it will be only one log, but if log directory
+@@ -265,15 +265,34 @@ class Partition(val topicPartition: TopicPartition,
+ 
+   def isAddingReplica(replicaId: Int): Boolean = assignmentState.isAddingReplica(replicaId)
+ 
+-  def inSyncReplicaIds(includeUncommittedReplicas: Boolean = false): Set[Int] = {
+-    // Only check for an "effective" ISR if we are using AlterIsr
+-    if (useAlterIsr && includeUncommittedReplicas) {
++  /**
++   * This set may include un-committed ISR members following an expansion. This "effective" ISR is used for advancing
++   * the high watermark as well as determining which replicas are required for acks=all produce requests.
++   *
++   * Only applicable as of IBP 2.7-IV1, for older versions this simply returns the committed ISR
++   *
++   * @return the set of replica IDs which are in-sync
++   */
++  def effectiveIsr: Set[Int] = {
++    if (useAlterIsr) {
+       pendingInSyncReplicaIds.getOrElse(inSyncReplicaIds)
+     } else {
+       inSyncReplicaIds
+     }
+   }
+ 
++  /**
++   * Check if we have an in-flight AlterIsr
++   */
++  def checkInFlightAlterIsr: Boolean = {
++    if (pendingInSyncReplicaIds.isDefined) {
++      trace(s"ISR update in-flight for $topicPartition, skipping update")
++      true
++    } else {
++      false
++    }
++  }
++
+   /**
+     * Create the future replica if 1) the current replica is not in the given log directory and 2) the future replica
+     * does not exist. This method assumes that the current replica has already been created.
+@@ -514,7 +533,6 @@ class Partition(val topicPartition: TopicPartition,
+       val isr = partitionState.isr.asScala.map(_.toInt).toSet
+       val addingReplicas = partitionState.addingReplicas.asScala.map(_.toInt)
+       val removingReplicas = partitionState.removingReplicas.asScala.map(_.toInt)
+-      info(s"Leader setting ISR to $isr for $topicPartition with leader epoch ${partitionState.leaderEpoch}")
+ 
+       updateAssignmentAndIsr(
+         assignment = partitionState.replicas.asScala.map(_.toInt),
+@@ -665,7 +683,7 @@ class Partition(val topicPartition: TopicPartition,
+ 
+         // Check if this in-sync replica needs to be added to the ISR. We look at the "maximal" ISR here so we don't
+         // send an additional Alter ISR request for the same replica
+-        if (!inSyncReplicaIds(true).contains(followerId))
++        if (!effectiveIsr.contains(followerId))
+           maybeExpandIsr(followerReplica, followerFetchTimeMs)
+ 
+         // check if the HW of the partition can now be incremented
+@@ -755,7 +773,7 @@ class Partition(val topicPartition: TopicPartition,
+   private def needsExpandIsr(followerReplica: Replica): Boolean = {
+     leaderLogIfLocal.exists { leaderLog =>
+       val leaderHighwatermark = leaderLog.highWatermark
+-      !inSyncReplicaIds.contains(followerReplica.brokerId) && isFollowerInSync(followerReplica, leaderHighwatermark)
++      !inSyncReplicaIds.contains(followerReplica.brokerId) && isFollowerInSync(followerReplica, leaderHighwatermark) && !checkInFlightAlterIsr
+     }
+   }
+ 
+@@ -776,7 +794,7 @@ class Partition(val topicPartition: TopicPartition,
+     leaderLogIfLocal match {
+       case Some(leaderLog) =>
+         // keep the current immutable replica list reference
+-        val curInSyncReplicaIds = inSyncReplicaIds(true)
++        val curInSyncReplicaIds = effectiveIsr
+ 
+         if (isTraceEnabled) {
+           def logEndOffsetString: ((Int, Long)) => String = {
+@@ -841,7 +859,7 @@ class Partition(val topicPartition: TopicPartition,
+       remoteReplicasMap.values.foreach { replica =>
+         // Note here we are using the "maximal", see explanation above
+         if (replica.logEndOffsetMetadata.messageOffset < newHighWatermark.messageOffset &&
+-          (curTime - replica.lastCaughtUpTimeMs <= replicaLagTimeMaxMs || inSyncReplicaIds(true).contains(replica.brokerId))) {
++          (curTime - replica.lastCaughtUpTimeMs <= replicaLagTimeMaxMs || effectiveIsr.contains(replica.brokerId))) {
+           newHighWatermark = replica.logEndOffsetMetadata
+         }
+       }
+@@ -940,7 +958,7 @@ class Partition(val topicPartition: TopicPartition,
+   private def needsShrinkIsr(): Boolean = {
+     if (isLeader) {
+       val outOfSyncReplicaIds = getOutOfSyncReplicas(replicaLagTimeMaxMs)
+-      outOfSyncReplicaIds.nonEmpty
++      outOfSyncReplicaIds.nonEmpty && !checkInFlightAlterIsr
+     } else {
+       false
+     }
+@@ -968,7 +986,7 @@ class Partition(val topicPartition: TopicPartition,
+      * is violated, that replica is considered to be out of sync
+      *
+      **/
+-    val candidateReplicaIds = inSyncReplicaIds(true) - localBrokerId
++    val candidateReplicaIds = effectiveIsr - localBrokerId
+     val currentTimeMs = time.milliseconds()
+     val leaderEndOffset = localLogOrException.logEndOffset
+     candidateReplicaIds.filter(replicaId => isFollowerOutOfSync(replicaId, leaderEndOffset, currentTimeMs, maxLagMs))
+@@ -1251,6 +1269,7 @@ class Partition(val topicPartition: TopicPartition,
+     }
+   }
+ 
++  // This is called from maybeExpandIsr which holds the ISR write lock
+   private def expandIsrWithAlterIsr(newInSyncReplica: Int): Unit = {
+     // This is called from maybeExpandIsr which holds the ISR write lock
+     if (pendingInSyncReplicaIds.isEmpty) {
+@@ -1261,7 +1280,7 @@ class Partition(val topicPartition: TopicPartition,
+       debug(s"Adding new in-sync replica $newInSyncReplica. Pending ISR updated to [${newIsr.mkString(",")}] for $topicPartition")
+       sendAlterIsrRequest(newIsr)
+     } else {
+-      debug(s"ISR update in-flight, not adding new in-sync replica $newInSyncReplica for $topicPartition")
++      trace(s"ISR update in-flight, not adding new in-sync replica $newInSyncReplica for $topicPartition")
+     }
+   }
+ 
+@@ -1281,6 +1300,7 @@ class Partition(val topicPartition: TopicPartition,
+     }
+   }
+ 
++  // This is called from maybeShrinkIsr which holds the ISR write lock
+   private def shrinkIsrWithAlterIsr(outOfSyncReplicas: Set[Int]): Unit = {
+     // This is called from maybeShrinkIsr which holds the ISR write lock
+     if (pendingInSyncReplicaIds.isEmpty) {
+@@ -1292,7 +1312,7 @@ class Partition(val topicPartition: TopicPartition,
+       debug(s"Removing out-of-sync replicas $outOfSyncReplicas for $topicPartition")
+       sendAlterIsrRequest(newIsr)
+     } else {
+-      debug(s"ISR update in-flight, not removing out-of-sync replicas $outOfSyncReplicas for $topicPartition")
++      trace(s"ISR update in-flight, not removing out-of-sync replicas $outOfSyncReplicas for $topicPartition")
+     }
+   }
+ 
+diff --git a/core/src/main/scala/kafka/controller/KafkaController.scala b/core/src/main/scala/kafka/controller/KafkaController.scala
+index ba1bb9958cf..4c4640f3955 100644
+--- a/core/src/main/scala/kafka/controller/KafkaController.scala
++++ b/core/src/main/scala/kafka/controller/KafkaController.scala
+@@ -283,10 +283,10 @@ class KafkaController(val config: KafkaConfig,
+   private def onControllerResignation(): Unit = {
+     debug("Resigning")
+     // de-register listeners
++    zkClient.unregisterZNodeChildChangeHandler(isrChangeNotificationHandler.path)
+     zkClient.unregisterZNodeChangeHandler(partitionReassignmentHandler.path)
+     zkClient.unregisterZNodeChangeHandler(preferredReplicaElectionHandler.path)
+     zkClient.unregisterZNodeChildChangeHandler(logDirEventNotificationHandler.path)
+-    zkClient.unregisterStateChangeHandler(isrChangeNotificationHandler.path)
+     unregisterBrokerModificationsHandler(brokerModificationsHandlers.keySet)
+ 
+     // shutdown leader rebalance scheduler
+@@ -1771,11 +1771,13 @@ class KafkaController(val config: KafkaConfig,
+   def alterIsrs(alterIsrRequest: AlterIsrRequestData, callback: AlterIsrResponseData => Unit): Unit = {
+     val isrsToAlter = mutable.Map[TopicPartition, LeaderAndIsr]()
+ 
+-    alterIsrRequest.topics().forEach(topicReq => topicReq.partitions().forEach(partitionReq => {
+-      val tp = new TopicPartition(topicReq.name, partitionReq.partitionIndex)
+-      val newIsr = partitionReq.newIsr().asScala.toList.map(_.toInt)
+-      isrsToAlter.put(tp, new LeaderAndIsr(partitionReq.leaderId, partitionReq.leaderEpoch, newIsr, partitionReq.currentIsrVersion))
+-    }))
++    alterIsrRequest.topics.forEach { topicReq =>
++      topicReq.partitions.forEach { partitionReq =>
++        val tp = new TopicPartition(topicReq.name, partitionReq.partitionIndex)
++        val newIsr = partitionReq.newIsr().asScala.toList.map(_.toInt)
++        isrsToAlter.put(tp, new LeaderAndIsr(partitionReq.leaderId, partitionReq.leaderEpoch, newIsr, partitionReq.currentIsrVersion))
++      }
++    }
+ 
+     def responseCallback(results: Either[Map[TopicPartition, Either[Errors, LeaderAndIsr]], Errors]): Unit = {
+       val resp = new AlterIsrResponseData()
+@@ -1784,27 +1786,27 @@ class KafkaController(val config: KafkaConfig,
+           resp.setErrorCode(error.code)
+         case Left(partitionResults) =>
+           resp.setTopics(new util.ArrayList())
+-          partitionResults.groupBy(_._1.topic).foreach(entry => {
++          partitionResults.groupBy(_._1.topic).foreach { entry =>
+             val topicResp = new AlterIsrResponseData.TopicData()
+               .setName(entry._1)
+               .setPartitions(new util.ArrayList())
+             resp.topics.add(topicResp)
+-            entry._2.foreachEntry((partition, errorOrResult) => {
+-              errorOrResult match {
++            entry._2.foreach { partitionEntry =>
++              partitionEntry._2 match {
+                 case Left(error) => topicResp.partitions.add(
+                   new AlterIsrResponseData.PartitionData()
+-                    .setPartitionIndex(partition.partition)
++                    .setPartitionIndex(partitionEntry._1.partition)
+                     .setErrorCode(error.code))
+                 case Right(leaderAndIsr) => topicResp.partitions.add(
+                   new AlterIsrResponseData.PartitionData()
+-                    .setPartitionIndex(partition.partition)
++                    .setPartitionIndex(partitionEntry._1.partition)
+                     .setLeader(leaderAndIsr.leader)
+                     .setLeaderEpoch(leaderAndIsr.leaderEpoch)
+                     .setIsr(leaderAndIsr.isr.map(Integer.valueOf).asJava)
+                     .setCurrentIsrVersion(leaderAndIsr.zkVersion))
+               }
+-            })
+-          })
++            }
++          }
+       }
+       callback.apply(resp)
+     }
+@@ -1814,84 +1816,91 @@ class KafkaController(val config: KafkaConfig,
+ 
+   private def processAlterIsr(brokerId: Int, brokerEpoch: Long, isrsToAlter: Map[TopicPartition, LeaderAndIsr],
+                               callback: AlterIsrCallback): Unit = {
+-    if (!isActive) {
+-      callback.apply(Right(Errors.NOT_CONTROLLER))
+-      return
+-    }
++    val response = try {
++      if (!isActive) {
++        Right(Errors.NOT_CONTROLLER)
++        return
++      }
+ 
+-    val brokerEpochOpt = controllerContext.liveBrokerIdAndEpochs.get(brokerId)
+-    if (brokerEpochOpt.isEmpty) {
+-      info(s"Ignoring AlterIsr due to unknown broker $brokerId")
+-      callback.apply(Right(Errors.STALE_BROKER_EPOCH))
+-      return
+-    }
++      val brokerEpochOpt = controllerContext.liveBrokerIdAndEpochs.get(brokerId)
++      if (brokerEpochOpt.isEmpty) {
++        info(s"Ignoring AlterIsr due to unknown broker $brokerId")
++        Right(Errors.STALE_BROKER_EPOCH)
++        return
++      }
+ 
+-    if (!brokerEpochOpt.contains(brokerEpoch)) {
+-      info(s"Ignoring AlterIsr due to stale broker epoch $brokerEpoch for broker $brokerId")
+-      callback.apply(Right(Errors.STALE_BROKER_EPOCH))
+-      return
+-    }
++      if (!brokerEpochOpt.contains(brokerEpoch)) {
++        info(s"Ignoring AlterIsr due to stale broker epoch $brokerEpoch for broker $brokerId")
++        Right(Errors.STALE_BROKER_EPOCH)
++        return
++      }
+ 
+-    val partitionResponses: mutable.Map[TopicPartition, Either[Errors, LeaderAndIsr]] =
+-      mutable.HashMap[TopicPartition, Either[Errors, LeaderAndIsr]]()
++      val partitionResponses: mutable.Map[TopicPartition, Either[Errors, LeaderAndIsr]] =
++        mutable.HashMap[TopicPartition, Either[Errors, LeaderAndIsr]]()
++
++      // Determine which partitions we will accept the new ISR for
++      val adjustedIsrs: Map[TopicPartition, LeaderAndIsr] = isrsToAlter.flatMap {
++        case (tp: TopicPartition, newLeaderAndIsr: LeaderAndIsr) =>
++          val partitionError: Errors = controllerContext.partitionLeadershipInfo(tp) match {
++            case Some(leaderIsrAndControllerEpoch) =>
++              val currentLeaderAndIsr = leaderIsrAndControllerEpoch.leaderAndIsr
++              if (newLeaderAndIsr.leaderEpoch < currentLeaderAndIsr.leaderEpoch) {
++                Errors.FENCED_LEADER_EPOCH
++              } else {
++                Errors.NONE
++              }
++            case None => Errors.UNKNOWN_TOPIC_OR_PARTITION
++          }
++          if (partitionError == Errors.NONE) {
++            Some(tp -> newLeaderAndIsr)
++          } else {
++            partitionResponses(tp) = Left(partitionError)
++            None
++          }
++      }
+ 
+-    // Determine which partitions we will accept the new ISR for
+-    val adjustedIsrs: Map[TopicPartition, LeaderAndIsr] = isrsToAlter.flatMap {
+-      case (tp: TopicPartition, newLeaderAndIsr: LeaderAndIsr) =>
+-        val partitionError: Errors = controllerContext.partitionLeadershipInfo(tp) match {
+-          case Some(leaderIsrAndControllerEpoch) =>
+-            val currentLeaderAndIsr = leaderIsrAndControllerEpoch.leaderAndIsr
+-            if (newLeaderAndIsr.leaderEpoch < currentLeaderAndIsr.leaderEpoch) {
+-              Errors.FENCED_LEADER_EPOCH
+-            } else {
+-              Errors.NONE
+-            }
+-          case None => Errors.UNKNOWN_TOPIC_OR_PARTITION
+-        }
+-        if (partitionError == Errors.NONE) {
+-          Some(tp -> newLeaderAndIsr)
+-        } else {
+-          partitionResponses(tp) = Left(partitionError)
+-          None
+-        }
+-    }
++      // Do the updates in ZK
++      debug(s"Updating ISRs for partitions: ${adjustedIsrs.keySet}.")
++      val UpdateLeaderAndIsrResult(finishedUpdates, badVersionUpdates) = zkClient.updateLeaderAndIsr(
++        adjustedIsrs, controllerContext.epoch, controllerContext.epochZkVersion)
++
++      val successfulUpdates: Map[TopicPartition, LeaderAndIsr] = finishedUpdates.flatMap {
++        case (partition: TopicPartition, isrOrError: Either[Throwable, LeaderAndIsr]) =>
++          isrOrError match {
++            case Right(updatedIsr) =>
++              debug("ISR for partition %s updated to [%s] and zkVersion updated to [%d]".format(partition, updatedIsr.isr.mkString(","), updatedIsr.zkVersion))
++              partitionResponses(partition) = Right(updatedIsr)
++              Some(partition -> updatedIsr)
++            case Left(error) =>
++              warn(s"Failed to update ISR for partition $partition", error)
++              partitionResponses(partition) = Left(Errors.forException(error))
++              None
++          }
++      }
++
++      badVersionUpdates.foreach(partition => {
++        warn(s"Failed to update ISR for partition $partition, bad ZK version")
++        partitionResponses(partition) = Left(Errors.INVALID_UPDATE_VERSION)
++      })
+ 
+-    // Do the updates in ZK
+-    info(s"Updating ISRs for partitions: ${adjustedIsrs.keySet}.")
+-    val UpdateLeaderAndIsrResult(finishedUpdates, badVersionUpdates) =  zkClient.updateLeaderAndIsr(
+-      adjustedIsrs, controllerContext.epoch, controllerContext.epochZkVersion)
+-
+-    val successfulUpdates: Map[TopicPartition, LeaderAndIsr] = finishedUpdates.flatMap {
+-      case (partition: TopicPartition, isrOrError: Either[Throwable, LeaderAndIsr]) =>
+-      isrOrError match {
+-        case Right(updatedIsr) =>
+-          info("ISR for partition %s updated to [%s] and zkVersion updated to [%d]".format(partition, updatedIsr.isr.mkString(","), updatedIsr.zkVersion))
+-          partitionResponses(partition) = Right(updatedIsr)
+-          Some(partition -> updatedIsr)
+-        case Left(error) =>
+-          warn(s"Failed to update ISR for partition $partition", error)
+-          partitionResponses(partition) = Left(Errors.forException(error))
+-          None
++      def processUpdateNotifications(partitions: Seq[TopicPartition]): Unit = {
++        val liveBrokers: Seq[Int] = controllerContext.liveOrShuttingDownBrokerIds.toSeq
++        debug(s"Sending MetadataRequest to Brokers: $liveBrokers for TopicPartitions: $partitions")
++        sendUpdateMetadataRequest(liveBrokers, partitions.toSet)
+       }
+-    }
+ 
+-    badVersionUpdates.foreach(partition => {
+-      warn(s"Failed to update ISR for partition $partition, bad ZK version")
+-      partitionResponses(partition) = Left(Errors.INVALID_UPDATE_VERSION)
+-    })
++      // Update our cache and send out metadata updates
++      updateLeaderAndIsrCache(successfulUpdates.keys.toSeq)
++      processUpdateNotifications(isrsToAlter.keys.toSeq)
+ 
+-    def processUpdateNotifications(partitions: Seq[TopicPartition]): Unit = {
+-      val liveBrokers: Seq[Int] = controllerContext.liveOrShuttingDownBrokerIds.toSeq
+-      debug(s"Sending MetadataRequest to Brokers: $liveBrokers for TopicPartitions: $partitions")
+-      sendUpdateMetadataRequest(liveBrokers, partitions.toSet)
++      Left(partitionResponses)
++    } catch {
++      case e: Throwable =>
++        error(s"Error when processing AlterIsr request", e)
++        Right(Errors.UNKNOWN_SERVER_ERROR)
+     }
+ 
+-    // Update our cache and send out metadata updates
+-    updateLeaderAndIsrCache(successfulUpdates.keys.toSeq)
+-    processUpdateNotifications(isrsToAlter.keys.toSeq)
+-
+-    // Send back AlterIsr response
+-    callback.apply(Left(partitionResponses))
++    callback.apply(response)
+   }
+ 
+   private def processControllerChange(): Unit = {
+diff --git a/core/src/main/scala/kafka/server/AlterIsrManager.scala b/core/src/main/scala/kafka/server/AlterIsrManager.scala
+index 9839613dec7..c98fd8a82b7 100644
+--- a/core/src/main/scala/kafka/server/AlterIsrManager.scala
++++ b/core/src/main/scala/kafka/server/AlterIsrManager.scala
+@@ -83,7 +83,7 @@ class AlterIsrManagerImpl(val controllerChannelManager: BrokerToControllerChanne
+ 
+     // Minimize time in this lock since it's also held during fetch hot path
+     val copy = unsentIsrUpdates synchronized {
+-      val copy = Map.from(unsentIsrUpdates)
++      val copy = unsentIsrUpdates.clone()
+       unsentIsrUpdates.clear()
+       lastIsrPropagationMs.set(now)
+       copy
+@@ -95,7 +95,7 @@ class AlterIsrManagerImpl(val controllerChannelManager: BrokerToControllerChanne
+     scheduledRequest = None
+   }
+ 
+-  def buildAndSendRequest(isrUpdates: Map[TopicPartition, AlterIsrItem]): Unit = {
++  def buildAndSendRequest(isrUpdates: mutable.Map[TopicPartition, AlterIsrItem]): Unit = {
+     if (isrUpdates.nonEmpty) {
+       val message = new AlterIsrRequestData()
+         .setBrokerId(brokerId)
+diff --git a/core/src/main/scala/kafka/server/BrokerToControllerChannelManagerImpl.scala b/core/src/main/scala/kafka/server/BrokerToControllerChannelManagerImpl.scala
+index 44f71700515..776eb4147e1 100644
+--- a/core/src/main/scala/kafka/server/BrokerToControllerChannelManagerImpl.scala
++++ b/core/src/main/scala/kafka/server/BrokerToControllerChannelManagerImpl.scala
+@@ -125,7 +125,7 @@ class BrokerToControllerChannelManagerImpl(metadataCache: kafka.server.MetadataC
+   }
+ 
+   override def sendRequest(request: AbstractRequest.Builder[_ <: AbstractRequest],
+-                  callback: RequestCompletionHandler): Unit = {
++                           callback: RequestCompletionHandler): Unit = {
+     requestQueue.put(BrokerToControllerQueueItem(request, callback))
+     requestThread.wakeup()
+   }
+diff --git a/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala b/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala
+index d8e284a65a9..e8bc87adee8 100644
+--- a/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala
++++ b/core/src/test/scala/unit/kafka/cluster/PartitionTest.scala
+@@ -921,7 +921,7 @@ class PartitionTest extends AbstractPartitionTest {
+ 
+     // Expansion does not affect the ISR
+     assertEquals("ISR", Set[Integer](leader, follower2), partition.inSyncReplicaIds)
+-    assertEquals("ISR", Set[Integer](leader, follower1, follower2), partition.inSyncReplicaIds(true))
++    assertEquals("ISR", Set[Integer](leader, follower1, follower2), partition.effectiveIsr)
+     assertEquals("AlterIsr", alterIsrManager.isrUpdates.dequeue().leaderAndIsr.isr.toSet,
+       Set(leader, follower1, follower2))
+   }
+@@ -1184,7 +1184,7 @@ class PartitionTest extends AbstractPartitionTest {
+     assertEquals(alterIsrManager.isrUpdates.size, 1)
+     assertEquals(alterIsrManager.isrUpdates.dequeue().leaderAndIsr.isr, List(brokerId, remoteBrokerId))
+     assertEquals(Set(brokerId), partition.inSyncReplicaIds)
+-    assertEquals(Set(brokerId, remoteBrokerId), partition.inSyncReplicaIds(true))
++    assertEquals(Set(brokerId, remoteBrokerId), partition.effectiveIsr)
+     assertEquals(10L, remoteReplica.logEndOffset)
+     assertEquals(0L, remoteReplica.logStartOffset)
+   }
+@@ -1282,7 +1282,7 @@ class PartitionTest extends AbstractPartitionTest {
+     assertEquals(alterIsrManager.isrUpdates.size, 1)
+     assertEquals(alterIsrManager.isrUpdates.dequeue().leaderAndIsr.isr, List(brokerId))
+     assertEquals(Set(brokerId, remoteBrokerId), partition.inSyncReplicaIds)
+-    assertEquals(Set(brokerId, remoteBrokerId), partition.inSyncReplicaIds(true))
++    assertEquals(Set(brokerId, remoteBrokerId), partition.effectiveIsr)
+     assertEquals(0L, partition.localLogOrException.highWatermark)
+   }
+ 
+@@ -1488,7 +1488,7 @@ class PartitionTest extends AbstractPartitionTest {
+     // Expand ISR
+     partition.expandIsr(follower3)
+     assertEquals(Set(brokerId, follower1, follower2), partition.inSyncReplicaIds)
+-    assertEquals(Set(brokerId, follower1, follower2, follower3), partition.inSyncReplicaIds(true))
++    assertEquals(Set(brokerId, follower1, follower2, follower3), partition.effectiveIsr)
+ 
+     // One AlterIsr request in-flight
+     assertEquals(alterIsrManager.isrUpdates.size, 1)
+diff --git a/core/src/test/scala/unit/kafka/utils/TestUtils.scala b/core/src/test/scala/unit/kafka/utils/TestUtils.scala
+index 573d437235f..d5903ff1c80 100755
+--- a/core/src/test/scala/unit/kafka/utils/TestUtils.scala
++++ b/core/src/test/scala/unit/kafka/utils/TestUtils.scala
+@@ -1069,7 +1069,7 @@ object TestUtils extends Logging {
+     val isrUpdates: mutable.Queue[AlterIsrItem] = new mutable.Queue[AlterIsrItem]()
+ 
+     override def enqueueIsrUpdate(alterIsrItem: AlterIsrItem): Unit = {
+-      isrUpdates.addOne(alterIsrItem)
++      isrUpdates += alterIsrItem
+     }
+ 
+     override def clearPending(topicPartition: TopicPartition): Unit = {

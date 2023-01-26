@@ -1,0 +1,376 @@
+diff --git a/api/src/main/java/io/druid/data/input/impl/MapInputRowParser.java b/api/src/main/java/io/druid/data/input/impl/MapInputRowParser.java
+index 5c168441dac..49d40fd88c4 100644
+--- a/api/src/main/java/io/druid/data/input/impl/MapInputRowParser.java
++++ b/api/src/main/java/io/druid/data/input/impl/MapInputRowParser.java
+@@ -72,7 +72,7 @@ public List<InputRow> parseBatch(Map<String, Object> theMap)
+       }
+     }
+     catch (Exception e) {
+-      throw new ParseException(e, "Unparseable timestamp found! Event: " + theMap);
++      throw new ParseException(e, "Unparseable timestamp found! Event: %s", theMap);
+     }
+ 
+     return ImmutableList.of(new MapBasedInputRow(timestamp.getMillis(), dimensions, theMap));
+diff --git a/api/src/main/java/io/druid/utils/CircularBuffer.java b/api/src/main/java/io/druid/utils/CircularBuffer.java
+index bac7277b367..e5f8158e0ef 100644
+--- a/api/src/main/java/io/druid/utils/CircularBuffer.java
++++ b/api/src/main/java/io/druid/utils/CircularBuffer.java
+@@ -21,6 +21,11 @@
+ 
+ import com.google.common.base.Preconditions;
+ 
++/**
++ * A circular buffer that supports random bidirectional access.
++ *
++ * @param <E> Type of object to be stored in the buffer
++ */
+ public class CircularBuffer<E>
+ {
+   public E[] getBuffer()
+@@ -52,8 +57,13 @@ public void add(E item)
+     }
+   }
+ 
++  /**
++   * Access object at a given index, starting from the latest entry added and moving backwards.
++   */
+   public E getLatest(int index)
+   {
++    Preconditions.checkArgument(index >= 0 && index < size, "invalid index");
++
+     int bufferIndex = start - index - 1;
+     if (bufferIndex < 0) {
+       bufferIndex = buffer.length + bufferIndex;
+@@ -61,6 +71,9 @@ public E getLatest(int index)
+     return buffer[bufferIndex];
+   }
+ 
++  /**
++   * Access object at a given index, starting from the earliest entry added and moving forward.
++   */
+   public E get(int index)
+   {
+     Preconditions.checkArgument(index >= 0 && index < size, "invalid index");
+diff --git a/common/src/main/java/io/druid/indexer/Jobby.java b/common/src/main/java/io/druid/indexer/Jobby.java
+index c0f2d68c7c3..b0d26affdf4 100644
+--- a/common/src/main/java/io/druid/indexer/Jobby.java
++++ b/common/src/main/java/io/druid/indexer/Jobby.java
+@@ -19,6 +19,8 @@
+ 
+ package io.druid.indexer;
+ 
++import io.druid.java.util.common.StringUtils;
++
+ import javax.annotation.Nullable;
+ import java.util.Map;
+ 
+@@ -28,15 +30,26 @@
+ {
+   boolean run();
+ 
++  /**
++   * @return A map containing statistics for a Jobby, optionally null if the Jobby is unable to provide stats.
++   */
+   @Nullable
+   default Map<String, Object> getStats()
+   {
+-    throw new UnsupportedOperationException("This Jobby does not implement getJobStats().");
++    throw new UnsupportedOperationException(
++        StringUtils.format("This Jobby does not implement getJobStats(), Jobby class: [%s]", getClass())
++    );
+   }
+ 
++  /**
++   * @return A string representing the error that caused a Jobby to fail. Can be null if the Jobby did not fail,
++   * or is unable to provide an error message.
++   */
+   @Nullable
+   default String getErrorMessage()
+   {
+-    throw new UnsupportedOperationException("This Jobby does not implement getErrorMessage().");
++    throw new UnsupportedOperationException(
++        StringUtils.format("This Jobby does not implement getErrorMessage(), Jobby class: [%s]", getClass())
++    );
+   }
+ }
+diff --git a/indexing-hadoop/src/main/java/io/druid/indexer/IndexGeneratorJob.java b/indexing-hadoop/src/main/java/io/druid/indexer/IndexGeneratorJob.java
+index ada3c6e704d..b5708b94354 100644
+--- a/indexing-hadoop/src/main/java/io/druid/indexer/IndexGeneratorJob.java
++++ b/indexing-hadoop/src/main/java/io/druid/indexer/IndexGeneratorJob.java
+@@ -361,15 +361,13 @@ protected void innerMap(
+                                                  InputRowSerde.toBytes(
+                                                      typeHelperMap,
+                                                      inputRow,
+-                                                     aggsForSerializingSegmentInputRow,
+-                                                     reportParseExceptions
++                                                     aggsForSerializingSegmentInputRow
+                                                  )
+                                                                                      :
+                                                  InputRowSerde.toBytes(
+                                                      typeHelperMap,
+                                                      inputRow,
+-                                                     aggregators,
+-                                                     reportParseExceptions
++                                                     aggregators
+                                                  );
+ 
+       context.write(
+@@ -468,7 +466,7 @@ private void flushIndexToContextAndClose(BytesWritable key, IncrementalIndex ind
+         InputRow inputRow = getInputRowFromRow(row, dimensions);
+ 
+         // reportParseExceptions is true as any unparseable data is already handled by the mapper.
+-        InputRowSerde.SerializeResult serializeResult = InputRowSerde.toBytes(typeHelperMap, inputRow, combiningAggs, true);
++        InputRowSerde.SerializeResult serializeResult = InputRowSerde.toBytes(typeHelperMap, inputRow, combiningAggs);
+ 
+         context.write(
+             key,
+diff --git a/indexing-hadoop/src/main/java/io/druid/indexer/InputRowSerde.java b/indexing-hadoop/src/main/java/io/druid/indexer/InputRowSerde.java
+index 3a44762599c..4f0d9d4c81a 100644
+--- a/indexing-hadoop/src/main/java/io/druid/indexer/InputRowSerde.java
++++ b/indexing-hadoop/src/main/java/io/druid/indexer/InputRowSerde.java
+@@ -45,7 +45,6 @@
+ import io.druid.segment.serde.ComplexMetrics;
+ import org.apache.hadoop.io.WritableUtils;
+ 
+-import javax.annotation.Nullable;
+ import java.io.DataInput;
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -67,8 +66,7 @@
+   {
+     ValueType getType();
+ 
+-    @Nullable
+-    String serialize(ByteArrayDataOutput out, Object value, boolean reportParseExceptions);
++    void serialize(ByteArrayDataOutput out, Object value);
+ 
+     T deserialize(ByteArrayDataInput in);
+   }
+@@ -133,7 +131,7 @@ public ValueType getType()
+     }
+ 
+     @Override
+-    public String serialize(ByteArrayDataOutput out, Object value, boolean reportParseExceptions)
++    public void serialize(ByteArrayDataOutput out, Object value)
+     {
+       List<String> values = Rows.objectToStrings(value);
+       try {
+@@ -142,7 +140,6 @@ public String serialize(ByteArrayDataOutput out, Object value, boolean reportPar
+       catch (IOException ioe) {
+         throw new RuntimeException(ioe);
+       }
+-      return null;
+     }
+ 
+     @Override
+@@ -166,15 +163,15 @@ public ValueType getType()
+     }
+ 
+     @Override
+-    public String serialize(ByteArrayDataOutput out, Object value, boolean reportParseExceptions)
++    public void serialize(ByteArrayDataOutput out, Object value)
+     {
+-      String parseExceptionMessage = null;
++      ParseException exceptionToThrow = null;
+       Long ret = null;
+       try {
+-        ret = DimensionHandlerUtils.convertObjectToLong(value, reportParseExceptions);
++        ret = DimensionHandlerUtils.convertObjectToLong(value, true);
+       }
+       catch (ParseException pe) {
+-        parseExceptionMessage = pe.getMessage();
++        exceptionToThrow = pe;
+       }
+ 
+       if (ret == null) {
+@@ -183,7 +180,10 @@ public String serialize(ByteArrayDataOutput out, Object value, boolean reportPar
+         ret = DimensionHandlerUtils.ZERO_LONG;
+       }
+       out.writeLong(ret);
+-      return parseExceptionMessage;
++
++      if (exceptionToThrow != null) {
++        throw exceptionToThrow;
++      }
+     }
+ 
+     @Override
+@@ -202,15 +202,15 @@ public ValueType getType()
+     }
+ 
+     @Override
+-    public String serialize(ByteArrayDataOutput out, Object value, boolean reportParseExceptions)
++    public void serialize(ByteArrayDataOutput out, Object value)
+     {
+-      String parseExceptionMessage = null;
++      ParseException exceptionToThrow = null;
+       Float ret = null;
+       try {
+-        ret = DimensionHandlerUtils.convertObjectToFloat(value, reportParseExceptions);
++        ret = DimensionHandlerUtils.convertObjectToFloat(value, true);
+       }
+       catch (ParseException pe) {
+-        parseExceptionMessage = pe.getMessage();
++        exceptionToThrow = pe;
+       }
+ 
+       if (ret == null) {
+@@ -219,7 +219,10 @@ public String serialize(ByteArrayDataOutput out, Object value, boolean reportPar
+         ret = DimensionHandlerUtils.ZERO_FLOAT;
+       }
+       out.writeFloat(ret);
+-      return parseExceptionMessage;
++
++      if (exceptionToThrow != null) {
++        throw exceptionToThrow;
++      }
+     }
+ 
+     @Override
+@@ -238,15 +241,15 @@ public ValueType getType()
+     }
+ 
+     @Override
+-    public String serialize(ByteArrayDataOutput out, Object value, boolean reportParseExceptions)
++    public void serialize(ByteArrayDataOutput out, Object value)
+     {
+-      String parseExceptionMessage = null;
++      ParseException exceptionToThrow = null;
+       Double ret = null;
+       try {
+-        ret = DimensionHandlerUtils.convertObjectToDouble(value, reportParseExceptions);
++        ret = DimensionHandlerUtils.convertObjectToDouble(value, true);
+       }
+       catch (ParseException pe) {
+-        parseExceptionMessage = pe.getMessage();
++        exceptionToThrow = pe;
+       }
+ 
+       if (ret == null) {
+@@ -255,7 +258,10 @@ public String serialize(ByteArrayDataOutput out, Object value, boolean reportPar
+         ret = DimensionHandlerUtils.ZERO_DOUBLE;
+       }
+       out.writeDouble(ret);
+-      return parseExceptionMessage;
++
++      if (exceptionToThrow != null) {
++        throw exceptionToThrow;
++      }
+     }
+ 
+     @Override
+@@ -268,8 +274,7 @@ public Double deserialize(ByteArrayDataInput in)
+   public static final SerializeResult toBytes(
+       final Map<String, IndexSerdeTypeHelper> typeHelperMap,
+       final InputRow row,
+-      AggregatorFactory[] aggs,
+-      boolean reportParseExceptions
++      AggregatorFactory[] aggs
+   )
+   {
+     try {
+@@ -290,9 +295,12 @@ public static final SerializeResult toBytes(
+             typeHelper = STRING_HELPER;
+           }
+           writeString(dim, out);
+-          String parseExceptionMessage = typeHelper.serialize(out, row.getRaw(dim), true);
+-          if (parseExceptionMessage != null) {
+-            parseExceptionMessages.add(parseExceptionMessage);
++
++          try {
++            typeHelper.serialize(out, row.getRaw(dim));
++          }
++          catch (ParseException pe) {
++            parseExceptionMessages.add(pe.getMessage());
+           }
+         }
+       }
+diff --git a/indexing-hadoop/src/main/java/io/druid/indexer/Utils.java b/indexing-hadoop/src/main/java/io/druid/indexer/Utils.java
+index 0729cf65ad7..1a899df18ee 100644
+--- a/indexing-hadoop/src/main/java/io/druid/indexer/Utils.java
++++ b/indexing-hadoop/src/main/java/io/druid/indexer/Utils.java
+@@ -145,7 +145,7 @@ public static String getFailureMessage(Job failedJob, ObjectMapper jsonMapper)
+       return jsonMapper.writeValueAsString(taskDiagsMap);
+     }
+     catch (IOException | InterruptedException ie) {
+-      log.error("couldn't get failure cause for job.");
++      log.error(ie, "couldn't get failure cause for job [%s]", failedJob.getJobName());
+       return null;
+     }
+   }
+diff --git a/indexing-hadoop/src/test/java/io/druid/indexer/IndexGeneratorCombinerTest.java b/indexing-hadoop/src/test/java/io/druid/indexer/IndexGeneratorCombinerTest.java
+index 4f0a22dd45f..3bfb1fb3983 100644
+--- a/indexing-hadoop/src/test/java/io/druid/indexer/IndexGeneratorCombinerTest.java
++++ b/indexing-hadoop/src/test/java/io/druid/indexer/IndexGeneratorCombinerTest.java
+@@ -175,8 +175,8 @@ public void testMultipleRowsMerged() throws Exception
+         )
+     );
+     List<BytesWritable> rows = Lists.newArrayList(
+-        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row1, aggregators, true).getSerializedRow()),
+-        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row2, aggregators, true).getSerializedRow())
++        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row1, aggregators).getSerializedRow()),
++        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row2, aggregators).getSerializedRow())
+     );
+ 
+     Reducer.Context context = EasyMock.createNiceMock(Reducer.Context.class);
+@@ -253,8 +253,8 @@ public void testMultipleRowsNotMerged() throws Exception
+     Map<String, InputRowSerde.IndexSerdeTypeHelper> typeHelperMap = InputRowSerde.getTypeHelperMap(dimensionsSpec);
+ 
+     List<BytesWritable> rows = Lists.newArrayList(
+-        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row1, aggregators, true).getSerializedRow()),
+-        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row2, aggregators, true).getSerializedRow())
++        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row1, aggregators).getSerializedRow()),
++        new BytesWritable(InputRowSerde.toBytes(typeHelperMap, row2, aggregators).getSerializedRow())
+     );
+ 
+     Reducer.Context context = EasyMock.createNiceMock(Reducer.Context.class);
+diff --git a/indexing-hadoop/src/test/java/io/druid/indexer/InputRowSerdeTest.java b/indexing-hadoop/src/test/java/io/druid/indexer/InputRowSerdeTest.java
+index 387d5b53512..0b72d31a71a 100644
+--- a/indexing-hadoop/src/test/java/io/druid/indexer/InputRowSerdeTest.java
++++ b/indexing-hadoop/src/test/java/io/druid/indexer/InputRowSerdeTest.java
+@@ -123,7 +123,7 @@ public Aggregator factorize(ColumnSelectorFactory metricFactory)
+         null
+     );
+ 
+-    byte[] data = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories, false)
++    byte[] data = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories)
+                                .getSerializedRow(); // Ignore Unparseable aggregator
+     InputRow out = InputRowSerde.fromBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), data, aggregatorFactories);
+ 
+@@ -176,8 +176,7 @@ public void testThrowParseExceptions()
+     InputRowSerde.SerializeResult result = InputRowSerde.toBytes(
+         InputRowSerde.getTypeHelperMap(dimensionsSpec),
+         in,
+-        aggregatorFactories,
+-        true
++        aggregatorFactories
+     );
+     Assert.assertEquals(
+         Arrays.asList("Unable to parse value[m3v] for field[m3]"),
+@@ -205,7 +204,7 @@ public void testDimensionParseExceptions()
+         null,
+         null
+     );
+-    result = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories, true);
++    result = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories);
+     Assert.assertEquals(
+         Arrays.asList("could not convert value [d1v] to long"),
+         result.getParseExceptionMessages()
+@@ -218,7 +217,7 @@ public void testDimensionParseExceptions()
+         null,
+         null
+     );
+-    result = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories, true);
++    result = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories);
+     Assert.assertEquals(
+         Arrays.asList("could not convert value [d1v] to float"),
+         result.getParseExceptionMessages()
+@@ -231,7 +230,7 @@ public void testDimensionParseExceptions()
+         null,
+         null
+     );
+-    result = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories, true);
++    result = InputRowSerde.toBytes(InputRowSerde.getTypeHelperMap(dimensionsSpec), in, aggregatorFactories);
+     Assert.assertEquals(
+         Arrays.asList("could not convert value [d1v] to double"),
+         result.getParseExceptionMessages()

@@ -1,0 +1,96 @@
+diff --git a/clients/src/main/java/org/apache/kafka/clients/Metadata.java b/clients/src/main/java/org/apache/kafka/clients/Metadata.java
+index 560e95539bd..4ea8d4afcba 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/Metadata.java
++++ b/clients/src/main/java/org/apache/kafka/clients/Metadata.java
+@@ -74,7 +74,7 @@ public Metadata() {
+     }
+ 
+     public Metadata(long refreshBackoffMs, long metadataExpireMs) {
+-        this(refreshBackoffMs, metadataExpireMs, false, Cluster.empty(), new ClusterResourceListeners());
++        this(refreshBackoffMs, metadataExpireMs, false, new ClusterResourceListeners());
+     }
+ 
+     /**
+@@ -85,11 +85,8 @@ public Metadata(long refreshBackoffMs, long metadataExpireMs) {
+      * @param topicExpiryEnabled If true, enable expiry of unused topics
+      * @param clusterResourceListeners List of ClusterResourceListeners which will receive metadata updates.
+      */
+-<<<<<<< HEAD
+-    public Metadata(long refreshBackoffMs, long metadataExpireMs, boolean topicExpiryEnabled, Cluster cluster, ClusterResourceListeners clusterResourceListeners) {
+-=======
+-    public Metadata(long refreshBackoffMs, long metadataExpireMs, boolean topicExpiryEnabled) {
+->>>>>>> refactored batch expiry logic into Sender
++
++    public Metadata(long refreshBackoffMs, long metadataExpireMs, boolean topicExpiryEnabled, ClusterResourceListeners clusterResourceListeners) {
+         this.refreshBackoffMs = refreshBackoffMs;
+         this.metadataExpireMs = metadataExpireMs;
+         this.topicExpiryEnabled = topicExpiryEnabled;
+diff --git a/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java b/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
+index b2ee58d61ce..50d793b2878 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
+@@ -246,7 +246,8 @@ public List<RecordBatch> abortExpiredBatches(int requestTimeout, boolean isMetad
+             // 
+             // Finally, we expire batches if the last metadata refresh was too long ago. I.e., > {@link Sender#metadataStaleMs}. 
+             // We might run in to this situation when the producer is disconnected from all the brokers. 
+-            if (!muted.contains(tp) && (isMetadataStale || cluster.leaderFor(tp) == null)) {
++            boolean guaranteeExpirationOrder = muted.contains(tp);
++            if (!guaranteeExpirationOrder && (isMetadataStale || cluster.leaderFor(tp) == null)) {
+                 synchronized (dq) {
+                     // iterate over the batches and expire them if they have been in the accumulator for more than requestTimeOut
+                     RecordBatch lastBatch = dq.peekLast();
+diff --git a/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java b/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
+index 9353784f895..3048a29edc6 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
+@@ -124,7 +124,7 @@ public Sender(KafkaClient client,
+         this.sensors = new SenderMetrics(metrics);
+         this.requestTimeout = requestTimeout;
+         
+-        this.metadataStaleMs = getMetadataStaleMs(metadata.maxAge(), requestTimeout, metadata.refreshBackoff());
++        this.metadataStaleMs = getMetadataStaleMs(metadata.maxAge(), requestTimeout, metadata.refreshBackoff(), retries);
+     }
+ 
+     /**
+@@ -388,8 +388,8 @@ public void wakeup() {
+      * metadata retries have no upper bound. However, as retries are subject to both regular request timeout and 
+      * the backoff, staleness determination is delayed by that factor.
+      */
+-    static long getMetadataStaleMs(long metadataMaxAge, int requestTimeout, long refreshBackoff) {
+-        return metadataMaxAge + 3 * (requestTimeout + refreshBackoff);
++    static long getMetadataStaleMs(long metadataMaxAge, int requestTimeout, long refreshBackoff, int retries) {
++        return metadataMaxAge + Math.max(retries, 1) * (requestTimeout + refreshBackoff);
+     }
+     
+     static boolean isMetadataStale(long now, Metadata metadata, long metadataStaleMs) {
+diff --git a/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java b/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java
+index 9580631d6d6..21a2ec16c83 100644
+--- a/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java
++++ b/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java
+@@ -36,6 +36,7 @@
+ import org.apache.kafka.common.Node;
+ import org.apache.kafka.common.PartitionInfo;
+ import org.apache.kafka.common.TopicPartition;
++import org.apache.kafka.common.internals.ClusterResourceListeners;
+ import org.apache.kafka.common.metrics.Metrics;
+ import org.apache.kafka.common.record.CompressionType;
+ import org.apache.kafka.common.record.LogEntry;
+@@ -350,7 +351,8 @@ public void testExpiredBatches() throws InterruptedException {
+         int batchSize = 1024;
+         long totalSize = 10 * 1024;
+         long metadataMaxAgeMs = 5 * 60 * 1000L; // 5 min
+-        long staleMetadataAgeMs  = Sender.getMetadataStaleMs(metadataMaxAgeMs, requestTimeoutMs, retryBackoffMs);
++        int retries = 1;
++        long staleMetadataAgeMs  = Sender.getMetadataStaleMs(metadataMaxAgeMs, requestTimeoutMs, retryBackoffMs, retries);
+         List<RecordBatch> expiredBatches;
+         RecordAccumulator.ReadyCheckResult result;
+         Set<Node> readyNodes;
+@@ -359,7 +361,7 @@ public void testExpiredBatches() throws InterruptedException {
+ 
+         assertTrue("Stale metadata age must be more than request timeout", staleMetadataAgeMs > metadataMaxAgeMs);
+         
+-        Metadata metadata = new Metadata(retryBackoffMs, metadataMaxAgeMs, false);
++        Metadata metadata = new Metadata(retryBackoffMs, metadataMaxAgeMs, false, new ClusterResourceListeners());
+         metadata.update(cluster, time.milliseconds());
+         RecordAccumulator accum = new RecordAccumulator(batchSize, totalSize, CompressionType.NONE, lingerMs, retryBackoffMs, metrics, time);
+         int appends = batchSize / msgSize;

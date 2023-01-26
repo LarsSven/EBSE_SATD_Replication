@@ -1,0 +1,309 @@
+diff --git a/common/src/main/java/io/druid/common/config/NullHandling.java b/common/src/main/java/io/druid/common/config/NullHandling.java
+index 643eeafb7b5..40156202b1e 100644
+--- a/common/src/main/java/io/druid/common/config/NullHandling.java
++++ b/common/src/main/java/io/druid/common/config/NullHandling.java
+@@ -28,8 +28,11 @@
+ {
+   private static String NULL_HANDLING_CONFIG_STRING = "druid.generic.useDefaultValueForNull";
+ 
+-  // use these values to ensure that convertObjectToLong(), convertObjectToDouble() and convertObjectToFloat()
+-  // return the same boxed object when returning a constant zero.
++  /**
++   * use these values to ensure that {@link NullHandling#nullToZeroIfNeeded(Long)},
++   * {@link NullHandling#nullToZeroIfNeeded(Double)}, {@link NullHandling#nullToZeroIfNeeded(Float)}
++   * return the same boxed object when returning a constant zero
++   */
+   public static final Double ZERO_DOUBLE = 0.0d;
+   public static final Float ZERO_FLOAT = 0.0f;
+   public static final Long ZERO_LONG = 0L;
+@@ -62,11 +65,16 @@ public static String emptyToNullIfNeeded(@Nullable String value)
+     return useDefaultValuesForNull() ? Strings.emptyToNull(value) : value;
+   }
+ 
+-  public static String defaultValue()
++  public static String defaultStringValue()
+   {
+     return useDefaultValuesForNull() ? "" : null;
+   }
+ 
++  public static Long defaultLongValue()
++  {
++    return useDefaultValuesForNull() ? ZERO_LONG : null;
++  }
++
+   public static boolean isNullOrEquivalent(@Nullable String value)
+   {
+     return INSTANCE.isUseDefaultValuesForNull() ? Strings.isNullOrEmpty(value) : value == null;
+diff --git a/common/src/main/java/io/druid/math/expr/Function.java b/common/src/main/java/io/druid/math/expr/Function.java
+index 80f45e98655..c94c6364c26 100644
+--- a/common/src/main/java/io/druid/math/expr/Function.java
++++ b/common/src/main/java/io/druid/math/expr/Function.java
+@@ -992,7 +992,7 @@ public ExprEval apply(List<Expr> args, Expr.ObjectBinding bindings)
+       } else {
+         // If starting index of substring is greater then the length of string, the result will be a zero length string.
+         // e.g. 'select substring("abc", 4,5) as c;' will return an empty string
+-        return ExprEval.of(NullHandling.defaultValue());
++        return ExprEval.of(NullHandling.defaultStringValue());
+       }
+     }
+   }
+@@ -1016,7 +1016,7 @@ public ExprEval apply(List<Expr> args, Expr.ObjectBinding bindings)
+       final String pattern = args.get(1).eval(bindings).asString();
+       final String replacement = args.get(2).eval(bindings).asString();
+       if (arg == null) {
+-        return ExprEval.of(NullHandling.defaultValue());
++        return ExprEval.of(NullHandling.defaultStringValue());
+       }
+       return ExprEval.of(
+           arg.replace(Strings.nullToEmpty(pattern), Strings.nullToEmpty(replacement))
+@@ -1041,7 +1041,7 @@ public ExprEval apply(List<Expr> args, Expr.ObjectBinding bindings)
+ 
+       final String arg = args.get(0).eval(bindings).asString();
+       if (arg == null) {
+-        return ExprEval.of(NullHandling.defaultValue());
++        return ExprEval.of(NullHandling.defaultStringValue());
+       }
+       return ExprEval.of(StringUtils.toLowerCase(arg));
+     }
+@@ -1064,7 +1064,7 @@ public ExprEval apply(List<Expr> args, Expr.ObjectBinding bindings)
+ 
+       final String arg = args.get(0).eval(bindings).asString();
+       if (arg == null) {
+-        return ExprEval.of(NullHandling.defaultValue());
++        return ExprEval.of(NullHandling.defaultStringValue());
+       }
+       return ExprEval.of(StringUtils.toUpperCase(arg));
+     }
+diff --git a/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountAggregator.java b/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountAggregator.java
+index 657feac7409..5945b24481b 100644
+--- a/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountAggregator.java
++++ b/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountAggregator.java
+@@ -19,17 +19,19 @@
+ 
+ package io.druid.query.aggregation.distinctcount;
+ 
++import com.google.common.base.Preconditions;
+ import io.druid.collections.bitmap.MutableBitmap;
++import io.druid.common.config.NullHandling;
+ import io.druid.query.aggregation.Aggregator;
+ import io.druid.segment.DimensionSelector;
+-import io.druid.common.config.NullHandling;
+ import io.druid.segment.data.IndexedInts;
+ 
+ public class DistinctCountAggregator implements Aggregator
+ {
++  private static int UNKNOWN = -1;
+   private final DimensionSelector selector;
+   private final MutableBitmap mutableBitmap;
+-  private final int idForNull;
++  private int idForNull;
+ 
+   public DistinctCountAggregator(
+       DimensionSelector selector,
+@@ -38,7 +40,12 @@ public DistinctCountAggregator(
+   {
+     this.selector = selector;
+     this.mutableBitmap = mutableBitmap;
+-    this.idForNull = selector.nameLookupPossibleInAdvance() ? selector.idLookup().lookupId(null) : -1;
++    Preconditions.checkArgument(
++        selector.nameLookupPossibleInAdvance()
++        || selector.getValueCardinality() != DimensionSelector.CARDINALITY_UNKNOWN,
++        "DistinctCountAggregator not supported for selector"
++    );
++    this.idForNull = selector.nameLookupPossibleInAdvance() ? selector.idLookup().lookupId(null) : UNKNOWN;
+   }
+ 
+   @Override
+@@ -55,7 +62,14 @@ public void aggregate()
+ 
+   private boolean isNotNull(int index)
+   {
+-    return selector.nameLookupPossibleInAdvance() ? index != idForNull : selector.lookupName(index) != null;
++    if (idForNull == UNKNOWN) {
++      String value = selector.lookupName(index);
++      if (value == null) {
++        idForNull = index;
++        return false;
++      }
++    }
++    return index != idForNull;
+   }
+ 
+   @Override
+diff --git a/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountBufferAggregator.java b/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountBufferAggregator.java
+index 841e5681ffd..aae41213854 100644
+--- a/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountBufferAggregator.java
++++ b/extensions-contrib/distinctcount/src/main/java/io/druid/query/aggregation/distinctcount/DistinctCountBufferAggregator.java
+@@ -19,6 +19,7 @@
+ 
+ package io.druid.query.aggregation.distinctcount;
+ 
++import com.google.common.base.Preconditions;
+ import io.druid.collections.bitmap.MutableBitmap;
+ import io.druid.collections.bitmap.WrappedRoaringBitmap;
+ import io.druid.common.config.NullHandling;
+@@ -33,9 +34,10 @@
+ 
+ public class DistinctCountBufferAggregator implements BufferAggregator
+ {
++  private static int UNKNOWN = -1;
+   private final DimensionSelector selector;
+   private final Int2ObjectMap<MutableBitmap> mutableBitmapCollection = new Int2ObjectOpenHashMap<>();
+-  private final int idForNull;
++  private int idForNull;
+ 
+ 
+   public DistinctCountBufferAggregator(
+@@ -43,7 +45,12 @@ public DistinctCountBufferAggregator(
+   )
+   {
+     this.selector = selector;
+-    this.idForNull = selector.nameLookupPossibleInAdvance() ? selector.idLookup().lookupId(null) : -1;
++    Preconditions.checkArgument(
++        selector.nameLookupPossibleInAdvance()
++        || selector.getValueCardinality() != DimensionSelector.CARDINALITY_UNKNOWN,
++        "DistinctCountBufferAggregator not supported for selector"
++    );
++    this.idForNull = selector.nameLookupPossibleInAdvance() ? selector.idLookup().lookupId(null) : UNKNOWN;
+   }
+ 
+   @Override
+@@ -78,7 +85,14 @@ private MutableBitmap getMutableBitmap(int position)
+ 
+   private boolean isNotNull(int index)
+   {
+-    return selector.nameLookupPossibleInAdvance() ? index != idForNull : selector.lookupName(index) != null;
++    if (idForNull == UNKNOWN) {
++      String value = selector.lookupName(index);
++      if (value == null) {
++        idForNull = index;
++        return false;
++      }
++    }
++    return index != idForNull;
+   }
+ 
+   @Override
+diff --git a/indexing-service/src/test/java/io/druid/indexing/common/task/RealtimeIndexTaskTest.java b/indexing-service/src/test/java/io/druid/indexing/common/task/RealtimeIndexTaskTest.java
+index f16575abdac..64677e13ce7 100644
+--- a/indexing-service/src/test/java/io/druid/indexing/common/task/RealtimeIndexTaskTest.java
++++ b/indexing-service/src/test/java/io/druid/indexing/common/task/RealtimeIndexTaskTest.java
+@@ -120,6 +120,7 @@
+ import io.druid.server.coordination.DataSegmentServerAnnouncer;
+ import io.druid.server.coordination.ServerType;
+ import io.druid.timeline.DataSegment;
++import io.druid.utils.Runnables;
+ import org.easymock.EasyMock;
+ import org.hamcrest.CoreMatchers;
+ import org.joda.time.DateTime;
+@@ -209,8 +210,7 @@ public InputRow nextRow()
+     @Override
+     public Runnable commit()
+     {
+-      return () -> {
+-      };
++      return Runnables.getNoopRunnable();
+     }
+ 
+     @Override
+@@ -1121,7 +1121,7 @@ public Long sumMetric(final Task task, final DimFilter filter, final String metr
+         Lists.<Result<TimeseriesResultValue>>newArrayList()
+     );
+     if (results.isEmpty()) {
+-      return NullHandling.nullToZeroIfNeeded((Long) null);
++      return NullHandling.defaultLongValue();
+     }
+     return results.get(0).getValue().getLongMetric(metric);
+   }
+diff --git a/processing/src/main/java/io/druid/query/aggregation/AggregatorUtil.java b/processing/src/main/java/io/druid/query/aggregation/AggregatorUtil.java
+index a67a24b7bbb..a8078aefb0a 100644
+--- a/processing/src/main/java/io/druid/query/aggregation/AggregatorUtil.java
++++ b/processing/src/main/java/io/druid/query/aggregation/AggregatorUtil.java
+@@ -37,6 +37,7 @@
+ import io.druid.segment.LongColumnSelector;
+ import io.druid.segment.virtual.ExpressionSelectors;
+ 
++import javax.annotation.Nullable;
+ import java.util.HashSet;
+ import java.util.LinkedList;
+ import java.util.List;
+@@ -141,7 +142,7 @@ public static BaseFloatColumnValueSelector makeColumnValueSelectorWithFloatDefau
+       final ExprMacroTable macroTable,
+       final String fieldName,
+       final String fieldExpression,
+-      final Float nullValue
++      @Nullable final Float nullValue
+   )
+   {
+     if (fieldName != null && fieldExpression == null) {
+diff --git a/processing/src/main/java/io/druid/query/aggregation/NullableAggregateCombiner.java b/processing/src/main/java/io/druid/query/aggregation/NullableAggregateCombiner.java
+index c261da320c5..a4cdf25a6ad 100644
+--- a/processing/src/main/java/io/druid/query/aggregation/NullableAggregateCombiner.java
++++ b/processing/src/main/java/io/druid/query/aggregation/NullableAggregateCombiner.java
+@@ -44,8 +44,12 @@ public NullableAggregateCombiner(AggregateCombiner delegate)
+   @Override
+   public void reset(ColumnValueSelector selector)
+   {
+-    isNullResult = true;
+-    delegate.reset(selector);
++    if(selector.isNull()){
++      isNullResult = true;
++    } else {
++      isNullResult = false;
++      delegate.reset(selector);
++    }
+   }
+ 
+   @Override
+@@ -81,7 +85,7 @@ public long getLong()
+   @Override
+   public boolean isNull()
+   {
+-    return isNullResult;
++    return isNullResult || delegate.isNull();
+   }
+ 
+   @Nullable
+diff --git a/processing/src/main/java/io/druid/query/aggregation/NullableAggregatorFactory.java b/processing/src/main/java/io/druid/query/aggregation/NullableAggregatorFactory.java
+index 698d3afa015..6dd116b747c 100644
+--- a/processing/src/main/java/io/druid/query/aggregation/NullableAggregatorFactory.java
++++ b/processing/src/main/java/io/druid/query/aggregation/NullableAggregatorFactory.java
+@@ -26,10 +26,12 @@
+ import io.druid.segment.ColumnSelectorFactory;
+ 
+ /**
++ * abstract class with functionality to wrap aggregator/bufferAggregator/combiner to make them Nullable.
++ * Implementations of {@link AggregatorFactory} which needs to Support Nullable Aggregations are encouraged
++ * to extend this class.
+  */
+ public abstract class NullableAggregatorFactory extends AggregatorFactory
+ {
+-
+   @Override
+   final public Aggregator factorize(ColumnSelectorFactory metricFactory)
+   {
+diff --git a/processing/src/main/java/io/druid/query/aggregation/NullableBufferAggregator.java b/processing/src/main/java/io/druid/query/aggregation/NullableBufferAggregator.java
+index 5e3f6d894f3..943d82b64e0 100644
+--- a/processing/src/main/java/io/druid/query/aggregation/NullableBufferAggregator.java
++++ b/processing/src/main/java/io/druid/query/aggregation/NullableBufferAggregator.java
+@@ -30,7 +30,6 @@
+  * Note that the delegate aggregator is not required to perform check for isNull on the columnValueSelector as only non-null values
+  * will be passed to the delegate aggregator.
+  */
+-
+ public class NullableBufferAggregator implements BufferAggregator
+ {
+   private static final byte IS_NULL_BYTE = (byte) 1;
+diff --git a/processing/src/main/java/io/druid/query/groupby/epinephelinae/column/DictionaryBuildingStringGroupByColumnSelectorStrategy.java b/processing/src/main/java/io/druid/query/groupby/epinephelinae/column/DictionaryBuildingStringGroupByColumnSelectorStrategy.java
+index 8ba0cc6dfa6..5ba86423687 100644
+--- a/processing/src/main/java/io/druid/query/groupby/epinephelinae/column/DictionaryBuildingStringGroupByColumnSelectorStrategy.java
++++ b/processing/src/main/java/io/druid/query/groupby/epinephelinae/column/DictionaryBuildingStringGroupByColumnSelectorStrategy.java
+@@ -60,7 +60,7 @@ public void processValueFromGroupingKey(GroupByColumnSelectorPlus selectorPlus,
+           value
+       );
+     } else {
+-      resultMap.put(selectorPlus.getOutputName(), NullHandling.defaultValue());
++      resultMap.put(selectorPlus.getOutputName(), NullHandling.defaultStringValue());
+     }
+   }
+ 

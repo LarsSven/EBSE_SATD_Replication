@@ -1,0 +1,122 @@
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousQueuedDataReader.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousQueuedDataReader.scala
+index 75d174fdc569a..6453c74b50f9d 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousQueuedDataReader.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousQueuedDataReader.scala
+@@ -62,18 +62,15 @@ class ContinuousQueuedDataReader(
+ 
+   private val queue = new ArrayBlockingQueue[ContinuousRecord](dataQueueSize)
+ 
+-  private val epochPollFailed = new AtomicBoolean(false)
+-  private val dataReaderFailed = new AtomicBoolean(false)
+-
+   private val coordinatorId = context.getLocalProperty(ContinuousExecution.EPOCH_COORDINATOR_ID_KEY)
+ 
+   private val epochMarkerExecutor = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+     s"epoch-poll--$coordinatorId--${context.partitionId()}")
+-  private val epochMarkerGenerator = new EpochMarkerGenerator(queue, context, epochPollFailed)
++  private val epochMarkerGenerator = new EpochMarkerGenerator
+   epochMarkerExecutor.scheduleWithFixedDelay(
+     epochMarkerGenerator, 0, epochPollIntervalMs, TimeUnit.MILLISECONDS)
+ 
+-  private val dataReaderThread = new DataReaderThread(reader, queue, context, dataReaderFailed)
++  private val dataReaderThread = new DataReaderThread
+   dataReaderThread.setDaemon(true)
+   dataReaderThread.start()
+ 
+@@ -95,10 +92,10 @@ class ContinuousQueuedDataReader(
+         // haven't sent one.
+         currentEntry = EpochMarker
+       } else {
+-        if (dataReaderFailed.get()) {
++        if (dataReaderThread.failureReason != null) {
+           throw new SparkException("data read failed", dataReaderThread.failureReason)
+         }
+-        if (epochPollFailed.get()) {
++        if (epochMarkerGenerator.failureReason != null) {
+           throw new SparkException("epoch poll failed", epochMarkerGenerator.failureReason)
+         }
+         currentEntry = queue.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+@@ -117,15 +114,10 @@ class ContinuousQueuedDataReader(
+    * The data component of [[ContinuousQueuedDataReader]]. Pushes (row, offset) to the queue when
+    * a new row arrives to the [[DataReader]].
+    */
+-  class DataReaderThread(
+-      reader: DataReader[UnsafeRow],
+-      queue: BlockingQueue[ContinuousRecord],
+-      context: TaskContext,
+-      failedFlag: AtomicBoolean)
+-    extends Thread(
++  class DataReaderThread extends Thread(
+       s"continuous-reader--${context.partitionId()}--" +
+         s"${context.getLocalProperty(ContinuousExecution.EPOCH_COORDINATOR_ID_KEY)}") {
+-    private[continuous] var failureReason: Throwable = _
++    @volatile private[continuous] var failureReason: Throwable = _
+ 
+     override def run(): Unit = {
+       TaskContext.setTaskContext(context)
+@@ -150,7 +142,6 @@ class ContinuousQueuedDataReader(
+ 
+         case t: Throwable =>
+           failureReason = t
+-          failedFlag.set(true)
+           // Don't rethrow the exception in this thread. It's not needed, and the default Spark
+           // exception handler will kill the executor.
+       } finally {
+@@ -163,12 +154,8 @@ class ContinuousQueuedDataReader(
+    * The epoch marker component of [[ContinuousQueuedDataReader]]. Populates the queue with
+    * (null, null) when a new epoch marker arrives.
+    */
+-  class EpochMarkerGenerator(
+-      queue: BlockingQueue[ContinuousRecord],
+-      context: TaskContext,
+-      failedFlag: AtomicBoolean)
+-    extends Thread with Logging {
+-    private[continuous] var failureReason: Throwable = _
++  class EpochMarkerGenerator extends Thread with Logging {
++    @volatile private[continuous] var failureReason: Throwable = _
+ 
+     private val epochEndpoint = EpochCoordinatorRef.get(
+       context.getLocalProperty(ContinuousExecution.EPOCH_COORDINATOR_ID_KEY), SparkEnv.get)
+@@ -191,7 +178,6 @@ class ContinuousQueuedDataReader(
+       } catch {
+         case t: Throwable =>
+           failureReason = t
+-          failedFlag.set(true)
+           throw t
+       }
+     }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousWriteRDD.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousWriteRDD.scala
+index 07f6408f31e10..1bd0b49eba906 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousWriteRDD.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/continuous/ContinuousWriteRDD.scala
+@@ -17,7 +17,10 @@
+ 
+ package org.apache.spark.sql.execution.streaming.continuous
+ 
++import java.util.concurrent.atomic.AtomicLong
++
+ import org.apache.spark.{Partition, SparkEnv, TaskContext}
++
+ import org.apache.spark.rdd.RDD
+ import org.apache.spark.sql.catalyst.InternalRow
+ import org.apache.spark.sql.execution.datasources.v2.DataWritingSparkTask.{logError, logInfo}
+@@ -43,7 +46,8 @@ class ContinuousWriteRDD(var prev: RDD[InternalRow], writeTask: DataWriterFactor
+     val epochCoordinator = EpochCoordinatorRef.get(
+       context.getLocalProperty(ContinuousExecution.EPOCH_COORDINATOR_ID_KEY),
+       SparkEnv.get)
+-    var currentEpoch = context.getLocalProperty(ContinuousExecution.START_EPOCH_KEY).toLong
++    ContinuousWriteRDD.currentEpoch.set(
++      new AtomicLong(context.getLocalProperty(ContinuousExecution.START_EPOCH_KEY).toLong))
+ 
+     do {
+       var dataWriter: DataWriter[InternalRow] = null
+@@ -86,3 +90,9 @@ class ContinuousWriteRDD(var prev: RDD[InternalRow], writeTask: DataWriterFactor
+     prev = null
+   }
+ }
++
++object ContinuousWriteRDD {
++  val currentEpoch: InheritableThreadLocal[AtomicLong] = new InheritableThreadLocal[AtomicLong] {
++
++  }
++}

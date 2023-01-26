@@ -1,0 +1,178 @@
+diff --git a/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIO.java b/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIO.java
+index 2d450aba202e..0b3acc53e66b 100644
+--- a/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIO.java
++++ b/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIO.java
+@@ -135,11 +135,9 @@
+  * <p>Example 4: reading a file or file pattern of RFC4180-compliant CSV files with fields that may
+  * contain line breaks.
+  *
+- * Example of such a file could be:
++ * <p>Example of such a file could be:
+  *
+- * "aaa","b CRLF
+- *  bb","ccc" CRLF
+- *  zzz,yyy,xxx
++ * <p>"aaa","b CRLF bb","ccc" CRLF zzz,yyy,xxx
+  *
+  * <pre>{@code
+  * Pipeline p = ...;
+@@ -475,7 +473,7 @@ public void processElement(ProcessContext p) {
+         Map<String, Long> pastRecords = new HashMap<>();
+ 
+         // For each (File, Range) Pair, compute the number of records before it
+-        for (Map.Entry entry : sorted.entrySet()) {
++        for (Map.Entry<KV<String, Long>, Long> entry : sorted.entrySet()) {
+           Long numRecords = (long) entry.getValue();
+           KV<String, Long> fileRange = (KV<String, Long>) entry.getKey();
+           String file = fileRange.getKey();
+@@ -505,16 +503,13 @@ public void processElement(ProcessContext p) {
+         RecordWithMetadata record = p.element().getValue();
+         Long numRecordsLessThanThisRange =
+             p.sideInput(numRecordsBeforeEachRange).get(KV.of(file, range));
+-        RecordWithMetadata newLine =
+-            RecordWithMetadata.newBuilder()
+-                .setValue(record.getValue())
+-                .setRecordOffset(record.getRecordOffset())
++        // update the recordNum in record
++        record =
++            record
++                .toBuilder()
+                 .setRecordNum(record.getRecordNumInOffset() + numRecordsLessThanThisRange)
+-                .setFileName(record.getFileName())
+-                .setRangeOffset(record.getRangeOffset())
+-                .setRecordNumInOffset(record.getRecordNumInOffset())
+                 .build();
+-        p.output(newLine);
++        p.output(record);
+       }
+     }
+ 
+diff --git a/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOSource.java b/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOSource.java
+index 08eba65ea043..51db88405ce1 100644
+--- a/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOSource.java
++++ b/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOSource.java
+@@ -103,6 +103,7 @@ protected FileBasedReader<RecordWithMetadata> createSingleFileReader(PipelineOpt
+     return new MultiLineTextBasedReader(this, delimiter, hasMultilineCSVRecords);
+   }
+ 
++  /** Returns the {@link Coder Coder} for {@link RecordWithMetadata RecordWithMetadata} */
+   @Override
+   public Coder<RecordWithMetadata> getOutputCoder() {
+     SchemaCoder<RecordWithMetadata> coder = null;
+@@ -195,7 +196,7 @@ protected void startReading(ReadableByteChannel channel) throws IOException {
+           requiredPosition = startOffset - delimiter.length;
+         }
+         ((SeekableByteChannel) channel).position(requiredPosition);
+-        findDelimiterBoundsWithMultiLineCheck();
++        findDelimiterBounds();
+         buffer = buffer.substring(endOfDelimiterInBuffer);
+         startOfNextRecord = requiredPosition + endOfDelimiterInBuffer;
+         endOfDelimiterInBuffer = 0;
+@@ -203,10 +204,6 @@ protected void startReading(ReadableByteChannel channel) throws IOException {
+       }
+     }
+ 
+-    private void findDelimiterBoundsWithMultiLineCheck() throws IOException {
+-      findDelimiterBounds();
+-    }
+-
+     /**
+      * Locates the start position and end position of the next delimiter. Will consume the channel
+      * till either EOF or the delimiter bounds are found.
+@@ -298,7 +295,7 @@ private void findDelimiterBounds() throws IOException {
+     protected boolean readNextRecord() throws IOException {
+       startOfRecord = startOfNextRecord;
+ 
+-      findDelimiterBoundsWithMultiLineCheck();
++      findDelimiterBounds();
+ 
+       // If we have reached EOF file and consumed all of the buffer then we know
+       // that there are no more records.
+diff --git a/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/RecordWithMetadata.java b/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/RecordWithMetadata.java
+index 341d703ba44d..1d2446855f70 100644
+--- a/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/RecordWithMetadata.java
++++ b/sdks/java/io/contextual-text-io/src/main/java/org/apache/beam/sdk/io/contextualtextio/RecordWithMetadata.java
+@@ -19,7 +19,6 @@
+ 
+ import com.google.auto.value.AutoValue;
+ import org.apache.beam.sdk.annotations.Experimental;
+-import org.apache.beam.sdk.io.fs.ResourceId;
+ import org.apache.beam.sdk.schemas.AutoValueSchema;
+ import org.apache.beam.sdk.schemas.annotations.DefaultSchema;
+ 
+@@ -35,33 +34,48 @@
+  *       RecordWithMetadata#getRecordOffset()}
+  *   <li>recordNum: The ordinal number of the record in its file. {@link
+  *       RecordWithMetadata#getRecordNum()}
+- *   <li>recordValue: The value / contents of the record {@link RecordWithMetadata#getValue()}
++ *   <li>recordValue: The value / contents of the record. {@link RecordWithMetadata#getValue()}
+  *   <li>rangeOffset: The starting offset of the range (split), which contained the record, when the
+  *       record was read. {@link RecordWithMetadata#getRangeOffset()}
+  *   <li>recordNumInOffset: The record number relative to the Range. (line number within the range)
+  *       {@link RecordWithMetadata#getRecordNumInOffset()}
+  *   <li>fileName: Name of the file to which the record belongs (this is the full filename,
+- *       eg:path/to/file.txt) {@link RecordWithMetadata#getFileName()}
++ *       eg:path/to/file.txt). {@link RecordWithMetadata#getFileName()}
+  * </ul>
+  */
+ @Experimental(Experimental.Kind.SCHEMAS)
+ @DefaultSchema(AutoValueSchema.class)
+ @AutoValue
+ public abstract class RecordWithMetadata {
++  /**
++   * Returns the offset of the record (the byte at which the record begins) in a file. This
++   * information can be useful if you wish to reconstruct the file.
++   */
+   public abstract long getRecordOffset();
+ 
++  /** Returns the ordinal number of the record in its file. */
+   public abstract long getRecordNum();
+ 
++  /** Returns the value / content of the Record */
+   public abstract String getValue();
+ 
++  /**
++   * Returns the starting offset of the range (split), which contained the record, when the record
++   * was read.
++   */
+   public abstract long getRangeOffset();
+ 
++  /** Returns the record number relative to the Range. */
+   public abstract long getRecordNumInOffset();
+ 
+-  public abstract Builder toBuilder();
+-
++  /**
++   * Returns the name of the file to which the record belongs (this is the full filename,
++   * eg:path/to/file.txt).
++   */
+   public abstract String getFileName();
+ 
++  public abstract Builder toBuilder();
++
+   public static Builder newBuilder() {
+     return new AutoValue_RecordWithMetadata.Builder();
+   }
+@@ -72,7 +86,7 @@ public abstract static class Builder {
+ 
+     public abstract Builder setRecordOffset(long recordOffset);
+ 
+-    public abstract Builder setValue(String Value);
++    public abstract Builder setValue(String value);
+ 
+     public abstract Builder setFileName(String fileName);
+ 
+diff --git a/sdks/java/io/contextual-text-io/src/test/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOTest.java b/sdks/java/io/contextual-text-io/src/test/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOTest.java
+index 0852185355b6..89498ade90fe 100644
+--- a/sdks/java/io/contextual-text-io/src/test/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOTest.java
++++ b/sdks/java/io/contextual-text-io/src/test/java/org/apache/beam/sdk/io/contextualtextio/ContextualTextIOTest.java
+@@ -764,8 +764,7 @@ public void processElement(@Element RecordWithMetadata record, OutputReceiver<St
+     public static class GetDetails extends DoFn<RecordWithMetadata, String> {
+       @ProcessElement
+       public void processElement(@Element RecordWithMetadata record, OutputReceiver<String> out) {
+-        out.output(
+-            record.getFileName() + " " + record.getRecordNum() + " " + record.getValue());
++        out.output(record.getFileName() + " " + record.getRecordNum() + " " + record.getValue());
+       }
+     }
+ 

@@ -1,0 +1,526 @@
+diff --git a/airflow/config_templates/config.yml b/airflow/config_templates/config.yml
+index df5a53abe7282..516bb6284e1c0 100644
+--- a/airflow/config_templates/config.yml
++++ b/airflow/config_templates/config.yml
+@@ -1747,84 +1747,6 @@
+       type: string
+       example: ~
+       default: "False"
+-- name: ldap
+-  description: ~
+-  options:
+-    - name: uri
+-      description: |
+-        set this to ldaps://<your.ldap.server>:<port>
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: ""
+-    - name: user_filter
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "objectClass=*"
+-    - name: user_name_attr
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "uid"
+-    - name: group_member_attr
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "memberOf"
+-    - name: superuser_filter
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: ""
+-    - name: data_profiler_filter
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: ""
+-    - name: bind_user
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "cn=Manager,dc=example,dc=com"
+-    - name: bind_password
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "insecure"
+-    - name: basedn
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "dc=example,dc=com"
+-    - name: cacert
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "/etc/ca/ldap_ca.crt"
+-    - name: search_scope
+-      description: ~
+-      version_added: ~
+-      type: string
+-      example: ~
+-      default: "LEVEL"
+-    - name: ignore_malformed_schema
+-      description: |
+-        This setting allows the use of LDAP servers that either return a
+-        broken schema, or do not return a schema.
+-      version_added: 1.10.3
+-      type: string
+-      example: ~
+-      default: "False"
+ - name: kerberos
+   description: ~
+   options:
+diff --git a/airflow/config_templates/default_airflow.cfg b/airflow/config_templates/default_airflow.cfg
+index 8a9a6a62b6ceb..cebbfd955489f 100644
+--- a/airflow/config_templates/default_airflow.cfg
++++ b/airflow/config_templates/default_airflow.cfg
+@@ -873,24 +873,6 @@ use_job_schedule = True
+ # Only has effect if schedule_interval is set to None in DAG
+ allow_trigger_in_future = False
+ 
+-[ldap]
+-# set this to ldaps://<your.ldap.server>:<port>
+-uri =
+-user_filter = objectClass=*
+-user_name_attr = uid
+-group_member_attr = memberOf
+-superuser_filter =
+-data_profiler_filter =
+-bind_user = cn=Manager,dc=example,dc=com
+-bind_password = insecure
+-basedn = dc=example,dc=com
+-cacert = /etc/ca/ldap_ca.crt
+-search_scope = LEVEL
+-
+-# This setting allows the use of LDAP servers that either return a
+-# broken schema, or do not return a schema.
+-ignore_malformed_schema = False
+-
+ [kerberos]
+ ccache = /tmp/airflow_krb5_ccache
+ 
+diff --git a/airflow/configuration.py b/airflow/configuration.py
+index 92790d1fb763b..338526b06c62d 100644
+--- a/airflow/configuration.py
++++ b/airflow/configuration.py
+@@ -129,7 +129,6 @@ class AirflowConfigParser(ConfigParser):  # pylint: disable=too-many-ancestors
+         ('celery', 'result_backend'),
+         ('atlas', 'password'),
+         ('smtp', 'smtp_password'),
+-        ('ldap', 'bind_password'),
+         ('kubernetes', 'git_password'),
+     }
+ 
+diff --git a/airflow/providers_manager.py b/airflow/providers_manager.py
+new file mode 100644
+index 0000000000000..5d5f206d63625
+--- /dev/null
++++ b/airflow/providers_manager.py
+@@ -0,0 +1,78 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++"""Manages all providers."""
++import importlib
++import logging
++import pkgutil
++import traceback
++
++import yaml
++
++try:
++    import importlib.resources as importlib_resources
++except ImportError:
++    # Try backported to PY<37 `importlib_resources`.
++    import importlib_resources
++
++
++log = logging.getLogger(__name__)
++
++
++class ProvidersManager:
++    """Manages all provider packages."""
++
++    def __find_all_providers(self, paths: str):
++        def onerror(_):
++            exception_string = traceback.format_exc()
++            log.warning(exception_string)
++
++        for module_info in pkgutil.walk_packages(paths, prefix="airflow.providers.", onerror=onerror):
++            try:
++                imported_module = importlib.import_module(module_info.name)
++            except Exception as e:  # noqa pylint: disable=broad-except
++                log.warning("Error when importing %s:%s", module_info.name, e)
++                continue
++            try:
++                provider_info = yaml.safe_load(
++                    importlib_resources.read_text(imported_module, 'provider.yaml')
++                )
++                # TODO(potiuk): map to a class maybe? Or we might stick to a dictionary
++                self._provider_directory[provider_info['package-name']] = provider_info
++            except FileNotFoundError:
++                # This is OK - this is not a provider package
++                pass
++            except TypeError as e:
++                if "is not a package" not in str(e):
++                    log.warning("Error when loading 'provider.yaml' file from %s:%s}", module_info.name, e)
++                # Otherwise this is OK - this is likely a module
++            except Exception as e:  # noqa pylint: disable=broad-except
++                log.warning("Error when loading 'provider.yaml' file from %s:%s", module_info.name, e)
++
++    def __init__(self):
++        self._provider_directory = {}
++        try:
++            from airflow import providers
++        except ImportError as e:
++            log.warning("No providers are present or error when importing them! :%s", e)
++            return
++        self.__find_all_providers(providers.__path__)
++
++    @property
++    def providers(self):
++        """Returns information about available providers."""
++        return self._provider_directory
+diff --git a/airflow/settings.py b/airflow/settings.py
+index 41642f428e065..7b6436ad9f25d 100644
+--- a/airflow/settings.py
++++ b/airflow/settings.py
+@@ -364,6 +364,36 @@ def prepare_syspath():
+         sys.path.append(PLUGINS_FOLDER)
+ 
+ 
++def get_session_lifetime_config():
++    """Gets session timeout configs and handles outdated configs gracefully."""
++    session_lifetime_minutes = conf.get('webserver', 'session_lifetime_minutes', fallback=None)
++    session_lifetime_days = conf.get('webserver', 'session_lifetime_days', fallback=None)
++    uses_deprecated_lifetime_configs = session_lifetime_days or conf.get(
++        'webserver', 'force_logout_after', fallback=None
++    )
++
++    minutes_per_day = 24 * 60
++    default_lifetime_minutes = '43200'
++    if uses_deprecated_lifetime_configs and session_lifetime_minutes == default_lifetime_minutes:
++        warnings.warn(
++            '`session_lifetime_days` option from `[webserver]` section has been '
++            'renamed to `session_lifetime_minutes`. The new option allows to configure '
++            'session lifetime in minutes. The `force_logout_after` option has been removed '
++            'from `[webserver]` section. Please update your configuration.',
++            category=DeprecationWarning,
++        )
++        if session_lifetime_days:
++            session_lifetime_minutes = minutes_per_day * int(session_lifetime_days)
++
++    if not session_lifetime_minutes:
++        session_lifetime_days = 30
++        session_lifetime_minutes = minutes_per_day * session_lifetime_days
++
++    logging.info('User session lifetime is set to %s minutes.', session_lifetime_minutes)
++
++    return int(session_lifetime_minutes)
++
++
+ def import_local_settings():
+     """Import airflow_local_settings.py files to allow overriding any configs in settings.py file"""
+     try:  # pylint: disable=too-many-nested-blocks
+diff --git a/airflow/www/app.py b/airflow/www/app.py
+index 25ebd0febe18c..986319887f3ae 100644
+--- a/airflow/www/app.py
++++ b/airflow/www/app.py
+@@ -16,8 +16,6 @@
+ # specific language governing permissions and limitations
+ # under the License.
+ #
+-import logging
+-import sys
+ from datetime import timedelta
+ from typing import Optional
+ 
+@@ -71,23 +69,7 @@ def create_app(config=None, testing=False, app_name="Airflow"):
+     flask_app = Flask(__name__)
+     flask_app.secret_key = conf.get('webserver', 'SECRET_KEY')
+ 
+-    if conf.has_option('webserver', 'SESSION_LIFETIME_DAYS') or conf.has_option(
+-        'webserver', 'FORCE_LOG_OUT_AFTER'
+-    ):
+-        logging.error(
+-            '`SESSION_LIFETIME_DAYS` option from `webserver` section has been '
+-            'renamed to `SESSION_LIFETIME_MINUTES`. New option allows to configure '
+-            'session lifetime in minutes. FORCE_LOG_OUT_AFTER option has been removed '
+-            'from `webserver` section. Please update your configuration.'
+-        )
+-        # Stop gunicorn server https://github.com/benoitc/gunicorn/blob/20.0.4/gunicorn/arbiter.py#L526
+-        sys.exit(4)
+-    else:
+-        session_lifetime_minutes = conf.getint('webserver', 'SESSION_LIFETIME_MINUTES', fallback=43200)
+-        logging.info('User session lifetime is set to %s minutes.', session_lifetime_minutes)
+-
+-    flask_app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=session_lifetime_minutes)
+-
++    flask_app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=settings.get_session_lifetime_config())
+     flask_app.config.from_pyfile(settings.WEBSERVER_CONFIG, silent=True)
+     flask_app.config['APP_NAME'] = app_name
+     flask_app.config['TESTING'] = testing
+diff --git a/dev/provider_packages/MANIFEST_TEMPLATE.in.jinja2 b/dev/provider_packages/MANIFEST_TEMPLATE.in.jinja2
+index 4fd2e90309a06..9963ebd81ae02 100644
+--- a/dev/provider_packages/MANIFEST_TEMPLATE.in.jinja2
++++ b/dev/provider_packages/MANIFEST_TEMPLATE.in.jinja2
+@@ -27,6 +27,8 @@ include airflow/providers/google/cloud/example_dags/*.sql
+ include airflow/providers/papermill/example_dags/*.ipynb
+ {% endif %}
+ 
++include airflow/providers/{{ PROVIDER_PATH }}/provider.yaml
++
+ include NOTICE
+ include LICENSE
+ include CHANGELOG.txt
+diff --git a/docs/howto/set-config.rst b/docs/howto/set-config.rst
+index 090a6f9352d44..3ba7d9fd2ab02 100644
+--- a/docs/howto/set-config.rst
++++ b/docs/howto/set-config.rst
+@@ -69,7 +69,6 @@ The following config options support this ``_cmd`` and ``_secret`` version:
+ * ``result_backend`` in ``[celery]`` section
+ * ``password`` in ``[atlas]`` section
+ * ``smtp_password`` in ``[smtp]`` section
+-* ``bind_password`` in ``[ldap]`` section
+ * ``git_password`` in ``[kubernetes]`` section
+ 
+ The ``_cmd`` config options can also be set using a corresponding environment variable
+diff --git a/docs/spelling_wordlist.txt b/docs/spelling_wordlist.txt
+index 0a1571a59c78f..eaf8c2e15d60c 100644
+--- a/docs/spelling_wordlist.txt
++++ b/docs/spelling_wordlist.txt
+@@ -478,7 +478,6 @@ backticks
+ balancer
+ balancers
+ baseOperator
+-basedn
+ basestring
+ basetaskrunner
+ bashrc
+diff --git a/setup.py b/setup.py
+index fe2522c543ebd..624e4206d7bbb 100644
+--- a/setup.py
++++ b/setup.py
+@@ -837,6 +837,7 @@ def is_package_excluded(package: str, exclusion_list: List[str]):
+     'graphviz>=0.12',
+     'gunicorn>=19.5.0, <20.0',
+     'iso8601>=0.1.12',
++    'importlib_resources; python_version<"3.7"',
+     'jinja2>=2.10.1, <2.12.0',
+     'json-merge-patch==0.2',
+     'jsonschema~=3.0',
+diff --git a/tests/core/test_config_templates.py b/tests/core/test_config_templates.py
+index 9c09c318c678c..42ba99133028a 100644
+--- a/tests/core/test_config_templates.py
++++ b/tests/core/test_config_templates.py
+@@ -45,7 +45,6 @@
+     'celery_broker_transport_options',
+     'dask',
+     'scheduler',
+-    'ldap',
+     'kerberos',
+     'github_enterprise',
+     'admin',
+diff --git a/tests/core/test_local_settings.py b/tests/core/test_local_settings.py
+index 8eacf0e542f5c..0915ec3b6a8be 100644
+--- a/tests/core/test_local_settings.py
++++ b/tests/core/test_local_settings.py
+@@ -23,6 +23,7 @@
+ from unittest.mock import MagicMock, call
+ 
+ from airflow.exceptions import AirflowClusterPolicyViolation
++from tests.test_utils.config import conf_vars
+ 
+ SETTINGS_FILE_POLICY = """
+ def test_policy(task_instance):
+@@ -180,3 +181,33 @@ def test_custom_policy(self):
+             task_instance.owner = 'airflow'
+             with self.assertRaises(AirflowClusterPolicyViolation):
+                 settings.task_must_have_owners(task_instance)  # pylint: disable=no-member
++
++
++class TestUpdatedConfigNames(unittest.TestCase):
++    @conf_vars(
++        {("webserver", "session_lifetime_days"): '5', ("webserver", "session_lifetime_minutes"): '43200'}
++    )
++    def test_updates_deprecated_session_timeout_config_val_when_new_config_val_is_default(self):
++        from airflow import settings
++
++        with self.assertWarns(DeprecationWarning):
++            session_lifetime_config = settings.get_session_lifetime_config()
++            minutes_in_five_days = 5 * 24 * 60
++            self.assertEqual(session_lifetime_config, minutes_in_five_days)
++
++    @conf_vars(
++        {("webserver", "session_lifetime_days"): '5', ("webserver", "session_lifetime_minutes"): '43201'}
++    )
++    def test_uses_updated_session_timeout_config_when_val_is_not_default(self):
++        from airflow import settings
++
++        session_lifetime_config = settings.get_session_lifetime_config()
++        self.assertEqual(session_lifetime_config, 43201)
++
++    @conf_vars({("webserver", "session_lifetime_days"): ''})
++    def test_uses_updated_session_timeout_config_by_default(self):
++        from airflow import settings
++
++        session_lifetime_config = settings.get_session_lifetime_config()
++        default_timeout_minutes = 30 * 24 * 60
++        self.assertEqual(session_lifetime_config, default_timeout_minutes)
+diff --git a/tests/core/test_providers_manager.py b/tests/core/test_providers_manager.py
+new file mode 100644
+index 0000000000000..c18566e8dd6e5
+--- /dev/null
++++ b/tests/core/test_providers_manager.py
+@@ -0,0 +1,91 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++import unittest
++
++from airflow.providers_manager import ProvidersManager
++
++ALL_PROVIDERS = [
++    'apache-airflow-providers-amazon',
++    'apache-airflow-providers-apache-cassandra',
++    'apache-airflow-providers-apache-druid',
++    'apache-airflow-providers-apache-hdfs',
++    'apache-airflow-providers-apache-hive',
++    'apache-airflow-providers-apache-kylin',
++    'apache-airflow-providers-apache-livy',
++    'apache-airflow-providers-apache-pig',
++    'apache-airflow-providers-apache-pinot',
++    'apache-airflow-providers-apache-spark',
++    'apache-airflow-providers-apache-sqoop',
++    'apache-airflow-providers-celery',
++    'apache-airflow-providers-cloudant',
++    'apache-airflow-providers-cncf-kubernetes',
++    'apache-airflow-providers-databricks',
++    'apache-airflow-providers-datadog',
++    'apache-airflow-providers-dingding',
++    'apache-airflow-providers-discord',
++    'apache-airflow-providers-docker',
++    'apache-airflow-providers-elasticsearch',
++    'apache-airflow-providers-exasol',
++    'apache-airflow-providers-facebook',
++    'apache-airflow-providers-ftp',
++    'apache-airflow-providers-google',
++    'apache-airflow-providers-grpc',
++    'apache-airflow-providers-hashicorp',
++    'apache-airflow-providers-http',
++    'apache-airflow-providers-imap',
++    'apache-airflow-providers-jdbc',
++    'apache-airflow-providers-jenkins',
++    'apache-airflow-providers-jira',
++    'apache-airflow-providers-microsoft-azure',
++    'apache-airflow-providers-microsoft-mssql',
++    'apache-airflow-providers-microsoft-winrm',
++    'apache-airflow-providers-mongo',
++    'apache-airflow-providers-mysql',
++    'apache-airflow-providers-odbc',
++    'apache-airflow-providers-openfaas',
++    'apache-airflow-providers-opsgenie',
++    'apache-airflow-providers-oracle',
++    'apache-airflow-providers-pagerduty',
++    'apache-airflow-providers-papermill',
++    'apache-airflow-providers-plexus',
++    'apache-airflow-providers-postgres',
++    'apache-airflow-providers-presto',
++    'apache-airflow-providers-qubole',
++    'apache-airflow-providers-redis',
++    'apache-airflow-providers-salesforce',
++    'apache-airflow-providers-samba',
++    'apache-airflow-providers-segment',
++    'apache-airflow-providers-sendgrid',
++    'apache-airflow-providers-sftp',
++    'apache-airflow-providers-singularity',
++    'apache-airflow-providers-slack',
++    'apache-airflow-providers-snowflake',
++    'apache-airflow-providers-sqlite',
++    'apache-airflow-providers-ssh',
++    'apache-airflow-providers-vertica',
++    'apache-airflow-providers-yandex',
++    'apache-airflow-providers-zendesk',
++]
++
++
++class TestProviderManager(unittest.TestCase):
++    def test_providers_are_loaded(self):
++        provider_manager = ProvidersManager()
++        provider_list = list(provider_manager.providers.keys())
++        provider_list.sort()
++        self.assertEqual(ALL_PROVIDERS, provider_list)
+diff --git a/tests/www/test_app.py b/tests/www/test_app.py
+index f0637e063c30f..814742a833fe2 100644
+--- a/tests/www/test_app.py
++++ b/tests/www/test_app.py
+@@ -25,7 +25,6 @@
+ from werkzeug.test import create_environ
+ from werkzeug.wrappers import Response
+ 
+-from airflow.configuration import conf
+ from airflow.www import app as application
+ from tests.test_utils.config import conf_vars
+ 
+@@ -233,16 +232,3 @@ def test_should_set_sqlalchemy_engine_options(self):
+     def test_should_set_permanent_session_timeout(self):
+         app = application.cached_app(testing=True)
+         self.assertEqual(app.config['PERMANENT_SESSION_LIFETIME'], timedelta(minutes=3600))
+-
+-    @conf_vars(
+-        {
+-            ('webserver', 'session_lifetime_days'): '30',
+-            ('webserver', 'force_log_out_after'): '30',
+-        }
+-    )
+-    @mock.patch("airflow.www.app.app", None)
+-    def test_should_stop_app_when_removed_options_are_provided(self):
+-        with self.assertRaises(SystemExit) as e:
+-            conf.remove_option('webserver', 'session_lifetime_minutes')
+-            application.cached_app(testing=True)
+-        self.assertEqual(e.exception.code, 4)

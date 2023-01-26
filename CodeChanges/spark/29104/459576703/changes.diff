@@ -1,0 +1,363 @@
+diff --git a/sql/catalyst/src/main/java/org/apache/spark/sql/catalyst/expressions/UnsafeRow.java b/sql/catalyst/src/main/java/org/apache/spark/sql/catalyst/expressions/UnsafeRow.java
+index 0217b2fb9b0a4..4dc5ce1de047b 100644
+--- a/sql/catalyst/src/main/java/org/apache/spark/sql/catalyst/expressions/UnsafeRow.java
++++ b/sql/catalyst/src/main/java/org/apache/spark/sql/catalyst/expressions/UnsafeRow.java
+@@ -591,15 +591,6 @@ public boolean anyNull() {
+     return BitSetMethods.anySet(baseObject, baseOffset, bitSetWidthInBytes / 8);
+   }
+ 
+-  public boolean allNull() {
+-    for (int i = 0; i < numFields; i++) {
+-      if (!BitSetMethods.isSet(baseObject, baseOffset, i)) {
+-        return false;
+-      }
+-    }
+-    return true;
+-  }
+-
+   /**
+    * Writes the content of this row into a memory address, identified by an object and an offset.
+    * The target memory address must already been allocated, and have enough space to hold all the
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
+index eaa3cdfd39952..df200add5ebbc 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/planning/patterns.scala
+@@ -393,9 +393,11 @@ object PhysicalWindow {
+ 
+ object ExtractSingleColumnNullAwareAntiJoin extends JoinSelectionHelper with PredicateHelper {
+ 
+-  // SingleColumn NullAwareAntiJoin
++  // TODO support multi column NULL-aware anti join in future.
++  // See. http://www.vldb.org/pvldb/vol2/vldb09-423.pdf Section 6
++  // multi-column null aware anti join is much more complicated than single column ones.
++
+   // streamedSideKeys, buildSideKeys
+-  // currently these two return Seq[Expression] should have only one element
+   private type ReturnType = (Seq[Expression], Seq[Expression])
+ 
+   /**
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
+index 1da4a90d90457..c06b3ea4a8a70 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
+@@ -51,9 +51,6 @@ case class BroadcastHashJoinExec(
+   extends HashJoin with CodegenSupport {
+ 
+   if (isNullAwareAntiJoin) {
+-    // TODO support multi column NULL-aware anti join in future.
+-    // See. http://www.vldb.org/pvldb/vol2/vldb09-423.pdf Section 6
+-    // multi-column null aware anti join is much more complicated than single column ones.
+     require(leftKeys.length == 1, "leftKeys length should be 1")
+     require(rightKeys.length == 1, "rightKeys length should be 1")
+     require(joinType == LeftAnti, "joinType must be LeftAnti.")
+@@ -149,9 +146,9 @@ case class BroadcastHashJoinExec(
+       streamedPlan.execute().mapPartitionsInternal { streamedIter =>
+         val hashed = broadcastRelation.value.asReadOnlyCopy()
+         TaskContext.get().taskMetrics().incPeakExecutionMemory(hashed.estimatedSize)
+-        if (hashed.isOriginInputEmpty) {
++        if (hashed.isOriginalInputEmpty) {
+           streamedIter
+-        } else if (hashed.allNullColumnKeyExistsInOriginInput) {
++        } else if (hashed.allNullColumnKeyExistsInOriginalInput) {
+           Iterator.empty
+         } else {
+           val keyGenerator = UnsafeProjection.create(
+@@ -161,12 +158,11 @@ case class BroadcastHashJoinExec(
+           )
+           streamedIter.filter(row => {
+             val lookupKey: UnsafeRow = keyGenerator(row)
+-            if (lookupKey.allNull()) {
++            // anyNull is equivalent to allNull since it's a single-column key.
++            if (lookupKey.anyNull()) {
+               false
+             } else {
+-              // in isNullAware mode
+-              // UnsafeHashedRelation include anyNull key, if match, dropped row
+-              // Same as LongHashedRelation where lookupKey isNotNullAt(0)
++              // Anti Join: Drop the row on the streamed side if it is a match on the build
+               hashed.get(lookupKey) == null
+             }
+           })
+@@ -494,32 +490,33 @@ case class BroadcastHashJoinExec(
+     val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
+     val (matched, checkCondition, _) = getJoinCondition(ctx, input)
+     val numOutput = metricTerm(ctx, "numOutputRows")
+-    val isLongHashedRelation = broadcastRelation.value.isInstanceOf[LongHashedRelation]
+ 
+-    // fast stop if isOriginInputEmpty = true
+-    // whether isNullAwareAntiJoin is true or false
+-    // should accept all rows in streamedSide
+-    if (broadcastRelation.value.isOriginInputEmpty) {
++    // fast stop if isOriginalInputEmpty = true, should accept all rows in streamedSide
++    if (broadcastRelation.value.isOriginalInputEmpty) {
+       return s"""
+-                |// Common Anti Join isOriginInputEmpty(true) accept all
++                |// Anti Join isOriginalInputEmpty(true) accept all
+                 |$numOutput.add(1);
+                 |${consume(ctx, input)}
+           """.stripMargin
+     }
+ 
+     if (isNullAwareAntiJoin) {
+-      if (broadcastRelation.value.allNullColumnKeyExistsInOriginInput) {
++      if (broadcastRelation.value.allNullColumnKeyExistsInOriginalInput) {
+         return s"""
+-                  |// NAAJ isOriginInputEmpty(false) anyNullKeyExists(true) reject all
++                  |// NAAJ
++                  |// isOriginalInputEmpty(false) allNullColumnKeyExistsInOriginalInput(true)
++                  |// reject all
+             """.stripMargin
+       } else {
+         val found = ctx.freshName("found")
+         return s"""
+-                  |// NAAJ isOriginInputEmpty(false) allNullColumnKeyExistsInOriginInput(false)
++                  |// NAAJ
++                  |// isOriginalInputEmpty(false) allNullColumnKeyExistsInOriginalInput(false)
+                   |boolean $found = false;
+                   |// generate join key for stream side
+                   |${keyEv.code}
+-                  |if (${ if (isLongHashedRelation) s"$anyNull" else s"${keyEv.value}.allNull()"}) {
++                  |// anyNull is equivalent to allNull since it's a single-column key.
++                  |if ($anyNull) {
+                   |  $found = true;
+                   |} else {
+                   |  UnsafeRow $matched = (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashJoin.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashJoin.scala
+index 8f6edbf769a0f..a043d2744b444 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashJoin.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashJoin.scala
+@@ -268,10 +268,8 @@ trait HashJoin extends BaseJoinExec {
+   private def antiJoin(
+       streamIter: Iterator[InternalRow],
+       hashedRelation: HashedRelation): Iterator[InternalRow] = {
+-    // fast stop if isOriginInputEmpty = true
+-    // whether isNullAwareAntiJoin is true or false
+-    // should accept all rows in streamedSide
+-    if (hashedRelation.isOriginInputEmpty) {
++    // fast stop if isOriginalInputEmpty = true, should accept all rows in streamedSide
++    if (hashedRelation.isOriginalInputEmpty) {
+       return streamIter
+     }
+ 
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala
+index 7013db45c9faf..aac2d4fbe6f1b 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala
+@@ -84,13 +84,14 @@ private[execution] sealed trait HashedRelation extends KnownSizeEstimation {
+ 
+   /**
+    * Normally HashedRelation is built from an Source (input: Iterator[InternalRow]).
+-   * This indicates the origin input is empty.
++   * This indicates the original input is empty.
+    * Note that, the hashed relation can be empty despite the input being not empty,
+    * since the hashed relation skips over null keys.
+    */
+-  var isOriginInputEmpty: Boolean
+-  def setOriginInputEmtpy(isOriginInputEmpty: Boolean): HashedRelation = {
+-    this.isOriginInputEmpty = isOriginInputEmpty
++  var isOriginalInputEmpty: Boolean
++
++  def setOriginInputEmtpy(isOriginalInputEmpty: Boolean): HashedRelation = {
++    this.isOriginalInputEmpty = isOriginalInputEmpty
+     this
+   }
+ 
+@@ -99,11 +100,12 @@ private[execution] sealed trait HashedRelation extends KnownSizeEstimation {
+    * This will be set true if Source (input: Iterator[InternalRow]) contains a key,
+    * which is allNullColumn.
+    */
+-  var allNullColumnKeyExistsInOriginInput: Boolean
+-  def setAllNullColumnKeyExistsInOriginInput(
+-      allNullColumnKeyExistsInOriginInput: Boolean): HashedRelation = {
+-    this.allNullColumnKeyExistsInOriginInput =
+-      allNullColumnKeyExistsInOriginInput
++  var allNullColumnKeyExistsInOriginalInput: Boolean
++
++  def setAllNullColumnKeyExistsInOriginalInput(
++      allNullColumnKeyExistsInOriginalInput: Boolean): HashedRelation = {
++    this.allNullColumnKeyExistsInOriginalInput =
++      allNullColumnKeyExistsInOriginalInput
+     this
+   }
+ 
+@@ -117,6 +119,7 @@ private[execution] object HashedRelation {
+ 
+   /**
+    * Create a HashedRelation from an Iterator of InternalRow.
++   * If isNullAware is true, UnsafeHashedRelation will store rows with null keys.
+    */
+   def apply(
+       input: Iterator[InternalRow],
+@@ -135,7 +138,7 @@ private[execution] object HashedRelation {
+     }
+ 
+     if (key.length == 1 && key.head.dataType == LongType) {
+-      LongHashedRelation(input, key, sizeEstimate, mm, isNullAware)
++      LongHashedRelation(input, key, sizeEstimate, mm)
+     } else {
+       UnsafeHashedRelation(input, key, sizeEstimate, mm, isNullAware)
+     }
+@@ -161,8 +164,8 @@ private[joins] class UnsafeHashedRelation(
+ 
+   override def asReadOnlyCopy(): UnsafeHashedRelation = {
+     new UnsafeHashedRelation(numKeys, numFields, binaryMap)
+-      .setOriginInputEmtpy(this.isOriginInputEmpty)
+-      .setAllNullColumnKeyExistsInOriginInput(this.allNullColumnKeyExistsInOriginInput)
++      .setOriginInputEmtpy(this.isOriginalInputEmpty)
++      .setAllNullColumnKeyExistsInOriginalInput(this.allNullColumnKeyExistsInOriginalInput)
+       .asInstanceOf[UnsafeHashedRelation]
+   }
+ 
+@@ -246,8 +249,8 @@ private[joins] class UnsafeHashedRelation(
+       writeLong: (Long) => Unit,
+       writeBuffer: (Array[Byte], Int, Int) => Unit) : Unit = {
+     writeInt(numFields)
+-    writeBoolean(isOriginInputEmpty)
+-    writeBoolean(allNullColumnKeyExistsInOriginInput)
++    writeBoolean(isOriginalInputEmpty)
++    writeBoolean(allNullColumnKeyExistsInOriginalInput)
+     // TODO: move these into BytesToBytesMap
+     writeLong(binaryMap.numKeys())
+     writeLong(binaryMap.numValues())
+@@ -282,8 +285,8 @@ private[joins] class UnsafeHashedRelation(
+       readLong: () => Long,
+       readBuffer: (Array[Byte], Int, Int) => Unit): Unit = {
+     numFields = readInt()
+-    isOriginInputEmpty = readBoolean()
+-    allNullColumnKeyExistsInOriginInput = readBoolean()
++    isOriginalInputEmpty = readBoolean()
++    allNullColumnKeyExistsInOriginalInput = readBoolean()
+     resultRow = new UnsafeRow(numFields)
+     val nKeys = readLong()
+     val nValues = readLong()
+@@ -339,8 +342,8 @@ private[joins] class UnsafeHashedRelation(
+     read(() => in.readBoolean(), () => in.readInt(), () => in.readLong(), in.readBytes)
+   }
+ 
+-  override var isOriginInputEmpty: Boolean = _
+-  override var allNullColumnKeyExistsInOriginInput: Boolean = _
++  override var isOriginalInputEmpty: Boolean = _
++  override var allNullColumnKeyExistsInOriginalInput: Boolean = _
+ }
+ 
+ private[joins] object UnsafeHashedRelation {
+@@ -372,17 +375,16 @@ private[joins] object UnsafeHashedRelation {
+     val keyGenerator = UnsafeProjection.create(key)
+     var numFields = 0
+     val numKeys = key.length
+-    val isOriginInputEmpty = !input.hasNext
+-    var allNullColumnKeyExistsInOriginInput: Boolean = false
++    val isOriginalInputEmpty = !input.hasNext
++    var allNullColumnKeyExistsInOriginalInput: Boolean = false
+     while (input.hasNext) {
+       val row = input.next().asInstanceOf[UnsafeRow]
+       numFields = row.numFields()
+       val key = keyGenerator(row)
+       if ((0 until numKeys).forall(key.isNullAt)) {
+-        allNullColumnKeyExistsInOriginInput = true
++        allNullColumnKeyExistsInOriginalInput = true
+       }
+ 
+-      // TODO keep anyNull key for multi column NAAJ support in future
+       if (isNullAware || (!isNullAware && !key.anyNull)) {
+         val loc = binaryMap.lookup(key.getBaseObject, key.getBaseOffset, key.getSizeInBytes)
+         val success = loc.append(
+@@ -398,8 +400,8 @@ private[joins] object UnsafeHashedRelation {
+     }
+ 
+     new UnsafeHashedRelation(key.size, numFields, binaryMap)
+-        .setOriginInputEmtpy(isOriginInputEmpty)
+-        .setAllNullColumnKeyExistsInOriginInput(allNullColumnKeyExistsInOriginInput)
++        .setOriginInputEmtpy(isOriginalInputEmpty)
++        .setAllNullColumnKeyExistsInOriginalInput(allNullColumnKeyExistsInOriginalInput)
+   }
+ }
+ 
+@@ -894,8 +896,8 @@ class LongHashedRelation(
+ 
+   override def asReadOnlyCopy(): LongHashedRelation =
+     new LongHashedRelation(nFields, map)
+-    .setOriginInputEmtpy(this.isOriginInputEmpty)
+-    .setAllNullColumnKeyExistsInOriginInput(this.allNullColumnKeyExistsInOriginInput)
++    .setOriginInputEmtpy(this.isOriginalInputEmpty)
++    .setAllNullColumnKeyExistsInOriginalInput(this.allNullColumnKeyExistsInOriginalInput)
+     .asInstanceOf[LongHashedRelation]
+ 
+   override def estimatedSize: Long = map.getTotalMemoryConsumption
+@@ -928,16 +930,16 @@ class LongHashedRelation(
+ 
+   override def writeExternal(out: ObjectOutput): Unit = {
+     out.writeInt(nFields)
+-    out.writeBoolean(isOriginInputEmpty)
+-    out.writeBoolean(allNullColumnKeyExistsInOriginInput)
++    out.writeBoolean(isOriginalInputEmpty)
++    out.writeBoolean(allNullColumnKeyExistsInOriginalInput)
+     out.writeObject(map)
+   }
+ 
+   override def readExternal(in: ObjectInput): Unit = {
+     nFields = in.readInt()
+     resultRow = new UnsafeRow(nFields)
+-    isOriginInputEmpty = in.readBoolean()
+-    allNullColumnKeyExistsInOriginInput = in.readBoolean()
++    isOriginalInputEmpty = in.readBoolean()
++    allNullColumnKeyExistsInOriginalInput = in.readBoolean()
+     map = in.readObject().asInstanceOf[LongToUnsafeRowMap]
+   }
+ 
+@@ -946,8 +948,8 @@ class LongHashedRelation(
+    */
+   override def keys(): Iterator[InternalRow] = map.keys()
+ 
+-  override var isOriginInputEmpty: Boolean = _
+-  override var allNullColumnKeyExistsInOriginInput: Boolean = _
++  override var isOriginalInputEmpty: Boolean = _
++  override var allNullColumnKeyExistsInOriginalInput: Boolean = _
+ }
+ 
+ /**
+@@ -959,23 +961,14 @@ private[joins] object LongHashedRelation {
+       key: Seq[Expression],
+       sizeEstimate: Int,
+       taskMemoryManager: TaskMemoryManager): LongHashedRelation = {
+-    apply(input, key, sizeEstimate, taskMemoryManager, isNullAware = false)
+-  }
+-
+-  def apply(
+-      input: Iterator[InternalRow],
+-      key: Seq[Expression],
+-      sizeEstimate: Int,
+-      taskMemoryManager: TaskMemoryManager,
+-      isNullAware: Boolean): LongHashedRelation = {
+ 
+     val map = new LongToUnsafeRowMap(taskMemoryManager, sizeEstimate)
+     val keyGenerator = UnsafeProjection.create(key)
+ 
+     // Create a mapping of key -> rows
+     var numFields = 0
+-    val isOriginInputEmpty: Boolean = !input.hasNext
+-    var allNullColumnKeyExistsInOriginInput: Boolean = false
++    val isOriginalInputEmpty: Boolean = !input.hasNext
++    var allNullColumnKeyExistsInOriginalInput: Boolean = false
+     while (input.hasNext) {
+       val unsafeRow = input.next().asInstanceOf[UnsafeRow]
+       numFields = unsafeRow.numFields()
+@@ -986,14 +979,14 @@ private[joins] object LongHashedRelation {
+         map.append(key, unsafeRow)
+       } else {
+         // LongHashedRelation is single-column key
+-        // rowKey.isNullAt(0) equivalent to allNullColumnKeyExistsInOriginInput
+-        allNullColumnKeyExistsInOriginInput = true
++        // rowKey.isNullAt(0) equivalent to allNullColumnKeyExistsInOriginalInput
++        allNullColumnKeyExistsInOriginalInput = true
+       }
+     }
+     map.optimize()
+     new LongHashedRelation(numFields, map)
+-      .setOriginInputEmtpy(isOriginInputEmpty)
+-      .setAllNullColumnKeyExistsInOriginInput(allNullColumnKeyExistsInOriginInput)
++      .setOriginInputEmtpy(isOriginalInputEmpty)
++      .setAllNullColumnKeyExistsInOriginalInput(allNullColumnKeyExistsInOriginalInput)
+       .asInstanceOf[LongHashedRelation]
+   }
+ }

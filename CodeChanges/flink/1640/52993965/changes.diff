@@ -1,0 +1,145 @@
+diff --git a/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraCommitter.java b/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraCommitter.java
+index e9b12dcb4cdcc..ddb65bbe01464 100644
+--- a/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraCommitter.java
++++ b/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraCommitter.java
+@@ -50,21 +50,29 @@ public void open() throws Exception {
+ 
+ 		session.execute("CREATE KEYSPACE IF NOT EXISTS " + keyspace + " with replication={'class':'SimpleStrategy', 'replication_factor':3};");
+ 		session.execute("CREATE TABLE IF NOT EXISTS " + keyspace + "." + table + " (sink_id text, sub_id int, checkpoint_id bigint, PRIMARY KEY (sink_id, sub_id));");
+-		session.executeAsync("INSERT INTO " + keyspace + "." + table + " (sink_id, sub_id, checkpoint_id) values ('" + operatorId + "', " + subtaskId + ", " + -1 + ");");
++		session.execute("INSERT INTO " + keyspace + "." + table + " (sink_id, sub_id, checkpoint_id) values ('" + operatorId + "', " + subtaskId + ", " + -1 + ");");
+ 	}
+ 
+ 	@Override
+ 	public void close() throws Exception {
+ 		session.executeAsync("DELETE FROM " + keyspace + "." + table + " where sink_id='" + operatorId + "' and sub_id=" + subtaskId + ";");
+-		session.close();
+-		cluster.close();
++		try {
++			session.close();
++		} catch (Exception e) {
++			LOG.error("Error while closing session.", e);
++		}
++		try {
++			cluster.close();
++		} catch (Exception e) {
++			LOG.error("Error while closing cluster.", e);
++		}
+ 	}
+ 
+ 	@Override
+ 	public void commitCheckpoint(long checkpointID) {
+ 		SimpleStatement s = new SimpleStatement("UPDATE " + keyspace + "." + table + " set checkpoint_id=" + checkpointID + " where sink_id='" + operatorId + "' and sub_id=" + subtaskId + ";");
+ 		s.setConsistencyLevel(ConsistencyLevel.ALL);
+-		session.executeAsync(s);
++		session.execute(s);
+ 	}
+ 
+ 	@Override
+diff --git a/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraExactlyOnceSink.java b/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraExactlyOnceSink.java
+index 3e957bd6cb3f6..50d2218240eeb 100644
+--- a/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraExactlyOnceSink.java
++++ b/flink-streaming-connectors/flink-connector-cassandra/src/main/java/org/apache/flink/streaming/connectors/cassandra/CassandraExactlyOnceSink.java
+@@ -47,6 +47,7 @@
+ 	private transient PreparedStatement preparedStatement;
+ 
+ 	private transient Throwable exception = null;
++	private transient final FutureCallback<ResultSet> callback;
+ 
+ 	public CassandraExactlyOnceSink(String host, String insertQuery, CheckpointCommitter committer) {
+ 		this(host, null, insertQuery, committer);
+@@ -63,13 +64,31 @@ public CassandraExactlyOnceSink(String host, String createQuery, String insertQu
+ 		this.host = host;
+ 		this.createQuery = createQuery;
+ 		this.insertQuery = insertQuery;
++		this.callback = new FutureCallback<ResultSet>() {
++			@Override
++			public void onSuccess(ResultSet resultSet) {
++			}
++
++			@Override
++			public void onFailure(Throwable throwable) {
++				exception = throwable;
++			}
++		};
+ 	}
+ 
+ 	@Override
+ 	public void close() throws Exception {
+ 		super.close();
+-		session.close();
+-		cluster.close();
++		try {
++			session.close();
++		} catch (Exception e) {
++			LOG.error("Error while closing session.", e);
++		}
++		try {
++			cluster.close();
++		} catch (Exception e) {
++			LOG.error("Error while closing cluster.", e);
++		}
+ 	}
+ 
+ 	@Override
+@@ -98,16 +117,7 @@ protected void sendValue(Iterable<IN> values) throws Exception {
+ 			//insert values and send to cassandra
+ 			ResultSetFuture result = session.executeAsync(preparedStatement.bind(fields));
+ 			//add callback to detect errors
+-			Futures.addCallback(result, new FutureCallback<ResultSet>() {
+-				@Override
+-				public void onSuccess(ResultSet resultSet) {
+-				}
+-
+-				@Override
+-				public void onFailure(Throwable throwable) {
+-					exception = throwable;
+-				}
+-			});
++			Futures.addCallback(result, callback);
+ 		}
+ 	}
+ }
+diff --git a/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/CheckpointCommitter.java b/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/CheckpointCommitter.java
+index a22f3a5902753..94aa0302ef274 100644
+--- a/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/CheckpointCommitter.java
++++ b/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/CheckpointCommitter.java
+@@ -17,6 +17,9 @@
+  */
+ package org.apache.flink.streaming.runtime.operators;
+ 
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ import java.io.Serializable;
+ 
+ /**
+@@ -37,6 +40,7 @@
+  * and as such should kept as small as possible.
+  */
+ public abstract class CheckpointCommitter implements Serializable {
++	protected static final Logger LOG = LoggerFactory.getLogger(CheckpointCommitter.class);
+ 	protected String operatorId;
+ 	protected int subtaskId;
+ 
+diff --git a/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/GenericExactlyOnceSink.java b/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/GenericExactlyOnceSink.java
+index 14e0cedd041bd..85acad90e20f4 100644
+--- a/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/GenericExactlyOnceSink.java
++++ b/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/operators/GenericExactlyOnceSink.java
+@@ -30,6 +30,8 @@
+ import org.apache.flink.streaming.api.watermark.Watermark;
+ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+ import org.apache.flink.streaming.runtime.tasks.StreamTaskState;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ import java.io.IOException;
+ import java.io.Serializable;
+@@ -48,6 +50,7 @@
+  * @param <IN> Type of the elements emitted by this sink
+  */
+ public abstract class GenericExactlyOnceSink<IN> extends AbstractStreamOperator<IN> implements OneInputStreamOperator<IN, IN> {
++	protected static final Logger LOG = LoggerFactory.getLogger(GenericExactlyOnceSink.class);
+ 	private transient AbstractStateBackend.CheckpointStateOutputView out;
+ 	private TypeSerializer<IN> serializer;
+ 	protected transient TypeInformation<IN> typeInfo;

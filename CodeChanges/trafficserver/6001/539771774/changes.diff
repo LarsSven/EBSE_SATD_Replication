@@ -1,0 +1,514 @@
+diff --git a/doc/appendices/command-line/traffic_server.en.rst b/doc/appendices/command-line/traffic_server.en.rst
+index 7a2dae2f403..75e42dd4835 100644
+--- a/doc/appendices/command-line/traffic_server.en.rst
++++ b/doc/appendices/command-line/traffic_server.en.rst
+@@ -71,7 +71,45 @@ the available tests.
+ 
+ .. option:: -M, --remote_management
+ 
+-.. option:: -C CMD, --command CMD
++.. option:: -C 'CMD [ARGS]', --command 'CMD [ARGS]'
++
++Run a |TS| maintenance command. These commands perform various administrative
++actions or queries against |TS|. Note that some commands (such as ``help`` and
++``verify_plugin``) take an argument. To invoke the command and its argument,
++surround the ``CMD`` and its argument in quotes. For instance, to request help
++on the ``verify_plugin`` command, format your command like so::
++    traffic_server -C "help verify_plugin"
++
++The following commands are supported:
++
++list
++   List the sizes of the host database and cache index and the storage
++   available to the cache.
++check
++   Check the cache for inconsistencies or corruption. ``check`` does not make
++   any changes to the data stored in the cache. ``check`` requires a scan of
++   the contents of the cache and may take a long time for large caches.
++clear
++   Clear the entire cache, both the document and the host database caches.  All
++   data in the cache is lost and the cache is reconfigured based on the current
++   description of database sizes and available storage.
++clear_cache
++   Clear the document cache.  All documents in the cache are lost and the cache
++   is reconfigured based on the current description of database sizes and
++   available storage.
++clear_hostdb
++   Clear the entire host database cache.  All host name resolution information
++   is lost.
++verify_config
++   Load the config and verify |TS| comes up correctly.
++verify_plugin PLUGIN_SO_FILE
++   Load a plugin's shared object file and verify it meets minimal plugin API
++   requirements.
++help [CMD]
++    Obtain a short description of a command. For example, ``'help clear'``
++    prints a description of the ``clear`` maintenance command. If no argument
++    is passed to ``help`` then a list of the supported maintenance commands are
++    printed along with a brief description of each.
+ 
+ .. option:: -k, --clear_hostdb
+ 
+diff --git a/doc/release-notes/whats-new.en.rst b/doc/release-notes/whats-new.en.rst
+index e369c9ad1e3..8a98978b1ba 100644
+--- a/doc/release-notes/whats-new.en.rst
++++ b/doc/release-notes/whats-new.en.rst
+@@ -22,7 +22,7 @@
+ What's New in ATS v10.x
+ =======================
+ 
+-This version of ATS includes over <x> commits, from <y> pull requests. A total of <z> contributors
++This version of |ATS| includes over <x> commits, from <y> pull requests. A total of <z> contributors
+ have participated in this development cycle.
+ 
+ .. toctree::
+@@ -31,6 +31,11 @@ have participated in this development cycle.
+ New Features
+ ------------
+ 
++``verify_plugin`` Maintenance Command
++    ``verify_plugin`` is a new maintenance command added to |TS|. This loads a
++    plugin's shared object file and verifies it meets minimal plugin API
++    requirements.
++
+ New or modifed Configurations
+ -----------------------------
+ 
+diff --git a/src/traffic_server/traffic_server.cc b/src/traffic_server/traffic_server.cc
+index 591ce0b0c49..4b2cf6575d7 100644
+--- a/src/traffic_server/traffic_server.cc
++++ b/src/traffic_server/traffic_server.cc
+@@ -204,7 +204,7 @@ static ArgumentDescription argument_descriptions[] = {
+   {"remote_management", 'M', "Remote Management", "T", &remote_management_flag, "PROXY_REMOTE_MANAGEMENT", nullptr},
+   {"command", 'C',
+    "Maintenance Command to Execute\n"
+-   "      Commands: list, check, clear, clear_cache, clear_hostdb, verify_config, help",
++   "      Commands: list, check, clear, clear_cache, clear_hostdb, verify_config, verify_plugin, help",
+    "S511", &command_string, "PROXY_COMMAND_STRING", nullptr},
+   {"conf_dir", 'D', "config dir to verify", "S511", &conf_dir, "PROXY_CONFIG_CONFIG_DIR", nullptr},
+   {"clear_hostdb", 'k', "Clear HostDB on Startup", "F", &auto_clear_hostdb_flag, "PROXY_CLEAR_HOSTDB", nullptr},
+@@ -678,17 +678,28 @@ cmd_list(char * /* cmd ATS_UNUSED */)
+   }
+ }
+ 
++/**
++ * @brief Parse the given string and skip the first word.
++ *
++ * Words are assumed to be separated by spaces or tabs.
++ *
++ * @param[in] cmd The string whose first word will be skipped.
++ *
++ * @return The pointer in the string cmd to the second word in the string, or
++ * nullptr if there is no second word.
++ */
+ static char *
+-skip(char *cmd, int null_ok = 0)
++skip(char *cmd)
+ {
++  // Skip initial white space.
+   cmd += strspn(cmd, " \t");
++  // Point to the beginning of the next white space.
+   cmd = strpbrk(cmd, " \t");
+   if (!cmd) {
+-    if (!null_ok) {
+-      printf("Error: argument missing\n");
+-    }
+     return cmd;
+   }
++  // Skip the second white space so that cmd now points to the beginning of the
++  // second word.
+   cmd += strspn(cmd, " \t");
+   return cmd;
+ }
+@@ -900,6 +911,43 @@ cmd_verify(char * /* cmd ATS_UNUSED */)
+   return 0;
+ }
+ 
++/**
++ * @brief Verify whether a given SO file looks like a valid Plugin.
++ *
++ * @param[in] args The arguments passed to the -C command option. This includes
++ * verify_plugin.
++ *
++ * @return a CMD status code. See the CMD_ defines above in this file.
++ */
++static int
++cmd_verify_plugin(char *args)
++{
++  const auto *plugin_filename = skip(args);
++
++  if (!plugin_filename) {
++    fprintf(stderr, "ERROR: VERIFY_PLUGIN requires a plugin SO file path argument\n");
++    return CMD_FAILED;
++  }
++
++  fprintf(stderr, "NOTE: VERIFY_PLUGIN '%s'...\n", plugin_filename);
++  void *handle = dlopen(plugin_filename, RTLD_NOW);
++  if (!handle) {
++    fprintf(stderr, "ERROR: Unable to load '%s': %s\n", plugin_filename, dlerror());
++    return CMD_FAILED;
++  }
++
++  // Verify that the appropriate symbols exist.
++  const auto *init = dlsym(handle, "TSPluginInit");
++  if (!init) {
++    fprintf(stderr, "ERROR: Unable to find TSPluginInit function in '%s': %s\n", plugin_filename, dlerror());
++    return CMD_FAILED;
++  }
++
++  fprintf(stderr, "NOTE: VERIFY_PLUGIN '%s' Success\n", plugin_filename);
++  dlclose(handle);
++  return CMD_OK;
++}
++
+ static int cmd_help(char *cmd);
+ 
+ static const struct CMD {
+@@ -960,6 +1008,14 @@ static const struct CMD {
+    "\n"
+    "Load the config and verify traffic_server comes up correctly. \n",
+    cmd_verify, true},
++  {"verify_plugin", "Verify a plugin's shared object file",
++   "VERIFY_PLUGIN\n"
++   "\n"
++   "FORMAT: verify_plugin\n"
++   "\n"
++   "Load a plugin's shared object file and verify it meets\n"
++   "minimal plugin API requirements. \n",
++   cmd_verify_plugin, false},
+   {"help", "Obtain a short description of a command (e.g. 'help clear')",
+    "HELP\n"
+    "\n"
+@@ -992,16 +1048,25 @@ find_cmd_index(const char *p)
+   return -1;
+ }
+ 
++/**
++ * @brief Print the maintenance command help output.
++ */
++static void
++print_cmd_help()
++{
++  for (unsigned i = 0; i < countof(commands); i++) {
++    printf("%15s  %s\n", commands[i].n, commands[i].d);
++  }
++}
++
+ static int
+ cmd_help(char *cmd)
+ {
+   (void)cmd;
+   printf("HELP\n\n");
+-  cmd = skip(cmd, true);
++  cmd = skip(cmd);
+   if (!cmd) {
+-    for (unsigned i = 0; i < countof(commands); i++) {
+-      printf("%15s  %s\n", commands[i].n, commands[i].d);
+-    }
++    print_cmd_help();
+   } else {
+     int i;
+     if ((i = find_cmd_index(cmd)) < 0) {
+@@ -1044,6 +1109,10 @@ cmd_mode()
+     return commands[command_index].f(command_string);
+   } else if (*command_string) {
+     Warning("unrecognized command: '%s'", command_string);
++    printf("\n");
++    printf("WARNING: Unrecognized command: '%s'\n", command_string);
++    printf("\n");
++    print_cmd_help();
+     return CMD_FAILED; // in error
+   } else {
+     printf("\n");
+diff --git a/tests/gold_tests/command_argument/verify_plugin.test.py b/tests/gold_tests/command_argument/verify_plugin.test.py
+new file mode 100644
+index 00000000000..206896eea75
+--- /dev/null
++++ b/tests/gold_tests/command_argument/verify_plugin.test.py
+@@ -0,0 +1,151 @@
++'''
++Test the verify_plugin TrafficServer command.
++'''
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++import os
++
++Test.Summary = '''
++Test that the TrafficServer verify_plugin command works as expected.
++'''
++
++process_counter = 0
++
++
++def create_ts_process():
++    """
++    Create a unique ATS process with each call to this function.
++    """
++    global process_counter
++    process_counter += 1
++
++    ts = Test.MakeATSProcess("ts{counter}".format(counter=process_counter))
++
++    # Ideally we would set the test run's Processes.Default to ts, but deep
++    # copy of processes is not currently implemented in autest. Therefore we
++    # replace the command which ts runs with a dummy command, and pull in
++    # peacemeal the values from ts that we want into the test run.
++    ts.Command = "sleep 100"
++    # sleep will return -2 when autest kills it. We set the expectation for the
++    # -2 return code here so the test doesn't fail because of this.
++    ts.ReturnCode = -2
++    # Clear the ready criteria because sleep is ready as soon as it is running.
++    ts.Ready = None
++    return ts
++
++
++tr = Test.AddTestRun("Verify the requirement of an argument")
++ts = create_ts_process()
++tr.Processes.Default.Env = ts.Env
++tr.Processes.Default.Command = "traffic_server -C 'verify_plugin'"
++tr.Processes.Default.ReturnCode = 1
++tr.Processes.Default.StartBefore(ts)
++tr.Processes.Default.Streams.stderr = Testers.ContainsExpression(
++    "ERROR: VERIFY_PLUGIN requires a plugin SO file path argument",
++    "Should warn about the need for an SO file argument")
++
++
++tr = Test.AddTestRun("Verify the requirement of a file")
++ts = create_ts_process()
++tr.Processes.Default.Env = ts.Env
++tr.Processes.Default.Command = \
++    "traffic_server -C 'verify_plugin {filename}'".format(
++        filename="/this/file/does/not/exist.so")
++tr.Processes.Default.ReturnCode = 1
++tr.Processes.Default.StartBefore(ts)
++tr.Processes.Default.Streams.stderr = Testers.ContainsExpression(
++    "ERROR: Unable to load.*No such file or directory",
++    "Should warn about the non-existent SO file argument")
++
++
++tr = Test.AddTestRun("Verify the requirement of our Plugin API.")
++ts = create_ts_process()
++Test.PreparePlugin(
++    os.path.join(Test.Variables.AtsTestToolsDir,
++                 'plugins', 'missing_ts_plugin_init.cc'),
++    ts)
++tr.Processes.Default.Env = ts.Env
++tr.Processes.Default.Command = \
++    "traffic_server -C 'verify_plugin {filename}'".format(
++        filename="${PROXY_CONFIG_PLUGIN_PLUGIN_DIR}/missing_ts_plugin_init.so")
++tr.Processes.Default.ReturnCode = 1
++tr.Processes.Default.StartBefore(ts)
++tr.Processes.Default.Streams.stderr = Testers.ContainsExpression(
++    "ERROR: Unable to find TSPluginInit function",
++    "Should warn about the need for an SO file argument")
++
++
++tr = Test.AddTestRun("Verify a properly formed plugin works as expected.")
++ts = create_ts_process()
++Test.PreparePlugin(
++    os.path.join(Test.Variables.AtsTestToolsDir,
++                 'plugins', 'ssl_hook_test.cc'),
++    ts)
++tr.Processes.Default.Env = ts.Env
++tr.Processes.Default.Command = \
++    "traffic_server -C 'verify_plugin {filename}'".format(
++        filename="${PROXY_CONFIG_PLUGIN_PLUGIN_DIR}/ssl_hook_test.so")
++tr.Processes.Default.ReturnCode = 0
++tr.Processes.Default.StartBefore(ts)
++tr.Processes.Default.Streams.stderr = Testers.ContainsExpression(
++    "NOTE: VERIFY_PLUGIN '.*' Success",
++    "Should warn about the need for an SO file argument")
++
++
++def prepare_undefined_symbol_plugin(tsproc, path_c, path_cpp, path_h):
++    """
++    Intentionally create an SO file with an undefined symbol.
++
++    We've seen issues where a plugin is created in which a C++ file
++    includes a function declaration and then expects a definition
++    of the mangled version of that function. However, the definition
++    was created with a c-compiler and thus is not mangled. This
++    builds a plugin with just such an undefined mangled symbol.
++    """
++    plugin_dir = tsproc.Env['PROXY_CONFIG_PLUGIN_PLUGIN_DIR']
++    tsproc.Setup.Copy(path_c, plugin_dir)
++    tsproc.Setup.Copy(path_cpp, plugin_dir)
++    tsproc.Setup.Copy(path_h, plugin_dir)
++
++    in_basename = os.path.basename(path_c)
++    out_basename = os.path.splitext(in_basename)[0] + '.so'
++    out_path = os.path.join(plugin_dir, out_basename)
++    tsproc.Setup.RunCommand(
++        ("gcc -c -fPIC {path_c} -o {path_c}_o; "
++            "g++ -c -fPIC {path_cpp} -o {path_cpp}_o; "
++            "g++ {path_c}_o {path_cpp}_o -shared -o {out_path}").format(
++                **locals())
++    )
++
++
++tr = Test.AddTestRun("Regression test for an undefined, mangled C++ symbol.")
++ts = create_ts_process()
++plugins_dir = os.path.join(Test.Variables.AtsTestToolsDir, 'plugins')
++prepare_undefined_symbol_plugin(
++    ts,
++    os.path.join(plugins_dir, 'missing_mangled_definition.c'),
++    os.path.join(plugins_dir, 'missing_mangled_definition.cc'),
++    os.path.join(plugins_dir, 'missing_mangled_definition.h'))
++tr.Processes.Default.Env = ts.Env
++tr.Processes.Default.Command = \
++    "traffic_server -C 'verify_plugin {filename}'".format(
++        filename="${PROXY_CONFIG_PLUGIN_PLUGIN_DIR}/missing_mangled_definition.so")
++tr.Processes.Default.ReturnCode = 1
++tr.Processes.Default.StartBefore(ts)
++tr.Processes.Default.Streams.stderr = Testers.ContainsExpression(
++    "ERROR: Unable to load.*: undefined symbol: .*foo.*",
++    "Should warn about the need for an SO file argument")
+diff --git a/tests/tools/plugins/missing_mangled_definition.c b/tests/tools/plugins/missing_mangled_definition.c
+new file mode 100644
+index 00000000000..4c62e2a4f05
+--- /dev/null
++++ b/tests/tools/plugins/missing_mangled_definition.c
+@@ -0,0 +1,31 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "missing_mangled_definition.h"
++
++void
++foo()
++{
++  return;
++}
++
++void
++TSPluginInit(int argc, const char *argv[])
++{
++  foo();
++}
+diff --git a/tests/tools/plugins/missing_mangled_definition.cc b/tests/tools/plugins/missing_mangled_definition.cc
+new file mode 100644
+index 00000000000..02c8339097a
+--- /dev/null
++++ b/tests/tools/plugins/missing_mangled_definition.cc
+@@ -0,0 +1,33 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "missing_mangled_definition.h"
++
++/*
++ * Assume the definition of foo from the corresponding .c
++ * object. This will result in an undefined symbol, however,
++ * because the .c file will be compiled with a C compiler
++ * while this will be compiled with a C++ compiler such that
++ * it will expect a definition for a mangled foo symbol.
++ */
++
++void
++TSPluginInit(int argc, const char *argv[])
++{
++  foo();
++}
+diff --git a/tests/tools/plugins/missing_mangled_definition.h b/tests/tools/plugins/missing_mangled_definition.h
+new file mode 100644
+index 00000000000..161ee1b0345
+--- /dev/null
++++ b/tests/tools/plugins/missing_mangled_definition.h
+@@ -0,0 +1,19 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++void foo();
+diff --git a/tests/tools/plugins/missing_ts_plugin_init.cc b/tests/tools/plugins/missing_ts_plugin_init.cc
+new file mode 100644
+index 00000000000..3aa761b42bc
+--- /dev/null
++++ b/tests/tools/plugins/missing_ts_plugin_init.cc
+@@ -0,0 +1,28 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * This simple file will be compiled to a supposed Plugin object that is
++ * missing the TSPluginInit function.
++ */
++
++void
++foo()
++{
++  return;
++}

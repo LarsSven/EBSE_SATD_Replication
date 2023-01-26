@@ -1,0 +1,634 @@
+diff --git a/pinot-common/src/main/java/org/apache/pinot/common/config/TagNameUtils.java b/pinot-common/src/main/java/org/apache/pinot/common/config/TagNameUtils.java
+index 30d9a0539bf..e73635aa304 100644
+--- a/pinot-common/src/main/java/org/apache/pinot/common/config/TagNameUtils.java
++++ b/pinot-common/src/main/java/org/apache/pinot/common/config/TagNameUtils.java
+@@ -46,33 +46,20 @@ public static boolean hasValidServerTagSuffix(String tagName) {
+     return false;
+   }
+ 
+-  public static boolean isServerTag(String tagName)
+-      throws InvalidConfigException {
+-    return TenantRole.SERVER == getTenantRoleFromTag(tagName);
++  public static boolean isServerTag(String tagName) {
++    return isOfflineServerTag(tagName) || isRealtimeServerTag(tagName);
+   }
+ 
+-  public static boolean isBrokerTags(String tagName)
+-      throws InvalidConfigException {
+-    return TenantRole.BROKER == getTenantRoleFromTag(tagName);
++  public static boolean isOfflineServerTag(String tagName) {
++    return tagName.endsWith(ServerType.OFFLINE.toString());
+   }
+ 
+-  // Make this method private to avoid exposing null out of this class.
+-  private static TenantRole getTenantRoleFromTag(String tagName) throws InvalidConfigException {
+-    if (tagName.endsWith(ServerType.REALTIME.toString())) {
+-      return TenantRole.SERVER;
+-    }
+-    if (tagName.endsWith(ServerType.OFFLINE.toString())) {
+-      return TenantRole.SERVER;
+-    }
+-    if (tagName.endsWith(TenantRole.BROKER.toString())) {
+-      return TenantRole.BROKER;
+-    }
+-    // Helix uses this tag to support full-auto.
+-    // Return null if the tag is controller, which isn't a type of tenant in Pinot.
+-    if (tagName.equalsIgnoreCase(CommonConstants.Helix.CONTROLLER_INSTANCE_TYPE)) {
+-      return null;
+-    }
+-    throw new InvalidConfigException("Cannot identify tenant type from tag name : " + tagName);
++  public static boolean isRealtimeServerTag(String tagName) {
++    return tagName.endsWith(ServerType.REALTIME.toString());
++  }
++
++  public static boolean isBrokerTags(String tagName) {
++    return tagName.endsWith(TenantRole.BROKER.toString());
+   }
+ 
+   public static String getTagFromTenantAndServerType(String tenantName, ServerType type) {
+diff --git a/pinot-common/src/main/java/org/apache/pinot/common/utils/CommonConstants.java b/pinot-common/src/main/java/org/apache/pinot/common/utils/CommonConstants.java
+index d4cc8daa1cf..6b07356d2f8 100644
+--- a/pinot-common/src/main/java/org/apache/pinot/common/utils/CommonConstants.java
++++ b/pinot-common/src/main/java/org/apache/pinot/common/utils/CommonConstants.java
+@@ -42,11 +42,10 @@ public static class Helix {
+     public static final String BROKER_RESOURCE_INSTANCE = "brokerResource";
+     public static final String LEAD_CONTROLLER_RESOURCE_NAME = "leadControllerResource";
+ 
+-    // This is for specifying the number of partitions in leadControllerResource.
+-    // In most of the cases there won't be more than 17 controllers in one single cluster.
+-    // Hard code the number of partitions to 17 since it's rarely changed and for less changes of hash collision.
+-    public static final int DEFAULT_NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE = 17;
+-    public static final int DEFAULT_NUMBER_OF_CONTROLLER_REPLICAS = 1;
++    // More information on why these numbers are set can be found in the following doc:
++    // https://cwiki.apache.org/confluence/display/PINOT/Controller+Separation+between+Helix+and+Pinot
++    public static final int NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE = 17;
++    public static final int NUMBER_OF_CONTROLLER_REPLICAS = 1;
+ 
+     public static final String UNTAGGED_SERVER_INSTANCE = "server_untagged";
+     public static final String UNTAGGED_BROKER_INSTANCE = "broker_untagged";
+diff --git a/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerConf.java b/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerConf.java
+index 3f1550c7a7d..d5a620e4744 100644
+--- a/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerConf.java
++++ b/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerConf.java
+@@ -57,8 +57,6 @@ public class ControllerConf extends PropertiesConfiguration {
+   private static final String CONSOLE_WEBAPP_USE_HTTPS = "controller.query.console.useHttps";
+   private static final String EXTERNAL_VIEW_ONLINE_TO_OFFLINE_TIMEOUT = "controller.upload.onlineToOfflineTimeout";
+   private static final String CONTROLLER_MODE = "controller.mode";
+-  private static final String NUMBER_OF_CONTROLLER_REPLICAS = "controller.number.replicas";
+-  private static final String NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE = "controller.number.partitions";
+ 
+   public enum ControllerMode {
+     DUAL,
+diff --git a/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerStarter.java b/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerStarter.java
+index f57d21f1ace..755519e1528 100644
+--- a/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerStarter.java
++++ b/pinot-controller/src/main/java/org/apache/pinot/controller/ControllerStarter.java
+@@ -220,7 +220,7 @@ private void setUpHelixController() {
+     // Register and connect instance as Helix controller.
+     LOGGER.info("Starting Helix controller");
+     _helixControllerManager = HelixSetupUtils
+-        .setup(_helixClusterName, _helixZkURL, _instanceId, _isUpdateStateModel, _enableBatchMessageMode);
++        .setup(_helixClusterName, _helixZkURL, _instanceId);
+ 
+     // Emit helix controller metrics
+     _controllerMetrics.addCallbackGauge(CommonConstants.Helix.INSTANCE_CONNECTED_METRIC_NAME,
+@@ -244,6 +244,9 @@ private void setUpPinotController() {
+       throw new RuntimeException("Pinot only controller currently isn't supported in production yet.");
+     }
+ 
++    // Set up Pinot cluster in Helix
++    HelixSetupUtils.setupPinotCluster(_helixClusterName, _helixZkURL, _isUpdateStateModel, _enableBatchMessageMode);
++
+     // Start all components
+     initPinotFSFactory();
+     initSegmentFetcherFactory();
+diff --git a/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManager.java b/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManager.java
+index 204a3e89067..f5ae0aaff50 100644
+--- a/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManager.java
++++ b/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManager.java
+@@ -288,7 +288,6 @@ private HelixManager registerAndConnectAsHelixParticipant() {
+    * Add instance group tag for controller so that pinot controller can be assigned to lead controller resource.
+    */
+   private void addInstanceGroupTag() {
+-    _helixZkManager.getClusterManagmentTool().enableInstance(_helixClusterName, _controllerParticipantInstanceId, true);
+     InstanceConfig instanceConfig = getHelixInstanceConfig(_controllerParticipantInstanceId);
+     instanceConfig.addTag(CommonConstants.Helix.CONTROLLER_INSTANCE_TYPE);
+     HelixDataAccessor accessor = _helixZkManager.getHelixDataAccessor();
+@@ -862,12 +861,8 @@ public Set<String> getAllBrokerTenantNames() {
+             .equals(CommonConstants.Minion.UNTAGGED_INSTANCE)) {
+           continue;
+         }
+-        try {
+-          if (TagNameUtils.isBrokerTags(tag)) {
+-            tenantSet.add(TagNameUtils.getTenantNameFromTag(tag));
+-          }
+-        } catch (InvalidConfigException e) {
+-          LOGGER.warn("Instance {} contains an invalid tag: {}", instanceName, tag);
++        if (TagNameUtils.isBrokerTags(tag)) {
++          tenantSet.add(TagNameUtils.getTenantNameFromTag(tag));
+         }
+       }
+     }
+@@ -885,12 +880,8 @@ public Set<String> getAllServerTenantNames() {
+             .equals(CommonConstants.Minion.UNTAGGED_INSTANCE)) {
+           continue;
+         }
+-        try {
+-          if (TagNameUtils.isServerTag(tag)) {
+-            tenantSet.add(TagNameUtils.getTenantNameFromTag(tag));
+-          }
+-        } catch (InvalidConfigException e) {
+-          LOGGER.warn("Instance {} contains an invalid tag: {}", instanceName, tag);
++        if (TagNameUtils.isServerTag(tag)) {
++          tenantSet.add(TagNameUtils.getTenantNameFromTag(tag));
+         }
+       }
+     }
+diff --git a/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/util/HelixSetupUtils.java b/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/util/HelixSetupUtils.java
+index ca46639d852..8e7c798c037 100644
+--- a/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/util/HelixSetupUtils.java
++++ b/pinot-controller/src/main/java/org/apache/pinot/controller/helix/core/util/HelixSetupUtils.java
+@@ -18,6 +18,7 @@
+  */
+ package org.apache.pinot.controller.helix.core.util;
+ 
++import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -27,8 +28,7 @@
+ import org.apache.helix.HelixDataAccessor;
+ import org.apache.helix.HelixManager;
+ import org.apache.helix.PropertyKey;
+-import org.apache.helix.PropertyPathConfig;
+-import org.apache.helix.PropertyType;
++import org.apache.helix.PropertyPathBuilder;
+ import org.apache.helix.ZNRecord;
+ import org.apache.helix.controller.HelixControllerMain;
+ import org.apache.helix.controller.rebalancer.strategy.CrushEdRebalanceStrategy;
+@@ -64,13 +64,12 @@
+  *
+  */
+ public class HelixSetupUtils {
+-
+   private static final Logger LOGGER = LoggerFactory.getLogger(HelixSetupUtils.class);
+ 
+   public static synchronized HelixManager setup(String helixClusterName, String zkPath,
+-      String pinotControllerInstanceId, boolean isUpdateStateModel, boolean enableBatchMessageMode) {
++      String pinotControllerInstanceId) {
+     try {
+-      setupHelixCluster(helixClusterName, zkPath, isUpdateStateModel, enableBatchMessageMode);
++      setupHelixCluster(helixClusterName, zkPath);
+     } catch (final Exception e) {
+       LOGGER.error("Caught exception when setting up Helix cluster: {}", helixClusterName, e);
+       return null;
+@@ -84,124 +83,152 @@ public static synchronized HelixManager setup(String helixClusterName, String zk
+     }
+   }
+ 
+-  public static void setupHelixCluster(String helixClusterName, String zkPath, boolean isUpdateStateModel,
++  /**
++   * Set up a brand new Helix cluster if it doesn't exist.
++   */
++  public static void setupHelixCluster(String helixClusterName, String zkPath) {
++    final HelixAdmin admin = new ZKHelixAdmin(zkPath);
++    if (admin.getClusters().contains(helixClusterName)) {
++      LOGGER.info("Helix cluster: {} already exists", helixClusterName);
++      return;
++    }
++    LOGGER.info("Creating a new Helix cluster: {}", helixClusterName);
++    admin.addCluster(helixClusterName, false);
++    LOGGER.info("New Cluster: {} created.", helixClusterName);
++  }
++
++  private static HelixManager startHelixControllerInStandadloneMode(String helixClusterName, String zkUrl,
++      String pinotControllerInstanceId) {
++    LOGGER.info("Starting Helix Standalone Controller ... ");
++    return HelixControllerMain.startHelixController(zkUrl, helixClusterName, pinotControllerInstanceId,
++        HelixControllerMain.STANDALONE);
++  }
++
++  /**
++   * Customizes existing Helix cluster to run Pinot components.
++   */
++  public static void setupPinotCluster(String helixClusterName, String zkPath, boolean isUpdateStateModel,
+       boolean enableBatchMessageMode) {
+     final HelixAdmin admin = new ZKHelixAdmin(zkPath);
++    if (!admin.getClusters().contains(helixClusterName)) {
++      LOGGER.error("Helix cluster: {} hasn't been set up", helixClusterName);
++      throw new RuntimeException();
++    }
++
++    // Ensure auto join.
++    ensureAutoJoin(helixClusterName, admin);
++
++    // Add segment state model definition if needed
++    addSegmentStateModelDefinitionIfNeeded(helixClusterName, admin, zkPath, isUpdateStateModel);
+ 
+-    createHelixClusterIfNeeded(helixClusterName, zkPath, admin, isUpdateStateModel, enableBatchMessageMode);
++    // Add broker resource online offline state model definition if needed
++    addBrokerResourceOnlineOfflineStateModelDefinitionIfNeeded(helixClusterName, admin);
+ 
++    // Add broker resource if needed
++    createBrokerResourceIfNeeded(helixClusterName, admin, enableBatchMessageMode);
++
++    // Add lead controller resource if needed
+     createLeadControllerResourceIfNeeded(helixClusterName, admin, enableBatchMessageMode);
++
++    // Init property store if needed
++    initPropertyStoreIfNeeded(helixClusterName, zkPath);
+   }
+ 
+-  public static void createHelixClusterIfNeeded(String helixClusterName, String zkPath, HelixAdmin admin,
+-      boolean isUpdateStateModel, boolean enableBatchMessageMode) {
++  private static void ensureAutoJoin(String helixClusterName, HelixAdmin admin) {
++    final HelixConfigScope scope =
++        new HelixConfigScopeBuilder(ConfigScopeProperty.CLUSTER).forCluster(helixClusterName).build();
++    String stateTransitionMaxThreads = MessageType.STATE_TRANSITION + "." + HelixTaskExecutor.MAX_THREADS;
++    List<String> keys = new ArrayList<>();
++    keys.add(ZKHelixManager.ALLOW_PARTICIPANT_AUTO_JOIN);
++    keys.add(stateTransitionMaxThreads);
++    Map<String, String> configs = admin.getConfig(scope, keys);
++    if (!Boolean.TRUE.toString().equals(configs.get(ZKHelixManager.ALLOW_PARTICIPANT_AUTO_JOIN))) {
++      configs.put(ZKHelixManager.ALLOW_PARTICIPANT_AUTO_JOIN, Boolean.TRUE.toString());
++    }
++    if (!Integer.toString(1).equals(configs.get(stateTransitionMaxThreads))) {
++      configs.put(stateTransitionMaxThreads, String.valueOf(1));
++    }
++    admin.setConfig(scope, configs);
++  }
++
++  private static void addSegmentStateModelDefinitionIfNeeded(String helixClusterName, HelixAdmin admin, String zkPath,
++      boolean isUpdateStateModel) {
+     final String segmentStateModelName =
+         PinotHelixSegmentOnlineOfflineStateModelGenerator.PINOT_SEGMENT_ONLINE_OFFLINE_STATE_MODEL;
++    StateModelDefinition stateModelDefinition = admin.getStateModelDef(helixClusterName, segmentStateModelName);
++    if (stateModelDefinition == null) {
++      LOGGER.info(
++          "Adding state model {} (with CONSUMED state) generated using {}",
++          segmentStateModelName, PinotHelixSegmentOnlineOfflineStateModelGenerator.class.toString());
+ 
+-    if (admin.getClusters().contains(helixClusterName)) {
+-      LOGGER.info("cluster already exists ********************************************* ");
+-      if (isUpdateStateModel) {
+-        final StateModelDefinition curStateModelDef = admin.getStateModelDef(helixClusterName, segmentStateModelName);
+-        List<String> states = curStateModelDef.getStatesPriorityList();
+-        if (states.contains(PinotHelixSegmentOnlineOfflineStateModelGenerator.CONSUMING_STATE)) {
+-          LOGGER.info("State model {} already updated to contain CONSUMING state", segmentStateModelName);
+-          return;
+-        } else {
+-          LOGGER.info("Updating {} to add states for low level consumers", segmentStateModelName);
+-          StateModelDefinition newStateModelDef =
+-              PinotHelixSegmentOnlineOfflineStateModelGenerator.generatePinotStateModelDefinition();
+-          ZkClient zkClient = new ZkClient(zkPath);
+-          zkClient.waitUntilConnected(CommonConstants.Helix.ZkClient.DEFAULT_CONNECT_TIMEOUT_SEC, TimeUnit.SECONDS);
+-          zkClient.setZkSerializer(new ZNRecordSerializer());
+-          HelixDataAccessor accessor =
+-              new ZKHelixDataAccessor(helixClusterName, new ZkBaseDataAccessor<ZNRecord>(zkClient));
+-          PropertyKey.Builder keyBuilder = accessor.keyBuilder();
+-          accessor.setProperty(keyBuilder.stateModelDef(segmentStateModelName), newStateModelDef);
+-          LOGGER.info("Completed updating statemodel {}", segmentStateModelName);
+-          zkClient.close();
+-        }
++      // If this is a fresh cluster we are creating, then the cluster will see the CONSUMING state in the
++      // state model. But then the servers will never be asked to go to that STATE (whether they have the code
++      // to handle it or not) unil we complete the feature using low-level consumers and turn the feature on.
++      admin.addStateModelDef(helixClusterName, segmentStateModelName,
++          PinotHelixSegmentOnlineOfflineStateModelGenerator.generatePinotStateModelDefinition());
++    } else if (isUpdateStateModel) {
++      final StateModelDefinition curStateModelDef = admin.getStateModelDef(helixClusterName, segmentStateModelName);
++      List<String> states = curStateModelDef.getStatesPriorityList();
++      if (states.contains(PinotHelixSegmentOnlineOfflineStateModelGenerator.CONSUMING_STATE)) {
++        LOGGER.info("State model {} already updated to contain CONSUMING state", segmentStateModelName);
++      } else {
++        LOGGER.info("Updating {} to add states for low level consumers", segmentStateModelName);
++        StateModelDefinition newStateModelDef =
++            PinotHelixSegmentOnlineOfflineStateModelGenerator.generatePinotStateModelDefinition();
++        ZkClient zkClient = new ZkClient(zkPath);
++        zkClient.waitUntilConnected(CommonConstants.Helix.ZkClient.DEFAULT_CONNECT_TIMEOUT_SEC, TimeUnit.SECONDS);
++        zkClient.setZkSerializer(new ZNRecordSerializer());
++        HelixDataAccessor accessor = new ZKHelixDataAccessor(helixClusterName, new ZkBaseDataAccessor<>(zkClient));
++        PropertyKey.Builder keyBuilder = accessor.keyBuilder();
++        accessor.setProperty(keyBuilder.stateModelDef(segmentStateModelName), newStateModelDef);
++        LOGGER.info("Completed updating statemodel {}", segmentStateModelName);
++        zkClient.close();
+       }
+-      return;
+     }
+-
+-    LOGGER.info("Creating a new cluster, as the helix cluster : " + helixClusterName
+-        + " was not found ********************************************* ");
+-    admin.addCluster(helixClusterName, false);
+-
+-    LOGGER.info("Enable auto join.");
+-    final HelixConfigScope scope =
+-        new HelixConfigScopeBuilder(ConfigScopeProperty.CLUSTER).forCluster(helixClusterName).build();
+-
+-    final Map<String, String> props = new HashMap<String, String>();
+-    props.put(ZKHelixManager.ALLOW_PARTICIPANT_AUTO_JOIN, String.valueOf(true));
+-    //we need only one segment to be loaded at a time
+-    props.put(MessageType.STATE_TRANSITION + "." + HelixTaskExecutor.MAX_THREADS, String.valueOf(1));
+-
+-    admin.setConfig(scope, props);
+-
+-    LOGGER.info(
+-        "Adding state model {} (with CONSUMED state) generated using {} **********************************************",
+-        segmentStateModelName, PinotHelixSegmentOnlineOfflineStateModelGenerator.class.toString());
+-
+-    // If this is a fresh cluster we are creating, then the cluster will see the CONSUMING state in the
+-    // state model. But then the servers will never be asked to go to that STATE (whether they have the code
+-    // to handle it or not) unil we complete the feature using low-level consumers and turn the feature on.
+-    admin.addStateModelDef(helixClusterName, segmentStateModelName,
+-        PinotHelixSegmentOnlineOfflineStateModelGenerator.generatePinotStateModelDefinition());
+-
+-    LOGGER.info("Adding state model definition named : "
+-        + PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.PINOT_BROKER_RESOURCE_ONLINE_OFFLINE_STATE_MODEL
+-        + " generated using : " + PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.class.toString()
+-        + " ********************************************** ");
+-
+-    admin.addStateModelDef(helixClusterName,
+-        PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.PINOT_BROKER_RESOURCE_ONLINE_OFFLINE_STATE_MODEL,
+-        PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.generatePinotStateModelDefinition());
+-
+-    LOGGER.info("Adding empty ideal state for Broker!");
+-    HelixHelper.updateResourceConfigsFor(new HashMap<String, String>(), CommonConstants.Helix.BROKER_RESOURCE_INSTANCE,
+-        helixClusterName, admin);
+-    IdealState idealState = PinotTableIdealStateBuilder
+-        .buildEmptyIdealStateForBrokerResource(admin, helixClusterName, enableBatchMessageMode);
+-    admin.setResourceIdealState(helixClusterName, CommonConstants.Helix.BROKER_RESOURCE_INSTANCE, idealState);
+-    initPropertyStorePath(helixClusterName, zkPath);
+-    LOGGER.info("New Cluster setup completed... ********************************************** ");
+   }
+ 
+-  private static void initPropertyStorePath(String helixClusterName, String zkPath) {
+-    String propertyStorePath = PropertyPathConfig.getPath(PropertyType.PROPERTYSTORE, helixClusterName);
+-    ZkHelixPropertyStore<ZNRecord> propertyStore =
+-        new ZkHelixPropertyStore<ZNRecord>(zkPath, new ZNRecordSerializer(), propertyStorePath);
+-    propertyStore.create("/CONFIGS", new ZNRecord(""), AccessOption.PERSISTENT);
+-    propertyStore.create("/CONFIGS/CLUSTER", new ZNRecord(""), AccessOption.PERSISTENT);
+-    propertyStore.create("/CONFIGS/TABLE", new ZNRecord(""), AccessOption.PERSISTENT);
+-    propertyStore.create("/CONFIGS/INSTANCE", new ZNRecord(""), AccessOption.PERSISTENT);
+-    propertyStore.create("/SCHEMAS", new ZNRecord(""), AccessOption.PERSISTENT);
+-    propertyStore.create("/SEGMENTS", new ZNRecord(""), AccessOption.PERSISTENT);
++  private static void addBrokerResourceOnlineOfflineStateModelDefinitionIfNeeded(String helixClusterName,
++      HelixAdmin admin) {
++    StateModelDefinition brokerResourceStateModelDefinition = admin.getStateModelDef(helixClusterName,
++        PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.PINOT_BROKER_RESOURCE_ONLINE_OFFLINE_STATE_MODEL);
++    if (brokerResourceStateModelDefinition == null) {
++      LOGGER.info("Adding state model definition named : {} generated using : {}",
++          PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.PINOT_BROKER_RESOURCE_ONLINE_OFFLINE_STATE_MODEL,
++          PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.class.toString());
++      admin.addStateModelDef(helixClusterName,
++          PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.PINOT_BROKER_RESOURCE_ONLINE_OFFLINE_STATE_MODEL,
++          PinotHelixBrokerResourceOnlineOfflineStateModelGenerator.generatePinotStateModelDefinition());
++    }
+   }
+ 
+-  private static HelixManager startHelixControllerInStandadloneMode(String helixClusterName, String zkUrl,
+-      String pinotControllerInstanceId) {
+-    LOGGER.info("Starting Helix Standalone Controller ... ");
+-    return HelixControllerMain
+-        .startHelixController(zkUrl, helixClusterName, pinotControllerInstanceId, HelixControllerMain.STANDALONE);
++  private static void createBrokerResourceIfNeeded(String helixClusterName, HelixAdmin admin,
++      boolean enableBatchMessageMode) {
++    IdealState brokerResourceIdealState =
++        admin.getResourceIdealState(helixClusterName, CommonConstants.Helix.BROKER_RESOURCE_INSTANCE);
++    if (brokerResourceIdealState == null) {
++      LOGGER.info("Adding empty ideal state for Broker!");
++      HelixHelper.updateResourceConfigsFor(new HashMap<>(), CommonConstants.Helix.BROKER_RESOURCE_INSTANCE,
++          helixClusterName, admin);
++      IdealState idealState = PinotTableIdealStateBuilder.buildEmptyIdealStateForBrokerResource(admin, helixClusterName,
++          enableBatchMessageMode);
++      admin.setResourceIdealState(helixClusterName, CommonConstants.Helix.BROKER_RESOURCE_INSTANCE, idealState);
++    }
+   }
+ 
+   private static void createLeadControllerResourceIfNeeded(String helixClusterName, HelixAdmin admin,
+       boolean enableBatchMessageMode) {
+-    IdealState leadControllerResourceIdealState = admin.getResourceIdealState(helixClusterName, LEAD_CONTROLLER_RESOURCE_NAME);
++    IdealState leadControllerResourceIdealState =
++        admin.getResourceIdealState(helixClusterName, LEAD_CONTROLLER_RESOURCE_NAME);
+     if (leadControllerResourceIdealState == null) {
+-      LOGGER.info("Cluster {} doesn't contain {}. Creating one..", helixClusterName,
+-          LEAD_CONTROLLER_RESOURCE_NAME);
++      LOGGER.info("Cluster {} doesn't contain {}. Creating one.", helixClusterName, LEAD_CONTROLLER_RESOURCE_NAME);
+ 
+       admin.addStateModelDef(helixClusterName, MasterSlaveSMD.name, MasterSlaveSMD.build());
+ 
+-      HelixHelper.updateResourceConfigsFor(new HashMap<>(), LEAD_CONTROLLER_RESOURCE_NAME,
+-          helixClusterName, admin);
++      HelixHelper.updateResourceConfigsFor(new HashMap<>(), LEAD_CONTROLLER_RESOURCE_NAME, helixClusterName, admin);
+       // FULL-AUTO Master-Slave state model with CrushED rebalance strategy.
+       admin.addResource(helixClusterName, LEAD_CONTROLLER_RESOURCE_NAME,
+-          CommonConstants.Helix.DEFAULT_NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE,
+-          MasterSlaveSMD.name, IdealState.RebalanceMode.FULL_AUTO.toString(), CrushEdRebalanceStrategy.class.getName());
++          CommonConstants.Helix.NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE, MasterSlaveSMD.name,
++          IdealState.RebalanceMode.FULL_AUTO.toString(), CrushEdRebalanceStrategy.class.getName());
+ 
+       // Set instance group tag for lead controller resource.
+       IdealState leadControllerIdealState =
+@@ -209,13 +236,36 @@ private static void createLeadControllerResourceIfNeeded(String helixClusterName
+       leadControllerIdealState.setInstanceGroupTag(CommonConstants.Helix.CONTROLLER_INSTANCE_TYPE);
+       leadControllerIdealState.setBatchMessageMode(enableBatchMessageMode);
+       leadControllerIdealState.setMinActiveReplicas(0);
+-      admin.setResourceIdealState(helixClusterName, LEAD_CONTROLLER_RESOURCE_NAME,
+-          leadControllerIdealState);
++      admin.setResourceIdealState(helixClusterName, LEAD_CONTROLLER_RESOURCE_NAME, leadControllerIdealState);
+ 
+       LOGGER.info("Re-balance lead controller resource with replicas: {}",
+-          CommonConstants.Helix.DEFAULT_NUMBER_OF_CONTROLLER_REPLICAS);
++          CommonConstants.Helix.NUMBER_OF_CONTROLLER_REPLICAS);
+       admin.rebalance(helixClusterName, LEAD_CONTROLLER_RESOURCE_NAME,
+-          CommonConstants.Helix.DEFAULT_NUMBER_OF_CONTROLLER_REPLICAS);
++          CommonConstants.Helix.NUMBER_OF_CONTROLLER_REPLICAS);
++    }
++  }
++
++  private static void initPropertyStoreIfNeeded(String helixClusterName, String zkPath) {
++    String propertyStorePath = PropertyPathBuilder.propertyStore(helixClusterName);
++    ZkHelixPropertyStore<ZNRecord> propertyStore =
++        new ZkHelixPropertyStore<>(zkPath, new ZNRecordSerializer(), propertyStorePath);
++    if (!propertyStore.exists("/CONFIGS", AccessOption.PERSISTENT)) {
++      propertyStore.create("/CONFIGS", new ZNRecord(""), AccessOption.PERSISTENT);
++    }
++    if (!propertyStore.exists("/CONFIGS/CLUSTER", AccessOption.PERSISTENT)) {
++      propertyStore.create("/CONFIGS/CLUSTER", new ZNRecord(""), AccessOption.PERSISTENT);
++    }
++    if (!propertyStore.exists("/CONFIGS/TABLE", AccessOption.PERSISTENT)) {
++      propertyStore.create("/CONFIGS/TABLE", new ZNRecord(""), AccessOption.PERSISTENT);
++    }
++    if (!propertyStore.exists("/CONFIGS/INSTANCE", AccessOption.PERSISTENT)) {
++      propertyStore.create("/CONFIGS/INSTANCE", new ZNRecord(""), AccessOption.PERSISTENT);
++    }
++    if (!propertyStore.exists("/SCHEMAS", AccessOption.PERSISTENT)) {
++      propertyStore.create("/SCHEMAS", new ZNRecord(""), AccessOption.PERSISTENT);
++    }
++    if (!propertyStore.exists("/SEGMENTS", AccessOption.PERSISTENT)) {
++      propertyStore.create("/SEGMENTS", new ZNRecord(""), AccessOption.PERSISTENT);
+     }
+   }
+ }
+diff --git a/pinot-controller/src/test/java/org/apache/pinot/controller/helix/PinotControllerModeTest.java b/pinot-controller/src/test/java/org/apache/pinot/controller/helix/PinotControllerModeTest.java
+index 5c1feda1e37..7214a7d0e06 100644
+--- a/pinot-controller/src/test/java/org/apache/pinot/controller/helix/PinotControllerModeTest.java
++++ b/pinot-controller/src/test/java/org/apache/pinot/controller/helix/PinotControllerModeTest.java
+@@ -42,7 +42,7 @@ public class PinotControllerModeTest extends ControllerTest {
+   public void setUp() {
+     startZk();
+     config = getDefaultControllerConfiguration();
+-    controllerPortOffset = 200;
++    controllerPortOffset = 0;
+   }
+ 
+   @Test
+@@ -72,6 +72,25 @@ public void testDualModeController()
+         "Failed to start " + config.getControllerMode() + " controller in " + TIMEOUT_IN_MS + "ms.");
+     Assert.assertEquals(_controllerStarter.getControllerMode(), ControllerConf.ControllerMode.DUAL);
+ 
++    // Enable the lead controller resource.
++    _helixAdmin.enableResource(getHelixClusterName(), CommonConstants.Helix.LEAD_CONTROLLER_RESOURCE_NAME, true);
++
++    // Starting a second dual-mode controller.
++    ControllerConf controllerConfig = getDefaultControllerConfiguration();
++    controllerConfig.setHelixClusterName(getHelixClusterName());
++    controllerConfig.setControllerMode(ControllerConf.ControllerMode.DUAL);
++    controllerConfig.setControllerPort(Integer.toString(Integer.parseInt(this.config.getControllerPort()) + controllerPortOffset++));
++
++    ControllerStarter secondDualModeController = new TestOnlyControllerStarter(controllerConfig);
++    secondDualModeController.start();
++    TestUtils.waitForCondition(
++        aVoid -> secondDualModeController.getHelixResourceManager().getHelixZkManager().isConnected(), TIMEOUT_IN_MS,
++        "Failed to start " + config.getControllerMode() + " controller in " + TIMEOUT_IN_MS + "ms.");
++    Assert.assertEquals(secondDualModeController.getControllerMode(), ControllerConf.ControllerMode.DUAL);
++
++    Thread.sleep(100000_000L);
++
++    secondDualModeController.stop();
+     stopController();
+     _controllerStarter = null;
+   }
+diff --git a/pinot-controller/src/test/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManagerTest.java b/pinot-controller/src/test/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManagerTest.java
+index 539eb7d8a42..152fd6e59a7 100644
+--- a/pinot-controller/src/test/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManagerTest.java
++++ b/pinot-controller/src/test/java/org/apache/pinot/controller/helix/core/PinotHelixResourceManagerTest.java
+@@ -19,14 +19,23 @@
+ package org.apache.pinot.controller.helix.core;
+ 
+ import com.google.common.collect.BiMap;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
+ import org.I0Itec.zkclient.ZkClient;
++import org.apache.helix.HelixDataAccessor;
++import org.apache.helix.PropertyKey;
+ import org.apache.helix.PropertyPathBuilder;
+ import org.apache.helix.ZNRecord;
++import org.apache.helix.controller.rebalancer.strategy.CrushEdRebalanceStrategy;
++import org.apache.helix.controller.stages.ClusterDataCache;
+ import org.apache.helix.manager.zk.ZNRecordSerializer;
++import org.apache.helix.model.ClusterConfig;
+ import org.apache.helix.model.ExternalView;
+ import org.apache.helix.model.IdealState;
+ import org.apache.helix.model.InstanceConfig;
+@@ -53,7 +62,7 @@
+ import org.testng.annotations.BeforeClass;
+ import org.testng.annotations.Test;
+ 
+-import static org.apache.pinot.common.utils.CommonConstants.Helix.LEAD_CONTROLLER_RESOURCE_NAME;
++import static org.apache.pinot.common.utils.CommonConstants.Helix.*;
+ import static org.apache.pinot.controller.helix.core.PinotHelixResourceManager.*;
+ 
+ 
+@@ -471,7 +480,7 @@ public void testLeadControllerResource() {
+     Assert.assertEquals(leadControllerResourceIdealState.getInstanceGroupTag(),
+         CommonConstants.Helix.CONTROLLER_INSTANCE_TYPE);
+     Assert.assertEquals(leadControllerResourceIdealState.getNumPartitions(),
+-        CommonConstants.Helix.DEFAULT_NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE);
++        CommonConstants.Helix.NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE);
+     Assert.assertEquals(leadControllerResourceIdealState.getReplicas(), "1");
+     Assert.assertEquals(leadControllerResourceIdealState.getRebalanceMode(), IdealState.RebalanceMode.FULL_AUTO);
+     Assert.assertTrue(leadControllerResourceIdealState
+@@ -482,11 +491,77 @@ public void testLeadControllerResource() {
+       Map<String, String> stateMap = leadControllerResourceExternalView.getStateMap(partition);
+       Assert.assertEquals(stateMap.size(), 1);
+       Map.Entry<String, String> entry = stateMap.entrySet().iterator().next();
+-      Assert.assertEquals(entry.getKey(), CommonConstants.Helix.PREFIX_OF_CONTROLLER_INSTANCE + "localhost_8998");
++      Assert.assertEquals(entry.getKey(), PREFIX_OF_CONTROLLER_INSTANCE + LOCAL_HOST + "_" + _controllerPort);
+       Assert.assertEquals(entry.getValue(), "MASTER");
+     }
+   }
+ 
++  @Test
++  public void testLeadControllerAssignment() {
++    // Given a list of instances (from 1 to 10), make sure all the instances got assigned to lead controller resource.
++    for (int nInstances = 1; nInstances <= 10; nInstances++) {
++      List<String> instanceNames = new ArrayList<>(nInstances);
++      List<Integer> ports = new ArrayList<>(nInstances);
++      for (int i = 0; i < nInstances; i++) {
++        instanceNames.add(PREFIX_OF_CONTROLLER_INSTANCE + LOCAL_HOST + "_" + i);
++        ports.add(i);
++      }
++
++      List<String> partitions = new ArrayList<>(NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE);
++      for (int i = 0; i < NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE; i++) {
++        partitions.add(PREFIX_OF_CONTROLLER_INSTANCE + LOCAL_HOST + "_" + i);
++      }
++
++      LinkedHashMap<String, Integer> states = new LinkedHashMap<>(2);
++      states.put("OFFLINE", 0);
++      states.put("MASTER", NUMBER_OF_CONTROLLER_REPLICAS);
++
++      CrushEdRebalanceStrategy crushEdRebalanceStrategy = new CrushEdRebalanceStrategy();
++      crushEdRebalanceStrategy.init(LEAD_CONTROLLER_RESOURCE_NAME, partitions, states, Integer.MAX_VALUE);
++
++      ClusterDataCache clusterDataCache = new ClusterDataCache();
++      PropertyKey.Builder keyBuilder = new PropertyKey.Builder(getHelixClusterName());
++      HelixDataAccessor accessor = _helixManager.getHelixDataAccessor();
++      ClusterConfig clusterConfig = accessor.getProperty(keyBuilder.clusterConfig());
++      clusterDataCache.setClusterConfig(clusterConfig);
++
++      Map<String, InstanceConfig> instanceConfigMap = new HashMap<>(nInstances);
++      for (int i = 0; i < nInstances; i++) {
++        String instanceName = instanceNames.get(i);
++        int port = ports.get(i);
++        instanceConfigMap.put(instanceName, new InstanceConfig(instanceName
++            + ", {HELIX_ENABLED=true, HELIX_ENABLED_TIMESTAMP=1559546216610, HELIX_HOST=Controller_localhost, HELIX_PORT="
++            + port + "}{}{TAG_LIST=[controller]}"));
++      }
++      clusterDataCache.setInstanceConfigMap(instanceConfigMap);
++      ZNRecord znRecord =
++          crushEdRebalanceStrategy.computePartitionAssignment(instanceNames, instanceNames, new HashMap<>(0),
++              clusterDataCache);
++
++      Assert.assertNotNull(znRecord);
++      Map<String, List<String>> listFields = znRecord.getListFields();
++      Assert.assertEquals(listFields.size(), NUMBER_OF_PARTITIONS_IN_LEAD_CONTROLLER_RESOURCE);
++
++      Map<String, Integer> instanceToMasterAssignmentCountMap = new HashMap<>();
++      int maxCount = 0;
++      for (List<String> assignments : listFields.values()) {
++        Assert.assertEquals(assignments.size(), NUMBER_OF_CONTROLLER_REPLICAS);
++        if (!instanceToMasterAssignmentCountMap.containsKey(assignments.get(0))) {
++          instanceToMasterAssignmentCountMap.put(assignments.get(0), 1);
++        } else {
++          instanceToMasterAssignmentCountMap.put(assignments.get(0),
++              instanceToMasterAssignmentCountMap.get(assignments.get(0)) + 1);
++        }
++        maxCount = Math.max(instanceToMasterAssignmentCountMap.get(assignments.get(0)), maxCount);
++      }
++      Assert.assertEquals(instanceToMasterAssignmentCountMap.size(), nInstances,
++          "Not all the instances got assigned to the resource!");
++      for (Integer count : instanceToMasterAssignmentCountMap.values()) {
++        Assert.assertTrue((maxCount - count == 0 || maxCount - count == 1), "Instance assignment isn't distributed");
++      }
++    }
++  }
++
+   @AfterMethod
+   public void cleanUpBrokerTags() {
+     // Untag all Brokers for other tests

@@ -1,0 +1,308 @@
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/DataStreamWriter.scala b/sql/core/src/main/scala/org/apache/spark/sql/DataStreamWriter.scala
+index 6ab8a67b2b9c2..b325d48fcbbb1 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/DataStreamWriter.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/DataStreamWriter.scala
+@@ -79,7 +79,7 @@ final class DataStreamWriter private[sql](df: DataFrame) {
+    */
+   @scala.annotation.varargs
+   def partitionBy(colNames: String*): DataStreamWriter = {
+-    this.partitioningColumns = Option(colNames)
++    this.partitioningColumns = colNames
+     this
+   }
+ 
+@@ -105,18 +105,19 @@ final class DataStreamWriter private[sql](df: DataFrame) {
+     val sink = ResolvedDataSource.createSink(
+       df.sqlContext,
+       source,
+-      extraOptions.toMap)
++      extraOptions.toMap,
++      normalizedParCols)
+ 
+     new StreamExecution(df.sqlContext, df.logicalPlan, sink)
+   }
+ 
+-  private def normalizedParCols: Option[Seq[String]] = partitioningColumns.map { parCols =>
+-    parCols.map { col =>
++  private def normalizedParCols: Seq[String] = {
++    partitioningColumns.map { col =>
+       df.logicalPlan.output
+-          .map(_.name)
+-          .find(df.sqlContext.analyzer.resolver(_, col))
+-          .getOrElse(throw new AnalysisException(s"Partition column $col not found in existing " +
+-              s"columns (${df.logicalPlan.output.map(_.name).mkString(", ")})"))
++        .map(_.name)
++        .find(df.sqlContext.analyzer.resolver(_, col))
++        .getOrElse(throw new AnalysisException(s"Partition column $col not found in existing " +
++            s"columns (${df.logicalPlan.output.map(_.name).mkString(", ")})"))
+     }
+   }
+ 
+@@ -128,6 +129,6 @@ final class DataStreamWriter private[sql](df: DataFrame) {
+ 
+   private var extraOptions = new scala.collection.mutable.HashMap[String, String]
+ 
+-  private var partitioningColumns: Option[Seq[String]] = None
++  private var partitioningColumns: Seq[String] = Nil
+ 
+ }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/ResolvedDataSource.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/ResolvedDataSource.scala
+index 5d6446d0bf70c..e3065ac5f87d2 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/ResolvedDataSource.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/ResolvedDataSource.scala
+@@ -110,7 +110,8 @@ object ResolvedDataSource extends Logging {
+   def createSink(
+       sqlContext: SQLContext,
+       providerName: String,
+-      options: Map[String, String]): Sink = {
++      options: Map[String, String],
++      partitionColumns: Seq[String]): Sink = {
+     val provider = lookupDataSource(providerName).newInstance() match {
+       case s: StreamSinkProvider => s
+       case _ =>
+@@ -118,7 +119,7 @@ object ResolvedDataSource extends Logging {
+           s"Data source $providerName does not support streamed writing")
+     }
+ 
+-    provider.createSink(sqlContext, options)
++    provider.createSink(sqlContext, options, partitionColumns)
+   }
+ 
+ 
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamExecution.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamExecution.scala
+index 80d280dab9d8f..ebebb829710b2 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamExecution.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamExecution.scala
+@@ -49,7 +49,7 @@ class StreamExecution(
+   private val minBatchTime = 10
+ 
+   /** Tracks how much data we have processed from each input source. */
+-  private[sql] val currentOffsets = new StreamProgress
++  private[sql] val streamProgress = new StreamProgress
+ 
+   /** All stream sources present the query plan. */
+   private val sources =
+@@ -67,14 +67,14 @@ class StreamExecution(
+ 
+         assert(sources.size == storedProgress.size)
+         sources.zip(storedProgress).foreach { case (source, offset) =>
+-          offset.foreach(currentOffsets.update(source, _))
++          offset.foreach(streamProgress.update(source, _))
+         }
+       case None => // We are starting this stream for the first time.
+       case _ => throw new IllegalArgumentException("Expected composite offset from sink")
+     }
+   }
+ 
+-  logInfo(s"Stream running at $currentOffsets")
++  logInfo(s"Stream running at $streamProgress")
+ 
+   /** When false, signals to the microBatchThread that it should stop running. */
+   @volatile private var shouldRun = true
+@@ -118,7 +118,7 @@ class StreamExecution(
+     // Replace sources in the logical plan with data that has arrived since the last batch.
+     val withNewSources = logicalPlan transform {
+       case StreamingRelation(source, output) =>
+-        val prevOffset = currentOffsets.get(source)
++        val prevOffset = streamProgress.get(source)
+         val newBatch = source.getNextBatch(prevOffset)
+ 
+         newBatch.map { batch =>
+@@ -147,11 +147,11 @@ class StreamExecution(
+       val optimizerTime = (System.nanoTime() - optimizerStart).toDouble / 1000000
+       logDebug(s"Optimized batch in ${optimizerTime}ms")
+ 
+-      StreamExecution.this.synchronized {
++      streamProgress.synchronized {
+         // Update the offsets and calculate a new composite offset
+-        newOffsets.foreach(currentOffsets.update)
++        newOffsets.foreach(streamProgress.update)
+         val newStreamProgress = logicalPlan.collect {
+-          case StreamingRelation(source, _) => currentOffsets.get(source)
++          case StreamingRelation(source, _) => streamProgress.get(source)
+         }
+         val batchOffset = CompositeOffset(newStreamProgress)
+ 
+@@ -170,7 +170,7 @@ class StreamExecution(
+       logInfo(s"Compete up to $newOffsets in ${batchTime}ms")
+     }
+ 
+-    logDebug(s"Waiting for data, current: $currentOffsets")
++    logDebug(s"Waiting for data, current: $streamProgress")
+   }
+ 
+   /**
+@@ -187,8 +187,8 @@ class StreamExecution(
+    * least the given `Offset`. This method is indented for use primarily when writing tests.
+    */
+   def awaitOffset(source: Source, newOffset: Offset): Unit = {
+-    def notDone = synchronized {
+-      !currentOffsets.contains(source) || currentOffsets(source) < newOffset
++    def notDone = streamProgress.synchronized {
++      !streamProgress.contains(source) || streamProgress(source) < newOffset
+     }
+ 
+     while (notDone) {
+@@ -201,7 +201,7 @@ class StreamExecution(
+   override def toString: String =
+     s"""
+        |=== Streaming Query ===
+-       |CurrentOffsets: $currentOffsets
++       |CurrentOffsets: $streamProgress
+        |Thread State: ${microBatchThread.getState}
+        |${if (streamDeathCause != null) stackTraceToString(streamDeathCause) else ""}
+        |
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamProgress.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamProgress.scala
+index f52c9055ff7f1..0ded1d7152c19 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamProgress.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/StreamProgress.scala
+@@ -59,12 +59,9 @@ class StreamProgress {
+     currentOffsets.map { case (k, v) => s"$k: $v"}.mkString("{", ",", "}")
+ 
+   override def equals(other: Any): Boolean = other match {
+-    case s: StreamProgress =>
+-      s.currentOffsets.keys.toSet == currentOffsets.keys.toSet &&
+-      s.currentOffsets.forall(w => currentOffsets(w._1) == w._2)
++    case s: StreamProgress => currentOffsets == s.currentOffsets
++    case _ => false
+   }
+ 
+-  override def hashCode: Int = {
+-    currentOffsets.toSeq.sortBy(_._1.toString).hashCode()
+-  }
++  override def hashCode: Int = currentOffsets.hashCode()
+ }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/sources/interfaces.scala b/sql/core/src/main/scala/org/apache/spark/sql/sources/interfaces.scala
+index 2351006dbe3e1..299fc6efbb046 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/sources/interfaces.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/sources/interfaces.scala
+@@ -140,7 +140,8 @@ trait StreamSourceProvider {
+ trait StreamSinkProvider {
+   def createSink(
+       sqlContext: SQLContext,
+-      parameters: Map[String, String]): Sink
++      parameters: Map[String, String],
++      partitionColumns: Seq[String]): Sink
+ }
+ 
+ /**
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/StreamTest.scala b/sql/core/src/test/scala/org/apache/spark/sql/StreamTest.scala
+index 40576f526ea5c..f45abbf2496a2 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/StreamTest.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/StreamTest.scala
+@@ -164,7 +164,7 @@ trait StreamTest extends QueryTest with Timeouts {
+     }.mkString("\n")
+ 
+     def currentOffsets =
+-      if (currentStream != null) currentStream.currentOffsets.toString else "not started"
++      if (currentStream != null) currentStream.streamProgress.toString else "not started"
+ 
+     def threadState =
+       if (currentStream != null && currentStream.microBatchThread.isAlive) "alive" else "dead"
+@@ -296,7 +296,7 @@ trait StreamTest extends QueryTest with Timeouts {
+    * @param addData and add data action that adds the given numbers to the stream, encoding them
+    *                as needed
+    */
+-  def createStressTest(
++  def runStressTest(
+       ds: Dataset[Int],
+       addData: Seq[Int] => StreamAction,
+       iterations: Int = 100): Unit = {
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/streaming/DataStreamReaderSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/streaming/DataStreamReaderSuite.scala
+index 426a23e894557..1dab6ebf1bee9 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/streaming/DataStreamReaderSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/streaming/DataStreamReaderSuite.scala
+@@ -17,15 +17,16 @@
+ 
+ package org.apache.spark.sql.streaming.test
+ 
+-import org.apache.spark.sql.{SQLContext, StreamTest}
++import org.apache.spark.sql.{AnalysisException, SQLContext, StreamTest}
+ import org.apache.spark.sql.execution.streaming.{Batch, Offset, Sink, Source}
+ import org.apache.spark.sql.sources.{StreamSinkProvider, StreamSourceProvider}
+ import org.apache.spark.sql.test.SharedSQLContext
+-import org.apache.spark.sql.types.StructType
++import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
+ 
+ object LastOptions {
+   var parameters: Map[String, String] = null
+   var schema: Option[StructType] = null
++  var partitionColumns: Seq[String] = Nil
+ }
+ 
+ /** Dummy provider: returns no-op source/sink and records options in [[LastOptions]]. */
+@@ -38,14 +39,16 @@ class DefaultSource extends StreamSourceProvider with StreamSinkProvider {
+     LastOptions.schema = schema
+     new Source {
+       override def getNextBatch(start: Option[Offset]): Option[Batch] = None
+-      override def schema: StructType = StructType(Nil)
++      override def schema: StructType = StructType(StructField("a", IntegerType) :: Nil)
+     }
+   }
+ 
+   override def createSink(
+       sqlContext: SQLContext,
+-      parameters: Map[String, String]): Sink = {
++      parameters: Map[String, String],
++      partitionColumns: Seq[String]): Sink = {
+     LastOptions.parameters = parameters
++    LastOptions.partitionColumns = partitionColumns
+     new Sink {
+       override def addBatch(batch: Batch): Unit = {}
+       override def currentOffset: Option[Offset] = None
+@@ -106,6 +109,43 @@ class DataStreamReaderWriterSuite extends StreamTest with SharedSQLContext {
+     assert(LastOptions.parameters("opt3") == "3")
+   }
+ 
++  test("partitioning") {
++    val df = sqlContext.streamFrom
++      .format("org.apache.spark.sql.streaming.test")
++      .open()
++
++    df.streamTo
++      .format("org.apache.spark.sql.streaming.test")
++      .start()
++      .stop()
++    assert(LastOptions.partitionColumns == Nil)
++
++    df.streamTo
++      .format("org.apache.spark.sql.streaming.test")
++      .partitionBy("a")
++      .start()
++      .stop()
++    assert(LastOptions.partitionColumns == Seq("a"))
++
++
++    withSQLConf("spark.sql.caseSensitive" -> "false") {
++      df.streamTo
++        .format("org.apache.spark.sql.streaming.test")
++        .partitionBy("A")
++        .start()
++        .stop()
++      assert(LastOptions.partitionColumns == Seq("a"))
++    }
++
++    intercept[AnalysisException] {
++      df.streamTo
++        .format("org.apache.spark.sql.streaming.test")
++        .partitionBy("b")
++        .start()
++        .stop()
++    }
++  }
++
+   test("stream paths") {
+     val df = sqlContext.streamFrom
+       .format("org.apache.spark.sql.streaming.test")
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/streaming/MemorySourceStressSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/streaming/MemorySourceStressSuite.scala
+index 83795ac53bb43..81760d2aa8205 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/streaming/MemorySourceStressSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/streaming/MemorySourceStressSuite.scala
+@@ -28,6 +28,6 @@ class MemorySourceStressSuite extends StreamTest with SharedSQLContext {
+     val input = MemoryStream[Int]
+     val mapped = input.toDS().map(_ + 1)
+ 
+-    createStressTest(mapped, AddData(input, _: _*))
++    runStressTest(mapped, AddData(input, _: _*))
+   }
+ }

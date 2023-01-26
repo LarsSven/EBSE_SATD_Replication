@@ -1,0 +1,84 @@
+diff --git a/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BeamSqlUnparseContext.java b/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BeamSqlUnparseContext.java
+index ebdacf78ff23..432b3b5db282 100644
+--- a/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BeamSqlUnparseContext.java
++++ b/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BeamSqlUnparseContext.java
+@@ -24,7 +24,6 @@
+ import org.apache.beam.vendor.calcite.v1_20_0.org.apache.calcite.rex.RexLiteral;
+ import org.apache.beam.vendor.calcite.v1_20_0.org.apache.calcite.rex.RexNode;
+ import org.apache.beam.vendor.calcite.v1_20_0.org.apache.calcite.rex.RexProgram;
+-import org.apache.beam.vendor.calcite.v1_20_0.org.apache.calcite.sql.SqlDialect;
+ import org.apache.beam.vendor.calcite.v1_20_0.org.apache.calcite.sql.SqlKind;
+ import org.apache.beam.vendor.calcite.v1_20_0.org.apache.calcite.sql.SqlLiteral;
+ import org.apache.beam.vendor.calcite.v1_20_0.org.apache.calcite.sql.SqlNode;
+@@ -37,8 +36,8 @@
+ 
+ public class BeamSqlUnparseContext extends SqlImplementor.SimpleContext {
+ 
+-  public BeamSqlUnparseContext(SqlDialect dialect, IntFunction<SqlNode> field) {
+-    super(dialect, field);
++  public BeamSqlUnparseContext(IntFunction<SqlNode> field) {
++    super(BeamBigQuerySqlDialect.DEFAULT, field);
+   }
+ 
+   @Override
+@@ -46,14 +45,12 @@ public SqlNode toSql(RexProgram program, RexNode rex) {
+     if (rex.getKind().equals(SqlKind.LITERAL)) {
+       final RexLiteral literal = (RexLiteral) rex;
+       SqlTypeFamily family = literal.getTypeName().getFamily();
+-      if (family != null) {
+-        if (family.equals(SqlTypeFamily.BINARY)) {
+-          BitString bitString = BitString.createFromBytes(literal.getValueAs(byte[].class));
+-          return new SqlByteStringLiteral(bitString, POS);
+-        } else if (family.equals(SqlTypeFamily.CHARACTER)) {
+-          String escaped = StringEscapeUtils.escapeJava(literal.getValueAs(String.class));
+-          return SqlLiteral.createCharString(escaped, POS);
+-        }
++      if (SqlTypeFamily.BINARY.equals(family)) {
++        BitString bitString = BitString.createFromBytes(literal.getValueAs(byte[].class));
++        return new SqlByteStringLiteral(bitString, POS);
++      } else if (SqlTypeFamily.CHARACTER.equals(family)) {
++        String escaped = StringEscapeUtils.escapeJava(literal.getValueAs(String.class));
++        return SqlLiteral.createCharString(escaped, POS);
+       }
+     }
+ 
+diff --git a/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BigQueryTable.java b/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BigQueryTable.java
+index 789d8ec1b73b..71f42359bfdf 100644
+--- a/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BigQueryTable.java
++++ b/sdks/java/extensions/sql/src/main/java/org/apache/beam/sdk/extensions/sql/meta/provider/bigquery/BigQueryTable.java
+@@ -188,8 +188,7 @@ private String generateRowRestrictions(Schema schema, List<RexNode> supported) {
+ 
+     // TODO: BigQuerySqlDialectWithTypeTranslation can be replaced with BigQuerySqlDialect after
+     // updating vendor Calcite version.
+-    SqlImplementor.SimpleContext context =
+-        new SqlImplementor.SimpleContext(BeamBigQuerySqlDialect.DEFAULT, field);
++    SqlImplementor.Context context = new BeamSqlUnparseContext(field);
+ 
+     // Create a single SqlNode from a list of RexNodes
+     SqlNode andSqlNode = null;
+diff --git a/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/BeamZetaSqlCalcRel.java b/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/BeamZetaSqlCalcRel.java
+index 8cc8d3ed2daa..330fb2df3550 100644
+--- a/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/BeamZetaSqlCalcRel.java
++++ b/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/BeamZetaSqlCalcRel.java
+@@ -74,7 +74,7 @@ public BeamZetaSqlCalcRel(
+         i ->
+             new SqlIdentifier(
+                 getProgram().getInputRowType().getFieldList().get(i).getName(), SqlParserPos.ZERO);
+-    context = new BeamSqlUnparseContext(DIALECT, fn);
++    context = new BeamSqlUnparseContext(fn);
+   }
+ 
+   @Override
+diff --git a/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/ZetaSqlUtils.java b/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/ZetaSqlUtils.java
+index 391041a7edb8..d771857e1ed2 100644
+--- a/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/ZetaSqlUtils.java
++++ b/sdks/java/extensions/sql/zetasql/src/main/java/org/apache/beam/sdk/extensions/sql/zetasql/ZetaSqlUtils.java
+@@ -158,6 +158,8 @@ public static Object zetaSqlValueToJavaObject(Value value, FieldType fieldType)
+       case DECIMAL:
+         return value.getNumericValue();
+       case DOUBLE:
++        // Floats with a floating part equal to zero are treated as whole (INT64).
++        // Cast to double when that happens.
+         if (value.getType().getKind().equals(TypeKind.TYPE_INT64)) {
+           return (double) value.getInt64Value();
+         }

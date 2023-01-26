@@ -1,0 +1,228 @@
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamPythonCalc.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamPythonCalc.scala
+index 6165bb5d1f503..fbb7be14bc458 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamPythonCalc.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/nodes/datastream/DataStreamPythonCalc.scala
+@@ -62,6 +62,7 @@ class DataStreamPythonCalc(
+   override def translateToPlan(
+       planner: StreamPlanner,
+       queryConfig: StreamQueryConfig): DataStream[CRow] = {
++    // Will add the implementation in FLINK-14018 as it's not testable for now.
+     null
+   }
+ }
+diff --git a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/logical/PythonScalarFunctionSplitRule.scala b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/logical/PythonScalarFunctionSplitRule.scala
+index eb7af394bdef2..5b885c2ce4c95 100644
+--- a/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/logical/PythonScalarFunctionSplitRule.scala
++++ b/flink-table/flink-table-planner/src/main/scala/org/apache/flink/table/plan/rules/logical/PythonScalarFunctionSplitRule.scala
+@@ -28,7 +28,6 @@ import org.apache.flink.table.functions.utils.ScalarSqlFunction
+ import org.apache.flink.table.plan.nodes.logical.FlinkLogicalCalc
+ import org.apache.flink.table.plan.util.PythonUtil.containsFunctionOf
+ import org.apache.flink.table.plan.util.{InputRefVisitor, RexDefaultVisitor}
+-import org.apache.flink.table.plan.rules.logical.PythonScalarFunctionSplitRule.extractRefInputFields
+ 
+ import scala.collection.JavaConverters._
+ import scala.collection.JavaConversions._
+@@ -47,8 +46,15 @@ class PythonScalarFunctionSplitRule extends RelOptRule(
+   override def matches(call: RelOptRuleCall): Boolean = {
+     val calc: FlinkLogicalCalc = call.rel(0).asInstanceOf[FlinkLogicalCalc]
+     val program = calc.getProgram
+-    program.getExprList.exists(containsFunctionOf(_, FunctionLanguage.PYTHON)) &&
+-    program.getExprList.exists(containsFunctionOf(_, FunctionLanguage.JVM))
++
++    // This rule matches if one of the following cases is met:
++    // 1. There are Python functions and Java functions mixed in the Calc
++    // 2. There are Python functions in the condition of the Calc
++    (program.getExprList.exists(containsFunctionOf(_, FunctionLanguage.PYTHON)) &&
++      program.getExprList.exists(containsFunctionOf(_, FunctionLanguage.JVM))) ||
++    Option(program.getCondition)
++      .map(program.expandLocalRef)
++      .exists(containsFunctionOf(_, FunctionLanguage.PYTHON))
+   }
+ 
+   override def onMatch(call: RelOptRuleCall): Unit = {
+@@ -58,19 +64,21 @@ class PythonScalarFunctionSplitRule extends RelOptRule(
+     val program = calc.getProgram
+     val extractedRexCalls = new mutable.ArrayBuffer[RexCall]()
+ 
+-    val outerCallContainsJavaFunction =
++    val convertPythonFunction =
+       program.getProjectList
+         .map(program.expandLocalRef)
+         .exists(containsFunctionOf(_, FunctionLanguage.JVM, recursive = false)) ||
+       Option(program.getCondition)
+         .map(program.expandLocalRef)
+-        .exists(containsFunctionOf(_, FunctionLanguage.JVM, recursive = false))
++        .exists(expr =>
++          containsFunctionOf(expr, FunctionLanguage.JVM, recursive = false) ||
++            containsFunctionOf(expr, FunctionLanguage.PYTHON))
+ 
+     val extractedFunctionOffset = input.getRowType.getFieldCount
+     val splitter = new ScalarFunctionSplitter(
+       extractedFunctionOffset,
+       extractedRexCalls,
+-      outerCallContainsJavaFunction)
++      convertPythonFunction)
+ 
+     val newProjects = program.getProjectList
+       .map(program.expandLocalRef)
+@@ -116,6 +124,26 @@ class PythonScalarFunctionSplitRule extends RelOptRule(
+ 
+     call.transformTo(topCalc)
+   }
++
++  /**
++    * Extracts the indices of the input fields referred by the specified projects and condition.
++    */
++  private def extractRefInputFields(
++      projects: Seq[RexNode],
++      condition: Option[RexNode],
++      inputFieldsCount: Int): Array[Int] = {
++    val visitor = new InputRefVisitor
++
++    // extract referenced input fields from projections
++    projects.foreach(exp => exp.accept(visitor))
++
++    // extract referenced input fields from condition
++    condition.foreach(_.accept(visitor))
++
++    // fields of indexes greater than inputFieldsCount is the extracted functions and
++    // should be filtered as they are not from the original input
++    visitor.getFields.filter(_ < inputFieldsCount)
++  }
+ }
+ 
+ private class ScalarFunctionSplitter(
+@@ -158,7 +186,7 @@ private class ScalarFunctionSplitter(
+   * @param extractedFunctionOffset the original start offset of the extracted functions
+   * @param accessedFields the accessed fields which will be forwarded
+   */
+-class ExtractedFunctionInputRewriter(
++private class ExtractedFunctionInputRewriter(
+     extractedFunctionOffset: Int,
+     accessedFields: Array[Int])
+   extends RexDefaultVisitor[RexNode] {
+@@ -188,24 +216,4 @@ class ExtractedFunctionInputRewriter(
+ 
+ object PythonScalarFunctionSplitRule {
+   val INSTANCE: RelOptRule = new PythonScalarFunctionSplitRule
+-
+-  /**
+-    * Extracts the indices of the input fields referred by the specified projects and condition.
+-    */
+-  def extractRefInputFields(
+-      projects: Seq[RexNode],
+-      condition: Option[RexNode],
+-      inputFieldsCount: Int): Array[Int] = {
+-    val visitor = new InputRefVisitor
+-
+-    // extract referenced input fields from projections
+-    projects.foreach(exp => exp.accept(visitor))
+-
+-    // extract referenced input fields from condition
+-    condition.foreach(_.accept(visitor))
+-
+-    // fields of indexes greater than inputFieldsCount is the extracted functions and
+-    // should be filtered as they are not from the original input
+-    visitor.getFields.filter(_ < inputFieldsCount)
+-  }
+ }
+diff --git a/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/plan/PythonScalarFunctionSplitRuleTest.scala b/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/plan/PythonScalarFunctionSplitRuleTest.scala
+index 6bdc10f4a8c38..c333da8bf6c2e 100644
+--- a/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/plan/PythonScalarFunctionSplitRuleTest.scala
++++ b/flink-table/flink-table-planner/src/test/scala/org/apache/flink/table/plan/PythonScalarFunctionSplitRuleTest.scala
+@@ -51,7 +51,7 @@ class PythonScalarFunctionSplitRuleTest extends TableTestBase {
+   }
+ 
+   @Test
+-  def testPythonFunctionMixWithJavaFunction(): Unit = {
++  def testPythonFunctionMixedWithJavaFunction(): Unit = {
+     val util = streamTestUtil()
+     val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
+     util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
+@@ -73,7 +73,7 @@ class PythonScalarFunctionSplitRuleTest extends TableTestBase {
+   }
+ 
+   @Test
+-  def testPythonFunctionInWhereClause(): Unit = {
++  def testPythonFunctionMixedWithJavaFunctionInWhereClause(): Unit = {
+     val util = streamTestUtil()
+     val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
+     util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
+@@ -92,6 +92,31 @@ class PythonScalarFunctionSplitRuleTest extends TableTestBase {
+         ),
+       term("select", "f0 AS _c0", "+(c, 1) AS _c1"),
+       term("where", ">(f1, 0)")
++      )
++
++    util.verifyTable(resultTable, expected)
++  }
++
++  @Test
++  def testPythonFunctionInWhereClause(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new PythonScalarFunction("pyFunc1"))
++    util.tableEnv.registerFunction("pyFunc2", new BooleanPythonScalarFunction("pyFunc2"))
++
++    val resultTable = table
++      .where("pyFunc2(a, c)")
++      .select("pyFunc1(a, b)")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "pyFunc1(a, b) AS f0", "pyFunc2(a, c) AS f1")
++      ),
++      term("select", "f0 AS _c0"),
++      term("where", "f1")
+     )
+ 
+     util.verifyTable(resultTable, expected)
+@@ -143,6 +168,30 @@ class PythonScalarFunctionSplitRuleTest extends TableTestBase {
+     util.verifyTable(resultTable, expected)
+   }
+ 
++  @Test
++  def testOnlyOnePythonFunctionInWhereClause(): Unit = {
++    val util = streamTestUtil()
++    val table = util.addTable[(Int, Int, Int)]("MyTable", 'a, 'b, 'c)
++    util.tableEnv.registerFunction("pyFunc1", new BooleanPythonScalarFunction("pyFunc1"))
++
++    val resultTable = table
++      .where("pyFunc1(a, c)")
++      .select("a, b")
++
++    val expected = unaryNode(
++      "DataStreamCalc",
++      unaryNode(
++        "DataStreamPythonCalc",
++        streamTableNode(table),
++        term("select", "a", "b", "pyFunc1(a, c) AS f0")
++      ),
++      term("select", "a", "b"),
++      term("where", "f0")
++    )
++
++    util.verifyTable(resultTable, expected)
++  }
++
+   @Test
+   def testFieldNameUniquify(): Unit = {
+     val util = streamTestUtil()
+@@ -176,3 +225,14 @@ class PythonScalarFunction(name: String) extends ScalarFunction {
+ 
+   override def toString: String = name
+ }
++
++class BooleanPythonScalarFunction(name: String) extends ScalarFunction {
++  def eval(i: Int, j: Int): Int = i + j
++
++  override def getResultType(signature: Array[Class[_]]): TypeInformation[_] =
++    BasicTypeInfo.BOOLEAN_TYPE_INFO
++
++  override def getLanguage: FunctionLanguage = FunctionLanguage.PYTHON
++
++  override def toString: String = name
++}
