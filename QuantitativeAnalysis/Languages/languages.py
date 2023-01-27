@@ -7,7 +7,7 @@ HEADERS = {
     'X-GitHub-Api-Version': '2022-11-28'
 }
 
-with open('Comments_Review/AllCategories.csv', 'r') as infile, open('languages.csv', 'w') as outfile:
+with open('../Comments_Review/AllCategories.csv', 'r') as infile, open('languages.csv', 'w') as outfile:
     reader = csv.reader(infile)
     writer = csv.DictWriter(outfile, ['project', 'languages'])
     writer.writeheader()
