@@ -19,20 +19,65 @@ $ cp new.csv ../QualitativeAnalysis/Round1/sampling_input.csv
 
 ## 2. Perform sampling for qualitative analysis rounds
 
-Repeat for round 1 and 2:
+### Round 1 and 2:
+
 ```console
 $ cd ../QualitativeAnalysis/Round<x>
 $ python ../subsample.py
 $ cp nonsampled.csv ../Round<x+1>/sampling_input.csv
 ```
 
-Round 3:
+### Round 3:
 
-Round 4:
+```console
+$ cd ../Round3
+```
+
+In `subsample.py`, set `NUM_SAMPLES` 172 (1/3rd of the total).
+Then, sample for each of the researchers (Lars, Germán, Koen):
+```
+$ python ../subsample.py
+```
+Use the `nonsampled.csv` output as the input file for the next researcher.
+
+### Round 4 (verification):
+
+Set `NUM_SAMPLES` to 17. Then sample from `Round3/sampled_{Lars,German,Koen}.csv`:
+```console
+$ cd ../Round4
+$ python ../subsample.py
+```
 
 ## 3. Calculate kappa score
 
 ```console
 $ cd Agreement
 $ python kappa.py
+```
+
+## 4. Retrieve code changes
+
+```console
+$ cd ../../QuantitativeAnalysis
+$ python codechanges.py
+```
+
+## 5. Retrieve project languages
+
+```console
+$ cd Languages
+$ python languages.py
+```
+
+## 6. Merge dataset with categories
+
+```console
+$ cd ../Data_analysis
+$ python merge_categories.py
+```
+
+## 7. Generate raw data for source code analysis
+
+```console
+$ python generate_metrics.py
 ```
