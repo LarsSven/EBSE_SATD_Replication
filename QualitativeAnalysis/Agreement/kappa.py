@@ -23,4 +23,4 @@ def print_kappa(filename):
 
 for file in ['round1.csv', 'round2.csv', 'round4.csv']:
     print(file)
-    print_kappa(f'Agreement/{file}')
+    print_kappa(file)
