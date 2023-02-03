@@ -6,7 +6,7 @@ This repository contains code and data to reproduce the results of our research 
 ## 0. Install prerequisites
 
 ```console
-$ pip install -U requests lizard
+$ pip install -U requests lizard scipy scikit-learn
 ```
 
 ## 1. Preprocess original dataset
@@ -80,4 +80,12 @@ $ python merge_categories.py
 
 ```console
 $ python generate_metrics.py
+```
+
+## 8. Perform statistical significance tests
+
+```console
+$ cd ../Statistical_Significance
+$ python levene.py
+$ python ttest.py
 ```
